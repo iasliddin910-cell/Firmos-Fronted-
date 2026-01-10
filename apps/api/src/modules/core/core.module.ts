@@ -36,6 +36,8 @@ export function registerCore(register: RegisterRoute) {
   // audit: append event
     // Company Brain (reads signals, does prioritization/conflicts)
   registerCompanyBrain(register, () => signals);
+    // Sales Agent (produces signals)
+  registerSales(register, (s) => signals.push(s));
   register("POST", "/api/v1/audit", (req, res) => {
     const auth = requireAuth(req);
     if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
