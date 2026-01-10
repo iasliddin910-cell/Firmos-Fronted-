@@ -1,5 +1,6 @@
 import type http from "http";
 import type { AuditEvent } from "@firmos/shared";
+import { registerCompanyBrain } from "../agents/company-brain/company-brain.module";
 
 type RegisterRoute = (method: string, path: string, handler: (req: http.IncomingMessage, res: http.ServerResponse) => any) => void;
 
