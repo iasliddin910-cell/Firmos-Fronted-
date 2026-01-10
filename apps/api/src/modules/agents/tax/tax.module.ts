@@ -334,7 +334,38 @@ export function registerTax(register: RegisterRoute, pushSignal: (s: AgentSignal
     writeStore(s);
     return json(res, 200, { ok: true, legal_source: ls });
   });
+  register("POST", "/api/v1/admin/tax/guidance", (req, res) => {
+    const auth = requireAuth(req);
+    if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
+    if (!requireRole(auth, "ADMIN")) return json(res, 403, { error: "FORBIDDEN" });
 
+    const body = (req as any).body as any;
+    const topic = String(body?.topic || "");
+    const steps = Array.isArray(body?.steps) ? body.steps : [];
+    const warnings = Array.isArray(body?.warnings) ? body.warnings : [];
+
+    if (!topic || steps.length === 0) return json(res, 400, { error: "BAD_REQUEST" });
+
+    const s = readStore();
+    const existing = s.cabinet_guidance.find((t) => t.topic === topic);
+    if (existing) {
+      existing.steps = steps;
+      existing.warnings = warnings;
+      existing.updated_at = nowIso();
+      existing.updated_by = auth.actorId;
+    } else {
+      s.cabinet_guidance.push({
+        id: uuid("guide"),
+        topic,
+        steps,
+        warnings,
+        updated_at: nowIso(),
+        updated_by: auth.actorId
+      });
+    }
+    writeStore(s);
+    return json(res, 200, { ok: true });
+  });
   register("PUT", "/api/v1/admin/legal-sources/:id", (req, res) => {
     const auth = requireAuth(req);
     if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
