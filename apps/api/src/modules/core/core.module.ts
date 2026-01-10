@@ -6,6 +6,7 @@ import { registerMarketing } from "../agents/marketing/marketing.module";
 import { registerCashflow } from "../agents/cashflow/cashflow.module";
 import { registerCompliance } from "../agents/compliance/compliance.module";
 import { registerCyber } from "../agents/cyber/cyber.module";
+import { registerTax } from "../agents/tax/tax.module";
 type RegisterRoute = (method: string, path: string, handler: (req: http.IncomingMessage, res: http.ServerResponse) => any) => void;
 
 // In-memory storage for now (later DB)
@@ -50,6 +51,8 @@ export function registerCore(register: RegisterRoute) {
   registerCompliance(register, (s) => signals.push(s));
     // Cybersecurity Agent (produces signals)
   registerCyber(register, (s) => signals.push(s));
+    // Tax Optimizer (produces signals)
+  registerTax(register, (s) => signals.push(s));
   register("POST", "/api/v1/audit", (req, res) => {
     const auth = requireAuth(req);
     if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
