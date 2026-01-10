@@ -5,6 +5,14 @@ import { parseFile } from "./tax.parse";
 import { taxRegimeValidator, vatObligationMonitor, penaltyRiskScanner } from "./tax.compute";
 import { taxChatReply } from "./tax.chat";
 import type { AgentSignal } from "@firmos/shared";
+import {
+  overpaymentFinder,
+  deductibilityAudit,
+  vatExitSimulation,
+  taxWhatIf,
+  cabinetGuidance,
+  reportPreparation
+} from "./tax.compute";
 
 type RegisterRoute = (method: string, path: string, handler: (req: http.IncomingMessage, res: http.ServerResponse) => any) => void;
 
@@ -39,6 +47,74 @@ export function registerTax(register: RegisterRoute, pushSignal: (s: AgentSignal
   // POST /api/v1/agents/tax/uploads
   // body: { filename, file_type, base64, period_from?, period_to? }
   // -------------------------
+    register("POST", "/api/v1/agents/tax/insights/deductibility", (req, res) => {
+    const auth = requireAuth(req);
+    if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
+    if (!requireRole(auth, "ANALYST")) return json(res, 403, { error: "FORBIDDEN" });
+
+    const body = (req as any).body as any;
+    const expenses = Array.isArray(body?.expenses) ? body.expenses : [];
+    const r = deductibilityAudit({ expenses });
+    return json(res, 200, r);
+  });
+    register("GET", "/api/v1/agents/tax/insights/overpayment", (req, res) => {
+    const auth = requireAuth(req);
+    if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
+    if (!requireRole(auth, "ANALYST")) return json(res, 403, { error: "FORBIDDEN" });
+
+    const q = (req as any).query || {};
+    const taxType = String(q.taxType || "INCOME");
+    const expectedBase = Number(q.expectedBase || 0);
+    const r = overpaymentFinder({ taxType, expectedBase });
+    return json(res, 200, r);
+  });
+    register("POST", "/api/v1/agents/tax/insights/vat-exit/simulate", (req, res) => {
+    const auth = requireAuth(req);
+    if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
+    if (!requireRole(auth, "OPERATOR")) return json(res, 403, { error: "FORBIDDEN" });
+
+    const body = (req as any).body as any;
+    const r = vatExitSimulation({
+      currentVatPaidMonthly: Number(body?.currentVatPaidMonthly || 0),
+      projectedNonVatTaxMonthly: Number(body?.projectedNonVatTaxMonthly || 0)
+    });
+    return json(res, 200, r);
+  });
+    register("POST", "/api/v1/agents/tax/what-if", (req, res) => {
+    const auth = requireAuth(req);
+    if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
+    if (!requireRole(auth, "OPERATOR")) return json(res, 403, { error: "FORBIDDEN" });
+
+    const body = (req as any).body as any;
+    const r = taxWhatIf({ scenario: body?.scenario || body });
+    return json(res, 200, r);
+  });
+    register("POST", "/api/v1/agents/tax/cabinet/guidance", (req, res) => {
+    const auth = requireAuth(req);
+    if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
+    if (!requireRole(auth, "ANALYST")) return json(res, 403, { error: "FORBIDDEN" });
+
+    const body = (req as any).body as any;
+    const topic = String(body?.topic || "");
+    if (!topic) return json(res, 400, { error: "BAD_REQUEST" });
+
+    const r = cabinetGuidance(topic);
+    return json(res, 200, r);
+  });
+    register("POST", "/api/v1/agents/tax/reports/prepare", (req, res) => {
+    const auth = requireAuth(req);
+    if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
+    if (!requireRole(auth, "OPERATOR")) return json(res, 403, { error: "FORBIDDEN" });
+
+    const body = (req as any).body as any;
+    const documentId = String(body?.document_id || body?.documentId || "");
+    const reportType = String(body?.report_type || body?.reportType || "");
+    if (!documentId || !reportType) return json(res, 400, { error: "BAD_REQUEST" });
+
+    const r = reportPreparation({ documentId, reportType });
+    return json(res, 200, r);
+  });
+  
   register("POST", "/api/v1/agents/tax/uploads", (req, res) => {
     const auth = requireAuth(req);
     if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
