@@ -2,6 +2,7 @@ import type http from "http";
 import type { AuditEvent } from "@firmos/shared";
 import { registerCompanyBrain } from "../agents/company-brain/company-brain.module";
 import { registerSales } from "../agents/sales/sales.module";
+import { registerMarketing } from "../agents/marketing/marketing.module";
 type RegisterRoute = (method: string, path: string, handler: (req: http.IncomingMessage, res: http.ServerResponse) => any) => void;
 
 // In-memory storage for now (later DB)
@@ -38,6 +39,8 @@ export function registerCore(register: RegisterRoute) {
   registerCompanyBrain(register, () => signals);
     // Sales Agent (produces signals)
   registerSales(register, (s) => signals.push(s));
+    // Marketing Agent (produces signals)
+  registerMarketing(register, (s) => signals.push(s));
   register("POST", "/api/v1/audit", (req, res) => {
     const auth = requireAuth(req);
     if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
