@@ -21,7 +21,17 @@ export default function TaxPage() {
   const [base64, setBase64] = useState("");
 
   const readyUpload = useMemo(() => fileName && fileType && base64, [fileName, fileType, base64]);
+    const [insOver, setInsOver] = useState<any>(null);
+  const [insDed, setInsDed] = useState<any>(null);
+  const [simVatExit, setSimVatExit] = useState<any>(null);
+  const [whatIfRes, setWhatIfRes] = useState<any>(null);
+  const [guidance, setGuidance] = useState<any>(null);
+  const [prepared, setPrepared] = useState<any>(null);
 
+  const [expectedBase, setExpectedBase] = useState("100000000");
+  const [guidanceTopic, setGuidanceTopic] = useState("QQS_REPORT");
+  const [docIdForPrep, setDocIdForPrep] = useState("");
+  const [reportType, setReportType] = useState("VAT");
   async function upload() {
     setErr("");
     try {
@@ -75,7 +85,75 @@ export default function TaxPage() {
       setErr(e.message);
     }
   }
+  async function loadOverpayment() {
+    setErr("");
+    try {
+      const r = await apiGet(`/api/v1/agents/tax/insights/overpayment?taxType=INCOME&expectedBase=${Number(expectedBase)}`);
+      setInsOver(r);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  }
 
+  async function runDeductibility() {
+    setErr("");
+    try {
+      const r = await apiPost(`/api/v1/agents/tax/insights/deductibility`, {
+        expenses: [
+          { id: "e1", category: "MARKETING", amount: 2000000, hasContract: false, hasInvoice: true },
+          { id: "e2", category: "LOGISTICS", amount: 1500000, hasContract: true, hasInvoice: false }
+        ]
+      });
+      setInsDed(r);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  }
+
+  async function simulateVatExit() {
+    setErr("");
+    try {
+      const r = await apiPost(`/api/v1/agents/tax/insights/vat-exit/simulate`, {
+        currentVatPaidMonthly: 2800000,
+        projectedNonVatTaxMonthly: 0
+      });
+      setSimVatExit(r);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  }
+
+  async function runWhatIf() {
+    setErr("");
+    try {
+      const r = await apiPost(`/api/v1/agents/tax/what-if`, {
+        scenario: { change: "activity_code", from: "A", to: "B" }
+      });
+      setWhatIfRes(r);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  }
+
+  async function getGuidance() {
+    setErr("");
+    try {
+      const r = await apiPost(`/api/v1/agents/tax/cabinet/guidance`, { topic: guidanceTopic });
+      setGuidance(r);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  }
+
+  async function prepareReport() {
+    setErr("");
+    try {
+      const r = await apiPost(`/api/v1/agents/tax/reports/prepare`, { document_id: docIdForPrep, report_type: reportType });
+      setPrepared(r);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  }
   return (
     <Page title="Tax Optimizer">
       {err ? <div style={{ color: "red" }}>{err}</div> : null}
@@ -150,7 +228,57 @@ export default function TaxPage() {
 
         <pre style={{ whiteSpace: "pre-wrap", marginTop: 10 }}>{chat ? JSON.stringify(chat, null, 2) : ""}</pre>
       </section>
+      <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12, marginTop: 12 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Overpayment / Deductibility / Simulations</div>
 
+        <div style={{ display: "grid", gap: 10 }}>
+          <div>
+            <div style={{ fontWeight: 600 }}>Overpayment Finder</div>
+            <input value={expectedBase} onChange={(e) => setExpectedBase(e.target.value)} />
+            <button onClick={loadOverpayment}>Check</button>
+            <pre style={{ whiteSpace: "pre-wrap" }}>{insOver ? JSON.stringify(insOver, null, 2) : ""}</pre>
+          </div>
+
+          <div>
+            <div style={{ fontWeight: 600 }}>Expense Deductibility Audit</div>
+            <button onClick={runDeductibility}>Run sample audit</button>
+            <pre style={{ whiteSpace: "pre-wrap" }}>{insDed ? JSON.stringify(insDed, null, 2) : ""}</pre>
+          </div>
+
+          <div>
+            <div style={{ fontWeight: 600 }}>VAT Exit Simulation</div>
+            <button onClick={simulateVatExit}>Simulate</button>
+            <pre style={{ whiteSpace: "pre-wrap" }}>{simVatExit ? JSON.stringify(simVatExit, null, 2) : ""}</pre>
+          </div>
+
+          <div>
+            <div style={{ fontWeight: 600 }}>What-if Tax Simulator</div>
+            <button onClick={runWhatIf}>Run scenario</button>
+            <pre style={{ whiteSpace: "pre-wrap" }}>{whatIfRes ? JSON.stringify(whatIfRes, null, 2) : ""}</pre>
+          </div>
+        </div>
+      </section>
+
+      <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12, marginTop: 12 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Assisted mode</div>
+
+        <div style={{ display: "grid", gap: 10 }}>
+          <div>
+            <div style={{ fontWeight: 600 }}>Guided Cabinet Access (no login)</div>
+            <input value={guidanceTopic} onChange={(e) => setGuidanceTopic(e.target.value)} />
+            <button onClick={getGuidance}>Get guidance</button>
+            <pre style={{ whiteSpace: "pre-wrap" }}>{guidance ? JSON.stringify(guidance, null, 2) : ""}</pre>
+          </div>
+
+          <div>
+            <div style={{ fontWeight: 600 }}>Report Preparation Assistance (no submit)</div>
+            <input placeholder="document id" value={docIdForPrep} onChange={(e) => setDocIdForPrep(e.target.value)} />
+            <input placeholder="report type" value={reportType} onChange={(e) => setReportType(e.target.value)} />
+            <button onClick={prepareReport}>Prepare</button>
+            <pre style={{ whiteSpace: "pre-wrap" }}>{prepared ? JSON.stringify(prepared, null, 2) : ""}</pre>
+          </div>
+        </div>
+      </section>
       <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12, marginTop: 12 }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Qoidalar</div>
         <ul>
@@ -159,6 +287,7 @@ export default function TaxPage() {
           <li>Maslahat: hisobot yuborilmaydi, kabinetga login qilinmaydi.</li>
         </ul>
       </section>
+      
     </Page>
   );
 }
