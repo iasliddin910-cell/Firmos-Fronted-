@@ -34,6 +34,8 @@ function requireAuth(req: http.IncomingMessage) {
 
 export function registerCore(register: RegisterRoute) {
   // audit: append event
+    // Company Brain (reads signals, does prioritization/conflicts)
+  registerCompanyBrain(register, () => signals);
   register("POST", "/api/v1/audit", (req, res) => {
     const auth = requireAuth(req);
     if (!auth) return json(res, 401, { error: "UNAUTHORIZED" });
