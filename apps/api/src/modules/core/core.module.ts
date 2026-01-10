@@ -1,5 +1,6 @@
 import type http from "http";
 import type { AuditEvent } from "@firmos/shared";
+import { registerCompanyBrain } from "../company-brain/brain.module";
 import { registerCompanyBrain } from "../agents/company-brain/company-brain.module";
 import { registerSales } from "../agents/sales/sales.module";
 import { registerMarketing } from "../agents/marketing/marketing.module";
@@ -39,6 +40,7 @@ function requireAuth(req: http.IncomingMessage) {
 
 export function registerCore(register: RegisterRoute) {
   // audit: append event
+    registerCompanyBrain(register, () => signals);
     // Company Brain (reads signals, does prioritization/conflicts)
   registerCompanyBrain(register, () => signals);
     // Sales Agent (produces signals)
