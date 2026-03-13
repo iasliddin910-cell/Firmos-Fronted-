@@ -904,12 +904,82 @@ class CentralKernel:
         return result
     
     async def _plan(self, message: str) -> List[Task]:
-        """Create execution plan using planner agent"""
+        """
+        Create execution plan using LLM-based planner
+        This is the REAL planner for No1 agent
+        """
         
-        # Use the coordinator to create a plan
-        # This is simplified - would use LLM in production
+        # Use native_brain for intelligent planning if available
+        if hasattr(self, 'native_brain') and self.native_brain:
+            try:
+                # Ask the brain to create a detailed plan
+                planning_prompt = f"""Create a detailed task plan for the following goal.
+
+Goal: {message}
+
+Create a JSON response with the following structure:
+{{
+    "tasks": [
+        {{
+            "id": "unique_id",
+            "description": "task description",
+            "priority": "HIGH/NORMAL/LOW",
+            "dependencies": ["id1", "id2"],
+            "required_tools": ["tool_name1", "tool_name2"],
+            "verification_type": "file_exists/process_result/browser_check/manual",
+            "success_criteria": "what defines success for this task",
+            "fallback_strategy": "what to do if this fails",
+            "retry_policy": "number of retries"
+        }}
+    ]
+}}
+
+Respond ONLY with valid JSON, no other text."""
+
+                # Get plan from brain
+                import json
+                response = self.native_brain.think(planning_prompt)
+                
+                # Try to parse JSON from response
+                try:
+                    # Extract JSON from response
+                    import re
+                    json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                    if json_match:
+                        plan_data = json.loads(json_match.group())
+                        tasks = []
+                        for t in plan_data.get('tasks', []):
+                            priority = TaskPriority.NORMAL
+                            if t.get('priority', '').upper() == 'HIGH':
+                                priority = TaskPriority.HIGH
+                            elif t.get('priority', '').upper() == 'LOW':
+                                priority = TaskPriority.LOW
+                            
+                            task = Task(
+                                id=t.get('id', str(uuid.uuid4())[:8]),
+                                description=t.get('description', ''),
+                                priority=priority,
+                                dependencies=t.get('dependencies', [])
+                            )
+                            # Store metadata
+                            task.input_data = {
+                                'required_tools': t.get('required_tools', []),
+                                'verification_type': t.get('verification_type', 'manual'),
+                                'success_criteria': t.get('success_criteria', ''),
+                                'fallback_strategy': t.get('fallback_strategy', ''),
+                                'retry_policy': t.get('retry_policy', 3)
+                            }
+                            tasks.append(task)
+                        
+                        if tasks:
+                            logger.info(f"📋 Created {len(tasks)} tasks via LLM planner")
+                            return tasks
+                except Exception as e:
+                    logger.warning(f"Failed to parse LLM plan: {e}")
+            except Exception as e:
+                logger.warning(f"LLM planning failed: {e}")
         
-        # Create tasks based on message
+        # Fallback to simple keyword-based planning
         tasks = []
         
         # Simple keyword-based task creation

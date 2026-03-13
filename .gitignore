@@ -30,3 +30,30 @@ Thumbs.db
 data/
 *.db
 *.sqlite
+# Temp workspaces
+temp/
+tmp/
+*.tmp
+
+# Artifacts
+artifacts/
+outputs/
+
+# Benchmark outputs
+benchmark_results/
+*.benchmark
+
+# Screenshots
+screenshots/
+*.png
+*.jpg
+*.jpeg
+
+# Generated tools
+generated_tools/
+
+# Snapshots
+snapshots/
+
+# Agent memory
+agent_memory/

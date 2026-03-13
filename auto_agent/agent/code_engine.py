@@ -39,7 +39,7 @@ class ASTParser:
                     entities.append(CodeEntity(name=node.name, type="class", file=filepath,
                         line_start=node.lineno, line_end=node.end_lineno or node.lineno))
             self.entities[filepath] = entities
-        except: pass
+        except Exception as e: logger.warning(f"Code parsing error: {e}")
         return entities
 
 class TestOrchestrator:
@@ -51,7 +51,7 @@ class TestOrchestrator:
             result = subprocess.run(["python", "-m", "pytest", test_file, "-v"],
                 capture_output=True, text=True, timeout=120)
             return {"file": test_file, "passed": result.returncode == 0}
-        except: return {"file": test_file, "passed": False}
+        except Exception as e: logger.warning(f"Test run error: {e}"); return {"file": test_file, "passed": False, "error": str(e)}
     
     def run_all_tests(self, root_dir: str) -> Dict:
         test_files = self.discover_tests(root_dir)
