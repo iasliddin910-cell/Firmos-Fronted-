@@ -3,19 +3,23 @@ OmniAgent X - Playwright Browser Automation (REFACTORED)
 =======================================================
 Production-grade browser automation
 
-REFACTORED:
+ENHANCED:
 - Browser bootstrap/install script
 - Session persistence
 - Multi-tab awareness
 - DOM extraction + screenshot-based fallback
 - Login/auth flow state handling
 - Action verification
+- Anti-bot fallback
+- Upload/download management
+- Task-specific verifiers
 """
 import os
 import json
 import logging
 import time
 import uuid
+import base64
 from typing import Optional, Dict, List, Any, Tuple
 from pathlib import Path
 from dataclasses import dataclass, field

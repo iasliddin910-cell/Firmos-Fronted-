@@ -3,10 +3,12 @@ OmniAgent X - Main Application (REFACTORED)
 ===========================================
 The entry point that brings everything together
 New architecture with:
+- Central Kernel orchestration
 - ReActAgent orchestration
 - Persistent memory (memory_ultimate.py)
 - Plan -> Act -> Observe -> Verify -> Repair flow
 - Environment-based configuration
+- All new enhanced components integrated
 """
 import os
 import sys
@@ -28,6 +30,20 @@ from agent.ultimate_brain import create_ultimate_brain
 from agent.tools import ToolsEngine
 from agent.memory_ultimate import get_memory_system
 from agent.ui import AgentUI
+
+# NEW: Import enhanced components
+from agent.kernel import create_kernel
+from agent.native_brain import create_native_brain
+from agent.sandbox import create_sandbox, ExecutionMode
+from agent.approval import create_approval_engine
+from agent.agent_memory import get_agent_memory
+from agent.learning_pipeline import create_learning_pipeline
+from agent.benchmark import create_benchmark_suite
+from agent.regression_suite import create_regression_suite
+from agent.self_improvement import create_self_improvement_engine
+from agent.tool_factory import create_tool_factory
+from agent.dependency_handler import create_dependency_manager
+from agent.secret_guard import create_secret_guard
 
 
 # Configure logging
@@ -80,13 +96,9 @@ class OmniAgent:
         if api_key:
             return api_key
         
-        # DEV MODE: Check api_key.txt only if explicitly enabled
-        if os.getenv("DEV_MODE", "").lower() == "true":
-            key_file = Path(__file__).parent / "api_key.txt"
-            if key_file.exists():
-                logger.warning("⚠️ DEV_MODE enabled - using api_key.txt (NOT FOR PRODUCTION!)")
-                return key_file.read_text().strip()
-        
+        # REMOVED: DEV_MODE api_key.txt fallback for security
+        # Production must use .env or secrets manager
+        logger.error("❌ OPENAI_API_KEY not found in environment!")
         return None
     
     def handle_message(self, user_message: str) -> str:

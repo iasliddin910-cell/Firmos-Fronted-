@@ -3,17 +3,23 @@ OmniAgent X - Vision System (Ko'rish Qobiliyati)
 ================================================
 Screenshot va ekran tahlili GPT-4 Vision orqali
 
-REFACTORED:
+ENHANCED:
 - Uses new OpenAI SDK
 - Added OCR fallback (pytesseract)
 - Coordinate grounding
 - Screen state tracking
+- Active window tracking
+- Accessibility tree
+- UI element detection
+- Screen diff
+- Failed click recovery
 """
 import os
 import base64
 import logging
+import subprocess
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 import json
 
 # NEW: Use new OpenAI SDK
