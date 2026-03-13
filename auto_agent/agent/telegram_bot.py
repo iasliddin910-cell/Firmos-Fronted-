@@ -308,6 +308,50 @@ class TelegramBot:
         
         await update.message.reply_text(help_text, parse_mode="Markdown")
     
+    async def jobs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List user jobs"""
+        user_id = update.effective_user.id
+        if not self.is_authorized(user_id): return
+        jobs = self.job_tracker.get_user_jobs(user_id)
+        if not jobs:
+            await update.message.reply_text("📋 Sizda hech qanday vazifa yoq")
+            return
+        msg = "📋 *Sizning vaziflaringiz:*\n\n"
+        for job in jobs[:10]:
+            msg += f"• {job.task_id}: {job.status.value}\n"
+        await update.message.reply_text(msg)
+
+    async def approve_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Approve a request"""
+        user_id = update.effective_user.id
+        if not self.is_authorized(user_id): return
+        args = context.args
+        if not args:
+            await update.message.reply_text("Usage: /approve <request_id>")
+            return
+        request_id = args[0]
+        if hasattr(self.agent, "approval_engine"):
+            self.agent.approval_engine.approve(request_id, f"telegram_{user_id}")
+            await update.message.reply_text(f"✅ Approved: {request_id}")
+        else:
+            await update.message.reply_text("❌ Approval system not available")
+
+    async def deny_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Deny a request"""
+        user_id = update.effective_user.id
+        if not self.is_authorized(user_id): return
+        args = context.args
+        if not args:
+            await update.message.reply_text("Usage: /deny <request_id> [reason]")
+            return
+        request_id = args[0]
+        reason = " ".join(args[1:]) if len(args) > 1 else "No reason"
+        if hasattr(self.agent, "approval_engine"):
+            self.agent.approval_engine.deny(request_id, reason, f"telegram_{user_id}")
+            await update.message.reply_text(f"❌ Denied: {request_id}")
+        else:
+            await update.message.reply_text("❌ Approval system not available")
+
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Status command"""
         user_id = update.effective_user.id
@@ -646,6 +690,9 @@ ID lar: {', '.join(str(u) for u in self.authorized_users) or 'Yo\'q'}"""
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
         self.app.add_handler(CommandHandler("status", self.status_command))
+        self.app.add_handler(CommandHandler("jobs", self.jobs_command))
+        self.app.add_handler(CommandHandler("approve", self.approve_command))
+        self.app.add_handler(CommandHandler("deny", self.deny_command))
         self.app.add_handler(CommandHandler("screenshot", self.screenshot_command))
         self.app.add_handler(CommandHandler("system", self.system_command))
         self.app.add_handler(CommandHandler("files", self.files_command))
