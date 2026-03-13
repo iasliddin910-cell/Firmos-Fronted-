@@ -666,6 +666,78 @@ class ContinuousLearningPipeline:
         }
 
 
+
+
+    # ==================== ADDITIONAL METHODS ====================
+    
+    def deduplicate(self):
+        """Remove duplicate knowledge"""
+        seen = set()
+        unique_items = []
+        for item_id, item in list(self.store.items.items()):
+            content_hash = hashlib.md5(item.content.encode()).hexdigest()
+            if content_hash not in seen:
+                seen.add(content_hash)
+                unique_items.append(item_id)
+            else:
+                del self.store.items[item_id]
+        self.store._save()
+        logger.info(f"🗑️ Deduplicated: {len(self.store.items)} unique items")
+    
+    def score_confidence(self, item_id: str) -> float:
+        """Calculate confidence score for knowledge item"""
+        item = self.store.get(item_id)
+        if not item:
+            return 0.0
+        
+        score = 1.0
+        
+        # Trust level factor
+        trust_weights = {"high": 1.0, "medium": 0.7, "low": 0.4}
+        score *= trust_weights.get(item.trust_level.value, 0.5)
+        
+        # Recency factor
+        age_days = (time.time() - item.created_at) / 86400
+        if age_days < 30:
+            score *= 1.0
+        elif age_days < 90:
+            score *= 0.8
+        else:
+            score *= 0.5
+        
+        # Access frequency factor
+        if item.access_count > 10:
+            score *= 1.2
+        elif item.access_count > 5:
+            score *= 1.0
+        else:
+            score *= 0.9
+        
+        return min(1.0, score)
+    
+    def prune_by_confidence(self, min_confidence: float = 0.3):
+        """Remove low confidence knowledge"""
+        to_remove = []
+        
+        for item_id, item in list(self.store.items.items()):
+            confidence = self.score_confidence(item_id)
+            if confidence < min_confidence:
+                to_remove.append(item_id)
+        
+        for item_id in to_remove:
+            del self.store.items[item_id]
+        
+        if to_remove:
+            self.store._save()
+            logger.info(f"🗑️ Pruned {len(to_remove)} low confidence items")
+        
+        return len(to_remove)
+    
+    def refresh_source(self, source_url: str):
+        """Refresh knowledge from a source"""
+        return self.learn_from_url(source_url)
+
+
 # ==================== FACTORY ====================
 
 def create_learning_pipeline(api_key: str = None) -> ContinuousLearningPipeline:
