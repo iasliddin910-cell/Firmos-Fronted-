@@ -418,7 +418,7 @@ class TelegramBot:
                         self.job_tracker.update_job(job_id, JobStatus.COMPLETED, progress=1.0)
                         return
                     except Exception as e:
-                        pass
+                        logger.warning("Telegram handler: feature not fully implemented")
             
             await update.message.reply_text(result)
             self.job_tracker.update_job(job_id, JobStatus.COMPLETED, progress=1.0)

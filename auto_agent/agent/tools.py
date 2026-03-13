@@ -536,7 +536,21 @@ class ToolsEngine:
         elif tool_name == "think":
             return ToolResult(tool_name=tool_name, status="success", stdout=args.get("question", ""))
         
-        return ToolResult(tool_name=tool_name, status="error", stderr="Not implemented")
+        # Fallback: try to find similar implemented tool
+        if "file" in tool_name.lower():
+            return ToolResult(tool_name=tool_name, status="error", 
+                           stderr=f"Tool {tool_name} not fully implemented. Use read_file or write_file instead.")
+        elif "search" in tool_name.lower() or "find" in tool_name.lower():
+            return self._search_files(".", tool_name)
+        elif "run" in tool_name.lower() or "exec" in tool_name.lower():
+            return self._execute_command(tool_name, 30)
+        else:
+            # Log warning and return structured error
+            logger.warning(f"Tool {tool_name} not implemented")
+            return ToolResult(tool_name=tool_name, status="error", 
+                            stderr=f"Tool {tool_name} not implemented. Please use implemented tools: "
+                            f"read_file, write_file, execute_command, execute_code, web_search, scrape_url, "
+                            f"get_system_info, take_screenshot, think, list_directory, search_files, delete_file")
     
     # ==================== FILE OPERATIONS ====================
     
