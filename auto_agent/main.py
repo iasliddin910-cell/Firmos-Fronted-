@@ -111,19 +111,10 @@ class OmniAgent:
         self.agent_memory = get_agent_memory()
         
         # =============================================
-        # LAYER 5: BRAIN (Native Function Calling)
+        # LAYER 5: CENTRAL KERNEL (THE HEART)
         # =============================================
         
-        # 7. Native Brain - Tool calling via OpenAI functions
-        logger.info("🧠 Initializing Native Brain (Function Calling)...")
-        from agent.native_brain import create_native_brain
-        self.brain = create_native_brain(self.api_key, self.tools, kernel=self.kernel, sandbox=self.sandbox, approval_engine=self.approval_engine)
-        
-        # =============================================
-        # LAYER 6: CENTRAL KERNEL (THE HEART)
-        # =============================================
-        
-        # 8. Central Kernel - Orchestration
+        # 7. Central Kernel - Orchestration (MUST be created first)
         logger.info("⚡ Initializing Central Kernel...")
         from agent.kernel import create_kernel
         self.kernel = create_kernel(self.api_key, self.tools)
@@ -134,6 +125,18 @@ class OmniAgent:
         self.kernel.sandbox = self.sandbox
         self.kernel.agent_memory = self.agent_memory
         self.kernel.memory = self.memory
+        
+        # =============================================
+        # LAYER 6: BRAIN (Native Function Calling)
+        # =============================================
+        
+        # 8. Native Brain - Tool calling via OpenAI functions (created AFTER kernel)
+        logger.info("🧠 Initializing Native Brain (Function Calling)...")
+        from agent.native_brain import create_native_brain
+        self.brain = create_native_brain(self.api_key, self.tools, kernel=self.kernel, sandbox=self.sandbox, approval_engine=self.approval_engine)
+        
+        # Connect kernel to brain (bi-directional)
+        self.kernel.native_brain = self.brain
         
         # =============================================
         # LAYER 7: LEARNING & IMPROVEMENT
@@ -250,18 +253,18 @@ class OmniAgent:
             )
             
             # Secret redaction
-        if hasattr(self, "secret_guard"):
-            result = self.secret_guard.redact(result)
-        return result
+            if hasattr(self, "secret_guard"):
+                result = self.secret_guard.redact(result)
+            return result
             
         except Exception as e:
             logger.error(f"Error in kernel: {e}")
             # Fallback to brain if kernel fails
             result = self.brain.think(user_message)
             # Secret redaction
-        if hasattr(self, "secret_guard"):
-            result = self.secret_guard.redact(result)
-        return result
+            if hasattr(self, "secret_guard"):
+                result = self.secret_guard.redact(result)
+            return result
     
     def submit_task(self, task: str) -> str:
         """Public method for external callers (Telegram, etc.)"""

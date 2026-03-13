@@ -990,50 +990,27 @@ class CentralKernel:
         """
         MAIN ENTRY POINT for all user messages
         
-        This is the central flow:
-        1. Receive task
-        2. Create task in queue
-        3. Plan with native_brain
-        4. Execute through tools
-        5. Verify result
-        6. Learn from result
+        Uses the powerful async pipeline via process()
         """
         
         logger.info(f"📥 Kernel received task: {user_message[:50]}...")
         
-        # Create task
-        task = self.task_manager.create_task(
-            description=user_message,
-            priority=TaskPriority.NORMAL
-        )
-        
-        # Mark as running
-        self.task_manager.mark_running(task.id)
-        self.state = KernelState.THINKING
-        
         try:
-            # Use native_brain for execution (if available)
-            if hasattr(self, 'native_brain'):
-                result = self.native_brain.think(user_message)
-            else:
-                # Fallback to simple execution
-                result = self._execute_simple(user_message)
-            
-            # Mark completed
-            self.task_manager.mark_completed(task.id, result)
-            self.state = KernelState.IDLE
-            
-            # Record telemetry
-            self.telemetry.record_task(success=True, duration=1.0)
-            
+            # Use the powerful async pipeline
+            result = asyncio.run(self.process(user_message))
             return result
             
         except Exception as e:
             logger.error(f"Task failed: {e}")
-            self.task_manager.mark_failed(task.id, str(e))
-            self.state = KernelState.ERROR
             
-            self.telemetry.record_task(success=False, duration=1.0)
+            # Fallback to simple native_brain execution
+            if hasattr(self, 'native_brain'):
+                try:
+                    result = self.native_brain.think(user_message)
+                    return result
+                except Exception as brain_error:
+                    logger.error(f"Brain also failed: {brain_error}")
+                    return f"❌ Xatolik: {str(brain_error)}"
             
             return f"❌ Xatolik: {str(e)}"
     

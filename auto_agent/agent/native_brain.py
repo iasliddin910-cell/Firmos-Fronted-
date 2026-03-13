@@ -213,7 +213,15 @@ class NativeFunctionBrain:
         # Settings
         self.max_iterations = 10
         
+        # Conversation history for reset capability
+        self.messages = []
+        
         logger.info("🧠 Native Function Brain initialized")
+    
+    def reset_conversation(self):
+        """Reset conversation history"""
+        self.messages = []
+        logger.info("🧠 Native Function Brain conversation reset")
     
     def _build_function_map(self) -> Dict:
         """Map function names to actual implementations"""
@@ -370,6 +378,6 @@ Available tools:
 
 # ==================== FACTORY ====================
 
-def create_native_brain(api_key: str, tools_engine):
+def create_native_brain(api_key: str, tools_engine, kernel=None, sandbox=None, approval_engine=None):
     """Create native function calling brain"""
-    return NativeFunctionBrain(api_key, tools_engine)
+    return NativeFunctionBrain(api_key, tools_engine, kernel=kernel, sandbox=sandbox, approval_engine=approval_engine)

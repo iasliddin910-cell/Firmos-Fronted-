@@ -36,7 +36,7 @@ class BenchmarkResult:
 
 
 @dataclass
-class BenchmarkSuite:
+class BenchmarkCollection:
     """Collection of benchmark results"""
     suite_name: str
     results: List[BenchmarkResult] = field(default_factory=list)
@@ -462,7 +462,7 @@ class LongHorizonBenchmark:
 
 # ==================== MASTER BENCHMARK SUITE ====================
 
-class BenchmarkSuite:
+class MasterBenchmarkSuite:
     """
     Master benchmark suite that runs all benchmarks
     """
@@ -547,6 +547,6 @@ class BenchmarkSuite:
 
 # ==================== FACTORY ====================
 
-def create_benchmark_suite(agent) -> BenchmarkSuite:
+def create_benchmark_suite(agent) -> MasterBenchmarkSuite:
     """Create benchmark suite"""
-    return BenchmarkSuite(agent)
+    return MasterBenchmarkSuite(agent)
