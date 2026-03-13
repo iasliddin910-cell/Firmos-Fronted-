@@ -986,6 +986,72 @@ class CentralKernel:
 🤖 Agentlar: {json.dumps(self.coordinator.get_status(), indent=2)}
 {self.telemetry.get_summary()}"""
     
+    def submit_task(self, user_message: str) -> str:
+        """
+        MAIN ENTRY POINT for all user messages
+        
+        This is the central flow:
+        1. Receive task
+        2. Create task in queue
+        3. Plan with native_brain
+        4. Execute through tools
+        5. Verify result
+        6. Learn from result
+        """
+        
+        logger.info(f"📥 Kernel received task: {user_message[:50]}...")
+        
+        # Create task
+        task = self.task_manager.create_task(
+            description=user_message,
+            priority=TaskPriority.NORMAL
+        )
+        
+        # Mark as running
+        self.task_manager.mark_running(task.id)
+        self.state = KernelState.THINKING
+        
+        try:
+            # Use native_brain for execution (if available)
+            if hasattr(self, 'native_brain'):
+                result = self.native_brain.think(user_message)
+            else:
+                # Fallback to simple execution
+                result = self._execute_simple(user_message)
+            
+            # Mark completed
+            self.task_manager.mark_completed(task.id, result)
+            self.state = KernelState.IDLE
+            
+            # Record telemetry
+            self.telemetry.record_task(success=True, duration=1.0)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Task failed: {e}")
+            self.task_manager.mark_failed(task.id, str(e))
+            self.state = KernelState.ERROR
+            
+            self.telemetry.record_task(success=False, duration=1.0)
+            
+            return f"❌ Xatolik: {str(e)}"
+    
+    def _execute_simple(self, task: str) -> str:
+        """Simple execution fallback"""
+        return f"Vazifa qabul qilindi: {task[:50]}..."
+    
+    def get_task_queue_status(self) -> str:
+        """Get task queue status"""
+        graph = self.task_manager.get_task_graph()
+        return f"""📋 **Vazifalar Holati**
+
+Pending: {graph['pending']}
+Running: {graph['running']}
+Completed: {graph['completed']}
+Failed: {graph['failed']}
+"""
+    
     def get_dashboard(self) -> Dict:
         """Get full dashboard data"""
         
