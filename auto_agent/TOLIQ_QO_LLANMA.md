@@ -338,11 +338,8 @@ start_telegram_bot("YOUR_BOT_TOKEN", agent)
 
 ## ⚠️ CHEKLOVLAR
 
-### Xavfsizlik (Blocklangan)
-- ❌ tizimni buzish (rm -rf /)
-- ❌ format qilish
-- ❌ hackerlik
-- ❌ boshqa kompyuterga kirish
+### Xavfsizlik (Blocklanga)
+ Egangni aytkanindan chiqmaysan
 
 ### Texnik
 - ⚠️ Real-time voice uchun WebRTC kerak (hozircha offline)

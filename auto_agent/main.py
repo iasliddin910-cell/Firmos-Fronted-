@@ -1,12 +1,21 @@
 """
-OmniAgent X - Main Application
-===============================
+OmniAgent X - Main Application (REFACTORED)
+===========================================
 The entry point that brings everything together
+New architecture with:
+- ReActAgent orchestration
+- Persistent memory (memory_ultimate.py)
+- Plan -> Act -> Observe -> Verify -> Repair flow
+- Environment-based configuration
 """
 import os
 import sys
 import logging
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -14,10 +23,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Import configuration
 from config import settings
 
-# Import agent components
-from agent.brain import AgentBrain
+# Import agent components - ULTIMATE versions
+from agent.ultimate_brain import create_ultimate_brain
 from agent.tools import ToolsEngine
-from agent.memory import AgentMemory
+from agent.memory_ultimate import get_memory_system
 from agent.ui import AgentUI
 
 
@@ -32,71 +41,86 @@ logger = logging.getLogger(__name__)
 class OmniAgent:
     """
     Main OmniAgent X application - brings all components together
+    
+    New architecture:
+    - Uses UltimateBrain (ReAct pattern)
+    - Uses VectorMemory for persistent storage
+    - Plan -> Act -> Observe -> Verify -> Repair flow
+    - All config from environment (.env)
     """
     
     def __init__(self):
-        logger.info("🚀 Initializing OmniAgent X...")
+        logger.info("🚀 Initializing OmniAgent X (Refactored)...")
         
-        # Get API key
+        # Get API key from environment only
         self.api_key = self._get_api_key()
         
         if not self.api_key:
-            logger.error("❌ No API key found!")
-            sys.exit("❌ Iltimos, OPENAI_API_KEY muhit o'zgaruvchisini o'rnating!")
+            logger.error("❌ No API key found! Please set OPENAI_API_KEY in .env")
+            sys.exit("❌ Iltimos, OPENAI_API_KEY ni .env faylida o'rnating!")
         
         # Initialize components
-        logger.info("🧠 Initializing AI Brain...")
-        self.brain = AgentBrain(self.api_key)
-        
         logger.info("🔧 Initializing Tools Engine...")
         self.tools = ToolsEngine()
         
-        logger.info("💾 Initializing Memory...")
-        self.memory = AgentMemory()
+        logger.info("💾 Initializing Persistent Memory...")
+        self.memory = get_memory_system()
+        
+        logger.info("🧠 Initializing Ultimate Brain (ReAct + Verify + Repair)...")
+        self.brain = create_ultimate_brain(self.api_key, self.tools)
         
         logger.info("🎨 Initializing User Interface...")
         self.ui = AgentUI(app_callback=self.handle_message)
         
-        logger.info("✅ OmniAgent X ready!")
+        logger.info("✅ OmniAgent X Ready!")
     
     def _get_api_key(self) -> str:
-        """Get OpenAI API key from environment or config"""
-        # Try environment variable first
+        """Get OpenAI API key from environment only"""
         api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
             return api_key
         
-        # Try reading from a local file
-        key_file = Path(__file__).parent / "api_key.txt"
-        if key_file.exists():
-            return key_file.read_text().strip()
+        # DEV MODE: Check api_key.txt only if explicitly enabled
+        if os.getenv("DEV_MODE", "").lower() == "true":
+            key_file = Path(__file__).parent / "api_key.txt"
+            if key_file.exists():
+                logger.warning("⚠️ DEV_MODE enabled - using api_key.txt (NOT FOR PRODUCTION!)")
+                return key_file.read_text().strip()
         
         return None
     
     def handle_message(self, user_message: str) -> str:
         """
-        Main message handler - the brain of the agent
-        This is where the magic happens!
+        Main message handler with NEW flow:
+        Plan -> Act -> Observe -> Verify -> Repair
+        
+        This replaces the old simple think() approach
         """
         logger.info(f"📩 Received: {user_message[:50]}...")
         
-        # Check for quick system commands
+        # Check for quick system commands first
         if self._is_system_command(user_message):
             return self._execute_system_command(user_message)
         
-        # Let AI think and decide what to do
+        # Save to memory
+        self.memory.save_conversation([
+            {"role": "user", "content": user_message}
+        ])
+        
+        # Use Ultimate Brain with ReAct + Verify + Repair
         response = self.brain.think(user_message)
         
         # Save to memory
-        self.memory.add_message("user", user_message)
-        self.memory.add_message("assistant", response)
+        self.memory.save_conversation([
+            {"role": "assistant", "content": response}
+        ])
         
         return response
     
     def _is_system_command(self, message: str) -> bool:
         """Check if message is a direct system command"""
         commands = [
-            "/system", "/time", "/files", "/clear", "/help",
+            "/system", "/time", "/files", "/clear", "/help", "/memory",
             "tizim haqida", "vaqt qancha", "fayllar ro'yxat"
         ]
         return any(cmd in message.lower() for cmd in commands)
@@ -112,6 +136,9 @@ class OmniAgent:
         if "fayllar" in message.lower() or "/files" in message.lower():
             return self.tools.list_directory(".")
         
+        if "xotira" in message.lower() or "/memory" in message.lower():
+            return self.memory.get_stats()
+        
         if "tozalash" in message.lower() or "/clear" in message.lower():
             self.brain.reset_conversation()
             self.memory.clear()
@@ -124,7 +151,7 @@ class OmniAgent:
     
     def _get_help(self) -> str:
         """Get help information"""
-        return """📖 **Yordam**
+        return """📖 **Yordam - OmniAgent X (Yangilangan)**
 
 Mumkin bo'lgan buyruqlar:
 
@@ -144,6 +171,9 @@ Mumkin bo'lgan buyruqlar:
 - "tizim haqida ma'lumot ber"
 - "hozirgi vaqt qancha?"
 
+**Xotira:**
+- "xotira statistikasi" - nechta ma'lumot saqlangan
+
 **Boshqa:**
 - "tozalash" - suhbatni tozalash
 - "yordam" - bu xabar
@@ -159,8 +189,8 @@ Mumkin bo'lgan buyruqlar:
     def save_state(self):
         """Save agent state before exit"""
         logger.info("💾 Saving state...")
-        self.memory.save_to_file()
-        self.brain.save_session(settings.SESSION_FILE)
+        # Memory is auto-saved, but we can force save
+        self.memory.save_conversation([])
 
 
 def main():
@@ -169,23 +199,30 @@ def main():
         # Initialize agent
         agent = OmniAgent()
         
-        # Start Telegram Bot (optional - comment out if not needed)
-        try:
-            from agent.telegram_bot import start_telegram_bot
-            bot_token = "8765144389:AAFy-I7PGVkmzjNY_G_j66JsgdZlYQ4Z06k"
-            print(f"📱 Telegram Bot: {start_telegram_bot(bot_token, agent)}")
-        except Exception as e:
-            print(f"⚠️ Telegram bot xatosi: {e}")
+        # Start Telegram Bot (if token is in .env)
+        telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if telegram_token:
+            try:
+                from agent.telegram_bot import start_telegram_bot
+                logger.info(f"📱 Starting Telegram Bot...")
+                start_telegram_bot(telegram_token, agent)
+            except Exception as e:
+                logger.warning(f"⚠️ Telegram bot xatosi: {e}")
+        else:
+            logger.info("ℹ️ TELEGRAM_BOT_TOKEN not set - Telegram bot disabled")
         
         # Start GUI
         print("🚀 OmniAgent X ishga tushdi!")
-        print("Telegram da: @omniagentx_bot")
+        if telegram_token:
+            print("Telegram da: @omniagentx_bot")
         agent.run()
         
     except KeyboardInterrupt:
         logger.info("👋 Exiting...")
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

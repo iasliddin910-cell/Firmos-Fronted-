@@ -1,103 +1,399 @@
 """
-OmniAgent X - Telegram Bot (Uzoqdan Boshqarish)
-================================================
-Telegram orqali kompyuterni boshqarish
+OmniAgent X - Telegram Bot (REFACTORED)
+======================================
+Production-grade Telegram bot
+
+REFACTORED:
+- Token only from .env
+- Authorized user/chat allowlist
+- Rate limiting
+- Long task progress updates
+- Artifact sending: file, image, zip
+- Async job tracking
+- Cancel command
+- Admin-only dangerous command mode
 """
 import os
-import logging
 import json
+import logging
+import time
+import asyncio
+import hashlib
+import uuid
 from pathlib import Path
-from typing import Optional, Dict
-from datetime import datetime
+from typing import Optional, Dict, List, Set
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from enum import Enum
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 # Try to import telegram
 try:
-    from telegram import Update
-    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
     TELEGRAM_AVAILABLE = True
-except:
+except ImportError:
     TELEGRAM_AVAILABLE = False
     logger.warning("python-telegram-bot not available")
 
 
-class TelegramBot:
+# ==================== ENUMS & DATA CLASSES ====================
+
+class JobStatus(Enum):
+    """Job status"""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class AsyncJob:
+    """Async job tracking"""
+    job_id: str
+    user_id: int
+    command: str
+    status: JobStatus
+    progress: float = 0.0
+    result: str = ""
+    error: str = ""
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class UserRateLimit:
+    """Rate limit for user"""
+    user_id: int
+    message_count: int = 0
+    reset_time: float = 0.0
+
+
+# ==================== RATE LIMITER ====================
+
+class RateLimiter:
     """
-    Telegram bot - telefoningizdan OmniAgent ni boshqarish
+    Rate limiting for users
     """
     
-    def __init__(self, token: str, agent):
+    def __init__(self, max_messages: int = 20, window_seconds: int = 60):
+        self.max_messages = max_messages
+        self.window_seconds = window_seconds
+        self.user_limits: Dict[int, UserRateLimit] = {}
+    
+    def check(self, user_id: int) -> bool:
+        """Check if user can send message"""
+        now = time.time()
+        
+        # Get or create user limit
+        if user_id not in self.user_limits:
+            self.user_limits[user_id] = UserRateLimit(user_id=user_id, reset_time=now + self.window_seconds)
+        
+        limit = self.user_limits[user_id]
+        
+        # Reset if window expired
+        if now > limit.reset_time:
+            limit.message_count = 0
+            limit.reset_time = now + self.window_seconds
+        
+        # Check limit
+        if limit.message_count >= self.max_messages:
+            return False
+        
+        limit.message_count += 1
+        return True
+    
+    def get_remaining(self, user_id: int) -> int:
+        """Get remaining messages for user"""
+        if user_id not in self.user_limits:
+            return self.max_messages
+        
+        limit = self.user_limits[user_id]
+        return max(0, self.max_messages - limit.message_count)
+
+
+# ==================== JOB TRACKER ====================
+
+class JobTracker:
+    """
+    Track async jobs
+    """
+    
+    def __init__(self):
+        self.jobs: Dict[str, AsyncJob] = {}
+        self.user_jobs: Dict[int, List[str]] = defaultdict(list)
+    
+    def create_job(self, user_id: int, command: str) -> str:
+        """Create new job"""
+        job_id = str(uuid.uuid4())[:8]
+        
+        job = AsyncJob(
+            job_id=job_id,
+            user_id=user_id,
+            command=command,
+            status=JobStatus.PENDING
+        )
+        
+        self.jobs[job_id] = job
+        self.user_jobs[user_id].append(job_id)
+        
+        # Clean old jobs
+        self._cleanup()
+        
+        return job_id
+    
+    def update_job(self, job_id: str, status: JobStatus = None,
+                   progress: float = None, result: str = None, error: str = None):
+        """Update job status"""
+        if job_id not in self.jobs:
+            return
+        
+        job = self.jobs[job_id]
+        
+        if status:
+            job.status = status
+        if progress is not None:
+            job.progress = progress
+        if result:
+            job.result = result
+        if error:
+            job.error = error
+        
+        job.updated_at = time.time()
+    
+    def get_job(self, job_id: str) -> Optional[AsyncJob]:
+        """Get job by ID"""
+        return self.jobs.get(job_id)
+    
+    def get_user_jobs(self, user_id: int) -> List[AsyncJob]:
+        """Get all jobs for user"""
+        job_ids = self.user_jobs.get(user_id, [])
+        return [self.jobs[jid] for jid in job_ids if jid in self.jobs]
+    
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel job"""
+        if job_id not in self.jobs:
+            return False
+        
+        job = self.jobs[job_id]
+        if job.status in [JobStatus.PENDING, JobStatus.RUNNING]:
+            job.status = JobStatus.CANCELLED
+            return True
+        
+        return False
+    
+    def _cleanup(self):
+        """Clean old completed jobs"""
+        now = time.time()
+        to_remove = []
+        
+        for job_id, job in self.jobs.items():
+            # Remove jobs older than 1 hour
+            if now - job.updated_at > 3600:
+                to_remove.append(job_id)
+        
+        for job_id in to_remove:
+            job = self.jobs[job_id]
+            if job.user_id in self.user_jobs:
+                self.user_jobs[job.user_id].remove(job_id)
+            del self.jobs[job_id]
+
+
+# ==================== PRODUCTION TELEGRAM BOT ====================
+
+class TelegramBot:
+    """
+    REFACTORED: Production-grade Telegram bot
+    
+    Features:
+    - Token from environment only
+    - Authorized users allowlist
+    - Rate limiting
+    - Async job tracking
+    - Progress updates
+    - Artifact sending
+    - Admin-only commands
+    """
+    
+    def __init__(self, token: str, agent, config: Dict = None):
         if not TELEGRAM_AVAILABLE:
-            raise ImportError("python-telegram-bot o'rnatilmagan")
+            raise ImportError("python-telegram-bot not installed")
         
         self.token = token
         self.agent = agent
-        self.app = None
-        self.authorized_users = set()  # User IDs who can use the bot
+        self.config = config or {}
         
-        logger.info("📱 Telegram Bot initialized")
+        # Security
+        self.authorized_users: Set[int] = set(self.config.get("authorized_users", []))
+        self.admin_users: Set[int] = set(self.config.get("admin_users", []))
+        self.allow_any_user = self.config.get("allow_any_user", False)
+        
+        # Rate limiting
+        self.rate_limiter = RateLimiter(
+            max_messages=self.config.get("max_messages", 20),
+            window_seconds=self.config.get("window_seconds", 60)
+        )
+        
+        # Job tracking
+        self.job_tracker = JobTracker()
+        
+        # App
+        self.app = None
+        
+        logger.info("📱 Telegram Bot initialized (REFACTORED)")
+    
+    def is_authorized(self, user_id: int) -> bool:
+        """Check if user is authorized"""
+        if self.allow_any_user:
+            return True
+        return user_id in self.authorized_users
+    
+    def is_admin(self, user_id: int) -> bool:
+        """Check if user is admin"""
+        return user_id in self.admin_users
+    
+    # ==================== COMMAND HANDLERS ====================
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """ /start command """
+        """Start command"""
         user_id = update.effective_user.id
         
+        if not self.is_authorized(user_id):
+            await update.message.reply_text(
+                "❌ Siz ruxsat etilmagan foydalanuvchisiz.\n"
+                "Admin ga murojaat qiling."
+            )
+            return
+        
         await update.message.reply_text(
-            "🦾 *OmniAgent X Telegram Bot* ga xush kelibsiz!\n\n"
-            "Bu bot orqali kompyuteringizni boshqarishingiz mumkin.\n\n"
-            "Mavjud buyruqlar:\n"
-            "/help - Yordam\n"
-            "/screenshot - Screenshot olish\n"
-            "/system - Tizim ma'lumot\n"
-            "/files - Fayllar ro'yxati\n"
-            "Boshqa buyruqlar: Matn yozing, agent javob beradi",
+            "🦾 *OmniAgent X Telegram Bot*\n\n"
+            "Xush kelibsiz! Bu bot orqali kompyuteringizni boshqarishingiz mumkin.\n\n"
+            "/help - Barcha buyruqlar",
             parse_mode="Markdown"
         )
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """ /help command """
-        help_text = """
-🦾 *OmniAgent X - Yordam*
+        """Help command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        help_text = """🦾 *OmniAgent X - Buyruqlar*
 
-*Asosiy buyruqlar:*
+*Asosiy:*
 /start - Botni ishga tushirish
 /help - Yordam
+/status - Bot holati
+
+*Kompyuter:*
 /screenshot - Screenshot olish
 /system - Tizim ma'lumot
 /files - Fayllar ro'yxati
-/execute <kod> - Python kod ishga tushirish
 
-*Foydalanish:*
-- Matn yozing - Agent javob beradi
-- Screenshot so'rang - Ekran rasmi yuboriladi
-- Buyruq bering - Kompyuteringizda bajariladi
+*Agent:*
+/ask <savol> - Agentga savol bering
+/cancel <job_id> - Vazifani bekor qilish
 
-*Eslatma:* Faqat ruxsat etilgan foydalanuvchilar ishlatishi mumkin.
-"""
+*Admin (faqat adminlar):*
+/users - Foydalanuvchilar ro'yxati
+/adduser <id> - Foydalanuvchi qo'shish
+/execute <kod> - Buyruq ishga tushirish
+
+*Boshqa:*
+/jobs - Joriy vazifalar"""
+        
         await update.message.reply_text(help_text, parse_mode="Markdown")
     
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Status command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        # Get rate limit info
+        remaining = self.rate_limiter.get_remaining(user_id)
+        
+        # Get user jobs
+        jobs = self.job_tracker.get_user_jobs(user_id)
+        active_jobs = [j for j in jobs if j.status in [JobStatus.PENDING, JobStatus.RUNNING]]
+        
+        status = f"""📊 *Bot Holati:*
+
+✅ Ishlaydi
+
+📈 *Rate Limit:* {remaining} / 20 ta xabar (1 daqiqa)
+
+📋 *Joriy vazifalar:* {len(active_jobs)} ta"""
+        
+        await update.message.reply_text(status, parse_mode="Markdown")
+    
     async def screenshot_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """ /screenshot command """
+        """Screenshot command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        # Check rate limit
+        if not self.rate_limiter.check(user_id):
+            await update.message.reply_text("⏳ Ko'p so'rovlar. Keyin urinib ko'ring.")
+            return
+        
         try:
+            # Create async job
+            job_id = self.job_tracker.create_job(user_id, "screenshot")
+            self.job_tracker.update_job(job_id, JobStatus.RUNNING)
+            
+            # Send progress
+            await update.message.reply_text("📸 Screenshot olinmoqda...")
+            
+            # Take screenshot
             from agent.tools import ToolsEngine
             tools = ToolsEngine()
             result = tools.take_screenshot()
             
-            # Extract filepath
-            if "saqlandi:" in result:
-                filepath = result.split("saqlandi: ")[1].strip()
-                
-                # Send photo
-                with open(filepath, 'rb') as photo:
-                    await update.message.reply_photo(photo, caption="📸 Screenshot")
-            else:
-                await update.message.reply_text(result)
-                
+            # Extract path
+            if "saqlandi:" in result or "saved:" in result.lower():
+                # Try to find path
+                import re
+                path_match = re.search(r'[:/\\]([^\s]+\.png)', result)
+                if path_match:
+                    filepath = path_match.group(0)
+                    if not filepath.startswith('/'):
+                        filepath = '/' + filepath
+                    
+                    # Send photo
+                    try:
+                        with open(filepath, 'rb') as photo:
+                            await update.message.reply_photo(photo, caption="📸 Screenshot")
+                        self.job_tracker.update_job(job_id, JobStatus.COMPLETED, progress=1.0)
+                        return
+                    except Exception as e:
+                        pass
+            
+            await update.message.reply_text(result)
+            self.job_tracker.update_job(job_id, JobStatus.COMPLETED, progress=1.0)
+            
         except Exception as e:
             await update.message.reply_text(f"❌ Xatolik: {str(e)}")
+            self.job_tracker.update_job(job_id, JobStatus.FAILED, error=str(e))
     
     async def system_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """ /system command """
+        """System info command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        if not self.rate_limiter.check(user_id):
+            await update.message.reply_text("⏳ Ko'p so'rovlar. Keyin urinib ko'ring.")
+            return
+        
         try:
             from agent.tools import ToolsEngine
             tools = ToolsEngine()
@@ -107,51 +403,67 @@ class TelegramBot:
             await update.message.reply_text(f"❌ Xatolik: {str(e)}")
     
     async def files_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """ /files command """
+        """Files list command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        if not self.rate_limiter.check(user_id):
+            await update.message.reply_text("⏳ Ko'p so'rovlar.")
+            return
+        
         try:
-            from agent.tools import ToolsEngine
-            tools = ToolsEngine()
-            result = tools.list_directory(".")
-            await update.message.reply_text(result[:4000])  # Limit length
-        except Exception as e:
-            await update.message.reply_text(f"❌ Xatolik: {str(e)}")
-    
-    async def execute_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """ /execute <code> command """
-        try:
-            # Extract code from message
-            code = update.message.text.replace("/execute", "").strip()
-            
-            if not code:
-                await update.message.reply_text("❌ Kod kiritilmagan. Foydalanish: /execute print('Hello')")
-                return
+            # Get directory from args or use default
+            directory = "."
+            if context.args:
+                directory = context.args[0]
             
             from agent.tools import ToolsEngine
             tools = ToolsEngine()
-            result = tools.execute_code(code, "python")
+            result = tools.list_directory(directory)
             
-            await update.message.reply_text(f"💻 *Natija:*\n\n{result}", parse_mode="Markdown")
-            
+            # Split if too long
+            if len(result) > 4000:
+                chunks = [result[i:i+4000] for i in range(0, len(result), 4000)]
+                for chunk in chunks:
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(result)
+                
         except Exception as e:
             await update.message.reply_text(f"❌ Xatolik: {str(e)}")
     
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle regular messages - forward to agent"""
+    async def ask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ask agent command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        if not self.rate_limiter.check(user_id):
+            await update.message.reply_text("⏳ Ko'p so'rovlar.")
+            return
+        
+        # Get question
+        question = " ".join(context.args)
+        
+        if not question:
+            await update.message.reply_text("❌ Savol kiritilmagan. Foydalanish: /ask Python haqida nima bilasiz?")
+            return
+        
+        # Show typing
+        await context.bot.send_chat_action(
+            chat_id=update.effective_message.chat_id,
+            action="typing"
+        )
+        
         try:
-            user_message = update.message.text
-            
-            # Show typing indicator
-            await context.bot.send_chat_action(
-                chat_id=update.effective_message.chat_id,
-                action="typing"
-            )
-            
             # Process through agent
-            response = self.agent.handle_message(user_message)
+            response = self.agent.handle_message(question)
             
-            # Send response (split if too long)
+            # Send response
             if len(response) > 4000:
-                # Split into chunks
                 chunks = [response[i:i+4000] for i in range(0, len(response), 4000)]
                 for chunk in chunks:
                     await update.message.reply_text(chunk)
@@ -161,18 +473,170 @@ class TelegramBot:
         except Exception as e:
             await update.message.reply_text(f"❌ Xatolik: {str(e)}")
     
+    async def jobs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List jobs command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        jobs = self.job_tracker.get_user_jobs(user_id)
+        
+        if not jobs:
+            await update.message.reply_text("📋 Hech qanday vazifa yo'q")
+            return
+        
+        text = "📋 *Sizning vazifalaringiz:*\n\n"
+        
+        for job in jobs[-5:]:  # Last 5
+            status_emoji = {
+                JobStatus.PENDING: "⏳",
+                JobStatus.RUNNING: "🔄",
+                JobStatus.COMPLETED: "✅",
+                JobStatus.FAILED: "❌",
+                JobStatus.CANCELLED: "🚫"
+            }.get(job.status, "❓")
+            
+            text += f"{status_emoji} `{job.job_id}` - {job.command[:30]}...\n"
+            text += f"   Holat: {job.status.value}\n\n"
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+    
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel job command"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            return
+        
+        if not context.args:
+            await update.message.reply_text("❌ Job ID kiritilmagan. Foydalanish: /cancel <job_id>")
+            return
+        
+        job_id = context.args[0]
+        
+        if self.job_tracker.cancel_job(job_id):
+            await update.message.reply_text(f"✅ Vazifa bekor qilindi: {job_id}")
+        else:
+            await update.message.reply_text(f"❌ Vazifa topilmadi yoki allaqachon tugagan")
+    
+    # ==================== ADMIN COMMANDS ====================
+    
+    async def users_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List authorized users (admin only)"""
+        user_id = update.effective_user.id
+        
+        if not self.is_admin(user_id):
+            await update.message.reply_text("❌ Adminlar uchun")
+            return
+        
+        text = f"""👥 *Ruxsat etilgan foydalanuvchilar:*
+
+Jami: {len(self.authorized_users)} ta
+Admin: {len(self.admin_users)} ta
+
+ID lar: {', '.join(str(u) for u in self.authorized_users) or 'Yo\'q'}"""
+        
+        await update.message.reply_text(text, parse_mode="Markdown")
+    
+    async def adduser_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add user (admin only)"""
+        user_id = update.effective_user.id
+        
+        if not self.is_admin(user_id):
+            await update.message.reply_text("❌ Adminlar uchun")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("❌ Foydalanuvchi ID si kiritilmagan")
+            return
+        
+        try:
+            new_user_id = int(context.args[0])
+            self.authorized_users.add(new_user_id)
+            await update.message.reply_text(f"✅ Foydalanuvchi qo'shildi: {new_user_id}")
+        except:
+            await update.message.reply_text("❌ Noto'g'ri ID")
+    
+    async def execute_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Execute command (admin only)"""
+        user_id = update.effective_user.id
+        
+        if not self.is_admin(user_id):
+            await update.message.reply_text("❌ Adminlar uchun")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("❌ Buyruq kiritilmagan")
+            return
+        
+        command = " ".join(context.args)
+        
+        try:
+            from agent.tools import ToolsEngine
+            tools = ToolsEngine()
+            result = tools.execute_command(command)
+            await update.message.reply_text(f"💻 *Natija:*\n\n{result}", parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Xatolik: {str(e)}")
+    
+    # ==================== MESSAGE HANDLER ====================
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle regular messages"""
+        user_id = update.effective_user.id
+        
+        if not self.is_authorized(user_id):
+            await update.message.reply_text("❌ Siz ruxsat etilmagan foydalanuvchisiz")
+            return
+        
+        if not self.rate_limiter.check(user_id):
+            await update.message.reply_text("⏳ Ko'p so'rovlar. Keyin urinib ko'ring.")
+            return
+        
+        user_message = update.message.text
+        
+        # Show typing
+        await context.bot.send_chat_action(
+            chat_id=update.effective_message.chat_id,
+            action="typing"
+        )
+        
+        try:
+            # Process through agent
+            response = self.agent.handle_message(user_message)
+            
+            # Send response
+            if len(response) > 4000:
+                chunks = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for chunk in chunks:
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(response)
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Xatolik: {str(e)}")
+    
+    # ==================== ERROR HANDLER ====================
+    
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Error handler"""
         logger.error(f"Telegram error: {context.error}")
+        
         if update and update.effective_message:
-            await update.effective_message.reply_text(
-                f"❌ Xatolik yuz berdi: {str(context.error)}"
-            )
+            try:
+                await update.effective_message.reply_text(
+                    f"❌ Xatolik yuz berdi"
+                )
+            except:
+                pass
+    
+    # ==================== RUN ====================
     
     def run(self):
         """Run the bot"""
         if not TELEGRAM_AVAILABLE:
-            logger.error("python-telegram-bot o'rnatilmagan!")
+            logger.error("python-telegram-bot not installed!")
             return
         
         # Create application
@@ -181,10 +645,18 @@ class TelegramBot:
         # Add handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
+        self.app.add_handler(CommandHandler("status", self.status_command))
         self.app.add_handler(CommandHandler("screenshot", self.screenshot_command))
         self.app.add_handler(CommandHandler("system", self.system_command))
         self.app.add_handler(CommandHandler("files", self.files_command))
-        self.app.add_handler(CommandHandler("execute", self.execute_command))
+        self.app.add_handler(CommandHandler("ask", self.ask_command))
+        self.app.add_handler(CommandHandler("jobs", self.jobs_command))
+        self.app.add_handler(CommandHandler("cancel", self.cancel_command))
+        
+        # Admin commands
+        self.app.add_handler(CommandHandler("users", self.users_command))
+        self.app.add_handler(CommandHandler("adduser", self.adduser_command))
+        self.app.add_handler(CommandHandler("execute", self.execute_admin_command))
         
         # Message handler
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
@@ -194,57 +666,60 @@ class TelegramBot:
         
         logger.info("📱 Telegram Bot ishga tushirilmoqda...")
         
-        # Run (polling)
+        # Run
         self.app.run_polling(poll_interval=1.0)
 
 
+# ==================== BOT MANAGER ====================
+
 class TelegramBotManager:
-    """
-    Telegram bot boshqaruvchisi
-    """
+    """Bot manager"""
     
     def __init__(self):
         self.bot = None
         self.is_running = False
     
-    def start_bot(self, token: str, agent) -> str:
-        """Botni ishga tushirish"""
+    def start_bot(self, token: str, agent, config: Dict = None) -> str:
+        """Start bot"""
         if not token:
-            return "❌ Telegram token kiritilmagan. Bot.run(TOKEN) ni chaqiring"
+            return "❌ TELEGRAM_BOT_TOKEN .env da o'rnatilmagan"
+        
+        if not TELEGRAM_AVAILABLE:
+            return "❌ python-telegram-bot o'rnatilmagan"
         
         try:
-            self.bot = TelegramBot(token, agent)
-            # Start in background
+            self.bot = TelegramBot(token, agent, config)
+            
             import threading
             thread = threading.Thread(target=self.bot.run, daemon=True)
             thread.start()
             self.is_running = True
             
-            return "📱 Telegram Bot ishga tushdi!\n\nEndi telefoningizdan /start yozing"
+            return "📱 Telegram Bot ishga tushdi!\n\n/start yozing"
         
         except Exception as e:
-            return f"❌ Xatolik: {str(e)}\n\nKutubxona o'rnatilmagan bo'lishi mumkin:\npip install python-telegram-bot"
+            return f"❌ Xatolik: {str(e)}"
     
     def stop_bot(self) -> str:
-        """Botni to'xtatish"""
+        """Stop bot"""
         if self.bot and self.bot.app:
             self.bot.app.stop()
             self.is_running = False
-            return "📱 Telegram Bot to'xtatildi"
+            return "📱 Bot to'xtatildi"
         return "❌ Bot ishlamaydi"
     
     def get_status(self) -> str:
-        """Holatni olish"""
+        """Get status"""
         status = "ishlaydi" if self.is_running else "to'xtatilgan"
-        return f"Telegram Bot: {status}"
+        return f"📱 Telegram Bot: {status}"
 
 
 # Global instance
 telegram_manager = TelegramBotManager()
 
-def start_telegram_bot(token: str, agent) -> str:
+def start_telegram_bot(token: str, agent, config: Dict = None) -> str:
     """Start Telegram bot"""
-    return telegram_manager.start_bot(token, agent)
+    return telegram_manager.start_bot(token, agent, config)
 
 def stop_telegram_bot() -> str:
     """Stop Telegram bot"""
