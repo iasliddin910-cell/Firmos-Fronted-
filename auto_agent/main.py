@@ -249,13 +249,19 @@ class OmniAgent:
                 status="completed"
             )
             
-            return result
+            # Secret redaction
+        if hasattr(self, "secret_guard"):
+            result = self.secret_guard.redact(result)
+        return result
             
         except Exception as e:
             logger.error(f"Error in kernel: {e}")
             # Fallback to brain if kernel fails
             result = self.brain.think(user_message)
-            return result
+            # Secret redaction
+        if hasattr(self, "secret_guard"):
+            result = self.secret_guard.redact(result)
+        return result
     
     def submit_task(self, task: str) -> str:
         """Public method for external callers (Telegram, etc.)"""
