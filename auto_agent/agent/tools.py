@@ -143,7 +143,8 @@ class CommandPolicy:
         # Check workspace boundary
         if ".." in command:
             # Allow relative paths within workspace
-            pass  # Let it through, will be checked at execution
+
+            logger.warning("Feature not fully implemented")
         
         return True, "OK"
     

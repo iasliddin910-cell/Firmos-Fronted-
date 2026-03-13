@@ -458,16 +458,16 @@ class CodeInterpreter:
             if "unexpected" in error_lower:
                 lines = code.split("\n")
                 # Find and fix lines with obvious issues
-                pass
-        
+
+            logger.warning("Feature not fully implemented")
         if "importerror" in error_lower or "modulenotfounderror" in error_lower:
             # Try to add import
-            pass
-        
+
+            logger.warning("Feature not fully implemented")
         if "attributeerror" in error_lower:
             # Try to fix attribute access
-            pass
-        
+
+            logger.warning("Feature not fully implemented")
         if "indentationerror" in error_lower:
             # Try to fix indentation
             lines = code.split("\n")

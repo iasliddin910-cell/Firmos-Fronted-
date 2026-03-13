@@ -191,7 +191,8 @@ def test_{spec.name}_basic():
 def test_{spec.name}_parameters():
     """Test parameter handling"""
     # Add parameter tests here
-    pass
+
+            logger.warning("Feature not fully implemented")
 '''
         
         return tests

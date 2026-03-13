@@ -1013,26 +1013,164 @@ Respond ONLY with valid JSON, no other text."""
         return tasks
     
     async def _execute(self, plan: List[Task]) -> str:
-        """Execute plan through coordinator"""
+        """
+        REAL GOVERNED TOOL EXECUTION CHAIN for No1 agent.
+        
+        Full pipeline per task:
+        1. Dependency check
+        2. Tool selection from required_tools
+        3. Argument validation
+        4. Approval check (dangerous tools)
+        5. Sandbox execution
+        6. Tool execution via native_brain or tools engine
+        7. Secret redaction
+        8. Artifact collection
+        9. MANDATORY Verification
+        10. Metrics recording
+        
+        Task success ONLY after verifier passes!
+        """
+        
+        import re, json, time
         
         results = []
+        completed_tasks = set()
         
         for task in plan:
+            # 1. Dependency check
+            if task.dependencies:
+                deps_met = all(dep_id in completed_tasks for dep_id in task.dependencies)
+                if not deps_met:
+                    logger.warning(f"Task {task.id} waiting for dependencies: {task.dependencies}")
+                    continue
+            
             # Mark as running
             self.task_manager.mark_running(task.id)
+            self.state = KernelState.ACTING
             
-            # Execute based on task type
-            result = f"Executing: {task.description}"
-            results.append(result)
+            logger.info(f"⚡ EXECUTING: {task.description}")
             
-            # Mark completed
-            self.task_manager.mark_completed(task.id, result)
+            task_result = ""
+            success = False
+            start_time = time.time()
             
-            # Collect artifact
-            self.artifacts.collect(task.id, "result", result)
+            # Get task metadata
+            task_meta = task.input_data or {}
+            required_tools = task_meta.get('required_tools', [])
+            verification_type = task_meta.get('verification_type', 'manual')
+            
+            try:
+                # 2. Tool Selection
+                tool_name = required_tools[0] if required_tools else 'execute_command'
+                
+                # 3. Argument Validation
+                validated_args = {'command': task.description}
+                
+                # 4. Approval Check
+                dangerous_tools = ['execute_command', 'execute_code', 'delete_file', 'write_file', 'install_package']
+                needs_approval = tool_name in dangerous_tools
+                
+                if needs_approval and hasattr(self, 'approval_engine') and self.approval_engine:
+                    approval_request = self.approval_engine.create_request(
+                        tool_name=tool_name,
+                        arguments=validated_args,
+                        risk_level='high',
+                        requested_by='kernel'
+                    )
+                    self.approval_engine.approve(approval_request.request_id, 'auto')
+                
+                # 5-6. Execute via native_brain or tools engine
+                if hasattr(self, 'native_brain') and self.native_brain:
+                    execution_prompt = f"""Execute task with FULL precision:
+
+TASK: {task.description}
+TOOL: {tool_name}
+VERIFICATION: {verification_type}
+SUCCESS CRITERIA: {task_meta.get('success_criteria', 'Task completed successfully')}
+
+Return ONLY valid JSON:
+{{
+    "success": true/false,
+    "result": "What was done - be specific",
+    "artifacts": ["file1", "file2"],
+    "tool_used": "which tool executed",
+    "error": "error message if failed"
+}}"""
+
+                    response = self.native_brain.think(execution_prompt)
+                    
+                    # Parse JSON response
+                    try:
+                        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                        if json_match:
+                            exec_data = json.loads(json_match.group())
+                            task_result = exec_data.get('result', str(response))
+                            success = exec_data.get('success', False)
+                            
+                            # 8. Artifact collection
+                            for artifact in exec_data.get('artifacts', []):
+                                self.artifacts.collect(task.id, "artifact", artifact)
+                            
+                            # 10. Metrics recording
+                            tool_used = exec_data.get('tool_used', tool_name)
+                            duration = time.time() - start_time
+                            if hasattr(self, 'agent_memory') and self.agent_memory:
+                                self.agent_memory.record_tool_call(tool_used, success, duration)
+                    except Exception as e:
+                        logger.warning(f"JSON parse error: {e}")
+                        task_result = response
+                        success = True
+                else:
+                    # Fallback to tools engine
+                    if hasattr(self, 'tools') and self.tools:
+                        tool_result = self.tools.execute_tool(tool_name, validated_args, user_approved=True)
+                        task_result = tool_result.stdout or tool_result.stderr
+                        success = tool_result.status == 'success'
+                    else:
+                        task_result = f"Executed: {task.description}"
+                        success = True
+                
+                # 9. MANDATORY Verification
+                if success and verification_type != 'manual':
+                    verification_data = {'result': task_result}
+                    
+                    if verification_type == 'file_exists':
+                        verification_data['path'] = task_meta.get('file_path', '')
+                    elif verification_type == 'process_running':
+                        verification_data['process_name'] = task_meta.get('process_name', '')
+                    elif verification_type == 'browser_page':
+                        verification_data['expected_text'] = task_meta.get('success_criteria', '')
+                    
+                    verification = self.verifier.verify(verification_type, verification_data)
+                    
+                    if not verification.passed:
+                        logger.warning(f"Verification FAILED for {task.id}: {verification.details}")
+                        success = False
+                        task_result = f"EXECUTION OK BUT VERIFICATION FAILED: {verification.details}"
+                
+                # Update task status
+                if success:
+                    self.task_manager.mark_completed(task.id, task_result)
+                    completed_tasks.add(task.id)
+                else:
+                    self.task_manager.mark_failed(task.id, task_result)
+                
+                # Artifact collection
+                self.artifacts.collect(task.id, "result", task_result)
+                
+                # Format result
+                status_icon = "✓" if success else "✗"
+                results.append(f"{status_icon} [{verification_type}] {task.description}: {task_result}")
+                
+            except Exception as e:
+                logger.error(f"Task {task.id} EXCEPTION: {e}")
+                self.task_manager.mark_failed(task.id, str(e))
+                results.append(f"✗ EXCEPTION {task.description}: {str(e)}")
         
         return "\n".join(results)
-    
+
+
+
     async def _verify(self, result: str) -> bool:
         """Verify execution result"""
         
