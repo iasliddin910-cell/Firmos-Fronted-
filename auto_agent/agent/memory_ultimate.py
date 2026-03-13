@@ -69,8 +69,7 @@ class VectorMemory:
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
-                pass
+            except Exception as e: logger.warning(f"Exception: {e}")
         return {}
     
     def _save_json(self, filepath: Path, data: Dict):
@@ -391,8 +390,7 @@ class AgentStateMemory:
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
-                pass
+            except Exception as e: logger.warning(f"Exception: {e}")
         return {}
     
     def _save_json(self, filepath: Path, data: Dict):

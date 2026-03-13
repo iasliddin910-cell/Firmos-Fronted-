@@ -672,8 +672,7 @@ ID lar: {', '.join(str(u) for u in self.authorized_users) or 'Yo\'q'}"""
                 await update.effective_message.reply_text(
                     f"❌ Xatolik yuz berdi"
                 )
-            except:
-                pass
+            except Exception as e: logger.warning(f"Exception: {e}")
     
     # ==================== RUN ====================
     

@@ -254,8 +254,7 @@ class BrowserManager:
                     url=page.url,
                     is_active=(tab_id == self.active_page_id)
                 ))
-            except:
-                pass
+            except Exception as e: logger.warning(f"Exception: {e}")
         
         return tabs
     
@@ -448,13 +447,11 @@ class BrowserManager:
                         "text": link.inner_text()[:50],
                         "href": link.get_attribute("href")
                     })
-                except:
-                    pass
+                except Exception as e: logger.warning(f"Exception: {e}")
             
             return result
         
-        except:
-            return []
+        except Exception as e: logger.warning(f"Exception: {e}"); return []
     
     def extract_images(self) -> List[Dict]:
         """Extract all images from page"""
@@ -474,13 +471,11 @@ class BrowserManager:
                         "src": img.get_attribute("src"),
                         "title": img.get_attribute("title") or ""
                     })
-                except:
-                    pass
+                except Exception as e: logger.warning(f"Exception: {e}")
             
             return result
         
-        except:
-            return []
+        except Exception as e: logger.warning(f"Exception: {e}"); return []
     
     # ==================== SCREENSHOTS ====================
     
@@ -694,8 +689,7 @@ class BrowserManager:
             for page in self.pages.values():
                 try:
                     page.close()
-                except:
-                    pass
+                except Exception as e: logger.warning(f"Exception: {e}")
             
             # Close context
             if self.context:

@@ -172,8 +172,7 @@ class VerificationEngine:
                 if process_name.lower() in proc.info['name'].lower():
                     running = True
                     break
-            except:
-                pass
+            except Exception as e: logger.warning(f"Exception: {e}")
         
         return VerificationResult(
             passed=running,

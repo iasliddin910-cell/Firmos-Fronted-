@@ -434,8 +434,7 @@ class DependencyManager:
         try:
             with open(filepath) as f:
                 return [line.strip() for line in f if line.strip() and not line.startswith("#")]
-        except:
-            return []
+        except Exception as e: logger.warning(f"Exception: {e}"); return []
     
     def sync_all(self) -> Dict[str, InstallResult]:
         """Sync all detected package managers"""

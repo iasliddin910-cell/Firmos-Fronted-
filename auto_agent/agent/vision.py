@@ -213,8 +213,7 @@ If not found, return: {{"found": false}}"""
                         return None
                     
                     return (data.get("x", 0), data.get("y", 0))
-            except:
-                pass
+            except Exception as e: logger.warning(f"Exception: {e}")
             
             return None
             
@@ -334,8 +333,7 @@ If not found, return: {{"found": false}}"""
                 if confidence > 100:
                     confidence = min(confidence, 100)
                 return {"confidence": confidence, "reasoning": analysis}
-        except:
-            pass
+        except Exception as e: logger.warning(f"Exception: {e}")
         
         return {"confidence": 0, "reasoning": analysis}
 
