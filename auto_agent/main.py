@@ -117,7 +117,7 @@ class OmniAgent:
         # 7. Native Brain - Tool calling via OpenAI functions
         logger.info("🧠 Initializing Native Brain (Function Calling)...")
         from agent.native_brain import create_native_brain
-        self.brain = create_native_brain(self.api_key, self.tools)
+        self.brain = create_native_brain(self.api_key, self.tools, kernel=self.kernel, sandbox=self.sandbox, approval_engine=self.approval_engine)
         
         # =============================================
         # LAYER 6: CENTRAL KERNEL (THE HEART)

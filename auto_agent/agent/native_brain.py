@@ -198,10 +198,13 @@ class NativeFunctionBrain:
     - More reliable tool calling
     """
     
-    def __init__(self, api_key: str, tools_engine):
+    def __init__(self, api_key: str, tools_engine, kernel=None, sandbox=None, approval_engine=None):
         self.api_key = api_key
         self.tools = tools_engine
         self.client = OpenAI(api_key=api_key)
+        self.kernel = kernel
+        self.sandbox = sandbox
+        self.approval_engine = approval_engine
         
         # Function definitions
         self.functions = get_function_definitions()

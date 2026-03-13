@@ -90,7 +90,7 @@ class CommandPolicy:
     Command execution policy with allowlist/denylist
     """
     
-    def __init__(self):
+    def __init__(self, sandbox=None, approval_engine=None, secret_guard=None):
         # Block these patterns
         self.denylist = [
             "rm -rf /",
@@ -161,7 +161,7 @@ class ToolRegistry:
     Registry for all available tools
     """
     
-    def __init__(self):
+    def __init__(self, sandbox=None, approval_engine=None, secret_guard=None):
         self.tools: Dict[str, Dict] = {}
         self._register_default_tools()
     
@@ -421,7 +421,10 @@ class ToolsEngine:
     - Risk management
     """
     
-    def __init__(self):
+    def __init__(self, sandbox=None, approval_engine=None, secret_guard=None):
+        self.sandbox = sandbox
+        self.approval_engine = approval_engine
+        self.secret_guard = secret_guard
         self.registry = ToolRegistry()
         self.policy = CommandPolicy()
         self.audit = AuditLog()
