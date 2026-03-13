@@ -123,6 +123,44 @@ class ProceduralMemory:
 
 # ==================== AGENT STATE MEMORY ====================
 
+
+# ==================== FOUR-LAYER MEMORY ====================
+class FourLayerMemory:
+    """
+    Four-layer memory architecture:
+    1. Working memory - current task context
+    2. Episodic memory - past runs
+    3. Semantic memory - general knowledge
+    4. Procedural memory - learned workflows
+    """
+    
+    def __init__(self):
+        self.working = {}  # Current task
+        self.episodic = []  # Past runs
+        self.semantic = {}  # Knowledge
+        self.procedural = {}  # Workflows
+    
+    def set_working(self, key, value):
+        self.working[key] = value
+    
+    def add_episodic(self, event):
+        import time
+        self.episodic.append({"event": event, "time": time.time()})
+        if len(self.episodic) > 1000:
+            self.episodic = self.episodic[-1000:]
+    
+    def add_semantic(self, key, value):
+        self.semantic[key] = value
+    
+    def add_procedural(self, name, steps):
+        self.procedural[name] = {"steps": steps, "uses": 0}
+    
+    def get_procedural(self, name):
+        if name in self.procedural:
+            self.procedural[name]["uses"] += 1
+        return self.procedural.get(name)
+
+
 class AgentStateMemory:
     """
     Comprehensive memory for autonomous agents

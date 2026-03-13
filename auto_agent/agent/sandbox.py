@@ -33,7 +33,8 @@ class ExecutionMode(Enum):
     SAFE = "safe"           # Whitelist only
     NORMAL = "normal"       # Basic restrictions
     ADVANCED = "advanced"   # Full sandbox
-    UNRESTRICTED = "unrestricted"  # No restrictions (for trusted ops)
+    UNRESTRICTED = "unrestricted"
+    CONTAINERIZED = "containerized"  # No restrictions (for trusted ops)
 
 
 class CommandCategory(Enum):
