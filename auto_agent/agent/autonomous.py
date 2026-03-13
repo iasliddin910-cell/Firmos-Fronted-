@@ -488,6 +488,12 @@ Return ONLY valid JSON:"""
 
 class AutonomousEngine:
     """
+    DEPRECATED: This class is now integrated into kernel.py
+    Use CentralKernel instead for all orchestration needs.
+    All functionality has been moved to kernel for unified architecture.
+    """
+    # This class is kept for backward compatibility only
+    """
     REFACTORED: Full autonomous engine with real planning
     
     Features:
