@@ -89,10 +89,11 @@ class VoiceSystem:
         logger.info("🎤 Doimiy eshitish boshlandi")
     
     def _continuous_listen(self, callback: Callable[[str], None]):
-        """Background listening loop"""
+        """Background listening loop - placeholder for audio setup"""
         while self.is_listening:
-            # This would require proper audio setup
-            pass
+            logger.debug("Waiting for audio input (STT not configured)")
+            import time
+            time.sleep(0.5)
     
     def stop_listening(self):
         """Eshitishni to'xtatish"""

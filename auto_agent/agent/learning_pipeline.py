@@ -183,12 +183,20 @@ class SourceDiscovery:
     
     def _save_sources(self):
         """Save sources to disk"""
-        # Simplified - would save to JSON
-        pass
+        import json
+        import os
+        os.makedirs("data/learning", exist_ok=True)
+        with open("data/learning/sources.json", "w") as f:
+            json.dump(self.sources, f, indent=2, default=str)
     
     def _load_sources(self):
         """Load sources from disk"""
-        pass
+        import json
+        import os
+        sources_file = "data/learning/sources.json"
+        if os.path.exists(sources_file):
+            with open(sources_file, "r") as f:
+                self.sources = json.load(f)
 
 
 # ==================== CONTENT PROCESSOR ====================
@@ -407,9 +415,33 @@ class KnowledgeStore:
         return removed
     
     def deduplicate(self):
-        """Remove duplicate knowledge"""
-        # Simplified - would use embeddings for semantic dedup
-        pass
+        """Remove duplicate knowledge using content hashing"""
+        import hashlib
+        
+        seen_hashes = set()
+        removed = []
+        
+        for item_id in list(self.items.keys()):
+            item = self.items[item_id]
+            # Create hash of content
+            content_hash = hashlib.md5(item.content.encode()).hexdigest()
+            
+            if content_hash in seen_hashes:
+                # Remove duplicate
+                del self.items[item_id]
+                removed.append(item_id)
+                # Remove from indexes
+                for tag in item.tags:
+                    self.tag_index[tag].discard(item_id)
+                self.source_index[item.source_url].discard(item_id)
+            else:
+                seen_hashes.add(content_hash)
+        
+        if removed:
+            self._save()
+            logger.info(f"🗑️ Removed {len(removed)} duplicate items")
+        
+        return removed
     
     def get_stats(self) -> Dict:
         """Get store statistics"""
