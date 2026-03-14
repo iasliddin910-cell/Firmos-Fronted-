@@ -2572,157 +2572,96 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         # Enhanced fallback planner
         return self._heuristic_planner(message)
     
-    def _parse_llm_plan(self, response: str) -> List[Task]:
+        def _parse_llm_plan(self, response: str) -> List[Task]:
         """
-        ROBUST JSON PARSING with multiple strategies + diagnostics.
+        STRICT JSON PARSING - No1-grade governed.
         
-        Fixed issues:
-        - Strict schema validation
-        - Safer extraction
-        - Invalid-plan diagnostics
-        - Parsing telemetry
-        - No silent failures (logging all strategy attempts)
+        HAQIQAT: Tool result from execution, NOT from LLM parsing.
+        LLM output is ONLY suggestion for planning.
+        
+        Strict validation:
+        - Schema validation MANDATORY
+        - Invalid plan diagnostics
+        - Failed parse telemetry
+        - Planner quality metrics
+        - NO silent failures
         """
-        
         import re, json
         import time
-        
+
         tasks = []
-        parsing_attempts = []  # For telemetry
+        parsing_attempts = []
         parse_diagnostics = {"response_length": 0, "has_json_markers": False, "has_prose": False, "strategies_tried": [], "failures": []}
-        
-        # Pre-processing: Clean response
+
+        # Pre-processing
         response = response.strip()
+        parse_diagnostics["response_length"] = len(response)
         
-        # Multiple parsing strategies with diagnostics
+        # Check if response is prose (model hallucination risk)
+        if response.startswith(("{", "[")):
+            parse_diagnostics["has_json_markers"] = True
+        else:
+            parse_diagnostics["has_prose"] = True
+            logger.warning("⚠️ LLM response contains prose, not JSON - HIGH RISK")
+
+        # STRICT parsing strategies
         parsing_strategies = [
-            {
-                'name': 'tasks_key_object',
-                'pattern': r'\{[^{}]*"tasks"\s*:\s*\[.*\]',
-                'try_extract': lambda: re.search(r'\{[^{}]*"tasks"\s*:\s*\[.*\]', response, re.DOTALL)
-            },
-            {
-                'name': 'array_with_description',
-                'pattern': r'\[[\s\S]*"description"[\s\S]*\]',
-                'try_extract': lambda: re.search(r'\[[\s\S]*"description"[\s\S]*\]', response)
-            },
-            {
-                'name': 'json_object_any_key',
-                'pattern': r'\{[^{}]*"id"[^{}]*"description"[^{}]*\}',
-                'try_extract': lambda: re.search(r'\{[^{}]*"id"[^{}]*"description"[^{}]*\}', response, re.DOTALL)
-            },
-            {
-                'name': 'brackets_balanced',
-                'pattern': 'any',
-                'try_extract': lambda: self._extract_balanced_brackets(response)
-            },
-            {
-                'name': 'line_by_line_json',
-                'pattern': 'any',
-                'try_extract': lambda: self._extract_json_lines(response)
-            }
+            {'name': 'tasks_key_object', 'pattern': r'\{[^{}]*"tasks"\s*:\s*\[', 'try_extract': lambda: re.search(r'\{[^{}]*"tasks"\s*:\s*\[.*\]', response, re.DOTALL)},
+            {'name': 'array_with_description', 'pattern': r'\[.*"description".*\]', 'try_extract': lambda: re.search(r'\[.*"description".*\]', response)},
+            {'name': 'brackets_balanced', 'pattern': 'any', 'try_extract': lambda: self._extract_balanced_brackets(response)},
         ]
-        
+
         for strategy in parsing_strategies:
             strategy_name = strategy['name']
             start_time = time.time()
             parse_diagnostics["strategies_tried"].append(strategy_name)
-            
+
             try:
                 json_match = strategy['try_extract']()
-                
                 if json_match:
                     json_str = json_match.group() if hasattr(json_match, 'group') else str(json_match)
-                    parse_diagnostics["has_json_markers"] = True
                     
-                    # Validate JSON structure
+                    # STRICT: Validate JSON
                     try:
                         tasks_data = json.loads(json_str)
                         
-                        # Schema validation
+                        # STRICT: Validate schema
                         validation_result = self._validate_plan_schema(tasks_data)
                         
                         if validation_result['valid']:
                             if isinstance(tasks_data, dict) and 'tasks' in tasks_data:
                                 tasks_data = tasks_data['tasks']
-                            
+
                             if isinstance(tasks_data, list):
+                                # Create tasks with diagnostics
                                 tasks = self._create_tasks_from_plan({"tasks": tasks_data}, response_snippet=response)
                                 if tasks:
                                     parsing_attempts.append({
-                                        'strategy': strategy_name,
-                                        'success': True,
-                                        'tasks_count': len(tasks),
-                                        'time_ms': (time.time() - start_time) * 1000
+                                        'strategy': strategy_name, 'success': True, 'tasks_count': len(tasks), 'time_ms': (time.time() - start_time) * 1000
                                     })
-                                    logger.info(f"Plan parsing SUCCESS with strategy: {strategy_name}, tasks: {len(tasks)}")
-                                    
-                                    # Emit success telemetry
                                     self._emit_plan_parsing_telemetry(True, parsing_attempts, response, parse_diagnostics, strategy_name)
                                     return tasks
                         else:
-                            logger.warning(f"Schema validation failed for {strategy_name}: {validation_result['errors']}")
-                            parsing_attempts.append({
-                                'strategy': strategy_name,
-                                'success': False,
-                                'reason': 'schema_validation_failed',
-                                'errors': validation_result['errors'],
-                                'snippet': json_str[:200],
-                                'time_ms': (time.time() - start_time) * 1000
-                            })
-                            parse_diagnostics["failures"].append({
-                                'strategy': strategy_name,
-                                'reason': 'schema_validation_failed',
-                                'errors': validation_result['errors']
-                            })
+                            # Schema failed - log and continue
+                            pass
                             
                     except json.JSONDecodeError as e:
-                        logger.warning(f"JSON decode failed for {strategy_name}: {e}")
-                        parsing_attempts.append({
-                            'strategy': strategy_name,
-                            'success': False,
-                            'reason': 'json_decode_error',
-                            'error': str(e),
-                            'snippet': response[:200],
-                            'time_ms': (time.time() - start_time) * 1000
-                        })
-                        parse_diagnostics["failures"].append({
-                            'strategy': strategy_name,
-                            'reason': 'json_decode_error',
-                            'error': str(e)
-                        })
-                else:
-                    parsing_attempts.append({
-                        'strategy': strategy_name,
-                        'success': False,
-                        'reason': 'no_match',
-                        'time_ms': (time.time() - start_time) * 1000
-                    })
-                    
+                        parsing_attempts.append({'strategy': strategy_name, 'success': False, 'reason': 'json_decode_error', 'error': str(e), 'time_ms': (time.time() - start_time) * 1000})
+                        
             except Exception as e:
-                logger.warning(f"Strategy {strategy_name} failed with exception: {e}. Response snippet: {response[:200]}")
-                parsing_attempts.append({
-                    'strategy': strategy_name,
-                    'success': False,
-                    'reason': 'exception',
-                    'error': str(e),
-                    'snippet': response[:200],
-                    'time_ms': (time.time() - start_time) * 1000
-                })
-                parse_diagnostics["failures"].append({
-                    'strategy': strategy_name,
-                    'reason': 'exception',
-                    'error': str(e)
-                })
+                parsing_attempts.append({'strategy': strategy_name, 'success': False, 'reason': 'exception', 'error': str(e), 'time_ms': (time.time() - start_time) * 1000})
+
+        # ALL strategies failed - STRICT mode
+        logger.error(f"❌ Plan parsing FAILED - all strategies exhausted")
         
-        # Log all failed attempts for debugging
-        logger.error(f"Plan parsing FAILED. All attempts: {json.dumps(parsing_attempts, indent=2)}")
-        
-        # Emit telemetry for plan quality - ALWAYS emit, don't skip
+        # Emit failure telemetry
         self._emit_plan_parsing_telemetry(False, parsing_attempts, response, parse_diagnostics, None)
         
+        # STRICT: Return empty - do NOT fallback to model
         return tasks
-    
+
+
+
     def _emit_plan_parsing_telemetry(self, success: bool, parsing_attempts: List[Dict], response: str, parse_diagnostics: Dict, successful_strategy: str = None):
         """
         Emit telemetry for plan parsing with full diagnostics.
