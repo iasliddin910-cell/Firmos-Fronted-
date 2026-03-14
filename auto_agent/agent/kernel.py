@@ -2493,6 +2493,13 @@ class CentralKernel:
         # Use NEW Multi-Agent Coordinator with 6 full workers
         logger.info("🤖 Initializing NEW Multi-Agent Coordinator with 6 workers...")
         self.coordinator = NewMultiAgentCoordinator(api_key, tools_engine)
+
+        # Planner Quality Tracking
+        self.planner_quality = PlannerQualityTracker()
+
+        # Invalid snippets storage for debugging
+        self._invalid_snippets_dir = Path("data/invalid_snippets")
+        self._invalid_snippets_dir.mkdir(parents=True, exist_ok=True)
         
         self.artifacts = ArtifactCollector()
         self.telemetry = Telemetry()
@@ -2720,7 +2727,61 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 })
             except Exception as e:
                 logger.error(f"Failed to emit improvement signal: {e}")
+
+        # Record in planner quality tracker
+        if hasattr(self, 'planner_quality') and self.planner_quality:
+            strategy_used = successful_strategy if successful_strategy else "failed"
+            total_time = sum(a.get('time_ms', 0) for a in parsing_attempts)
+            self.planner_quality.record_parse(success, strategy_used, total_time)
+
+        # Save invalid snippets to disk for debugging
+        if not success and hasattr(self, '_invalid_snippets_dir'):
+            self._save_invalid_snippet(response, parse_diagnostics, parsing_attempts)
+
+        # Log detailed diagnostics
+        self._log_parse_diagnostics(parse_diagnostics, parsing_attempts)
     
+
+    def _save_invalid_snippet(self, response: str, diagnostics: Dict, attempts: List[Dict]):
+        """Save invalid parsing snippets to disk for debugging"""
+        import json
+        import uuid
+        import time
+        
+        try:
+            snippet_data = {
+                'snippet_id': str(uuid.uuid4())[:8],
+                'response': response[:2000],  # Limit size
+                'diagnostics': diagnostics,
+                'attempts': attempts,
+                'timestamp': time.time()
+            }
+            
+            filename = f"invalid_snippet_{snippet_data['snippet_id']}.json"
+            filepath = self._invalid_snippets_dir / filename
+            
+            with open(filepath, 'w') as f:
+                json.dump(snippet_data, f, indent=2)
+                
+            logger.info(f"💾 Invalid snippet saved: {filename}")
+        except Exception as e:
+            logger.error(f"Failed to save invalid snippet: {e}")
+
+    def _log_parse_diagnostics(self, diagnostics: Dict, attempts: List[Dict]):
+        """Log detailed parse diagnostics for debugging"""
+        # Log JSON markers status
+        if diagnostics.get('has_prose'):
+            logger.warning(f"   📝 Response contains prose (not pure JSON)")
+        if diagnostics.get('has_json_markers'):
+            logger.info(f"   📋 Response has JSON markers")
+            
+        # Log response length
+        logger.info(f"   📏 Response length: {diagnostics.get('response_length', 0)} chars")
+        
+        # Log each failed attempt
+        for i, attempt in enumerate(attempts):
+            if not attempt.get('success', False):
+                logger.warning(f"   ❌ Attempt {i+1}: {attempt.get('strategy')} - {attempt.get('reason')}: {attempt.get('error', 'N/A')}")
     def _extract_balanced_brackets(self, text: str) -> Optional[re.Match]:
         """Extract balanced JSON from text"""
         import re
@@ -3090,6 +3151,19 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 })
             except Exception as e:
                 logger.error(f"Failed to emit improvement signal: {e}")
+
+        # Record in planner quality tracker
+        if hasattr(self, 'planner_quality') and self.planner_quality:
+            strategy_used = successful_strategy if successful_strategy else "failed"
+            total_time = sum(a.get('time_ms', 0) for a in parsing_attempts)
+            self.planner_quality.record_parse(success, strategy_used, total_time)
+
+        # Save invalid snippets to disk for debugging
+        if not success and hasattr(self, '_invalid_snippets_dir'):
+            self._save_invalid_snippet(response, parse_diagnostics, parsing_attempts)
+
+        # Log detailed diagnostics
+        self._log_parse_diagnostics(parse_diagnostics, parsing_attempts)
         
         return tasks
     
@@ -6166,3 +6240,84 @@ class RecoveryEngine:
 
 
 
+
+
+# ==================== PLANNER QUALITY TRACKER ====================
+
+class PlannerQualityTracker:
+    """
+    Tracks planner quality over time with metrics.
+    
+    Provides:
+    - Success/failure rate tracking
+    - Per-strategy success rates
+    - Quality trends over time
+    - Invalid snippet logging for debugging
+    """
+    
+    def __init__(self):
+        self.parse_history: List[Dict] = []
+        self.strategy_stats: Dict[str, Dict] = defaultdict(lambda: {
+            'success': 0, 
+            'failure': 0, 
+            'total_time_ms': 0
+        })
+        self.quality_window = 100  # Track last 100 parses
+        
+    def record_parse(self, success: bool, strategy: str, time_ms: float, task_count: int = 0):
+        """Record a parse attempt"""
+        self.parse_history.append({
+            'success': success,
+            'strategy': strategy,
+            'time_ms': time_ms,
+            'task_count': task_count,
+            'timestamp': time.time()
+        })
+        
+        # Keep only last N records
+        if len(self.parse_history) > self.quality_window:
+            self.parse_history = self.parse_history[-self.quality_window:]
+            
+        # Update strategy stats
+        if success:
+            self.strategy_stats[strategy]['success'] += 1
+        else:
+            self.strategy_stats[strategy]['failure'] += 1
+        self.strategy_stats[strategy]['total_time_ms'] += time_ms
+        
+    def get_success_rate(self) -> float:
+        """Get overall success rate"""
+        if not self.parse_history:
+            return 0.0
+        success_count = sum(1 for p in self.parse_history if p['success'])
+        return success_count / len(self.parse_history)
+        
+    def get_strategy_stats(self) -> Dict:
+        """Get per-strategy statistics"""
+        stats = {}
+        for strategy, data in self.strategy_stats.items():
+            total = data['success'] + data['failure']
+            if total > 0:
+                stats[strategy] = {
+                    'success_rate': data['success'] / total,
+                    'total_attempts': total,
+                    'avg_time_ms': data['total_time_ms'] / total
+                }
+        return stats
+        
+    def get_quality_report(self) -> Dict:
+        """Get comprehensive quality report"""
+        return {
+            'overall_success_rate': self.get_success_rate(),
+            'total_parses': len(self.parse_history),
+            'strategy_stats': self.get_strategy_stats(),
+            'recent_success_rate': self._get_recent_success_rate()
+        }
+        
+    def _get_recent_success_rate(self, n: int = 20) -> float:
+        """Get success rate for last N parses"""
+        recent = self.parse_history[-n:] if self.parse_history else []
+        if not recent:
+            return 0.0
+        success_count = sum(1 for p in recent if p['success'])
+        return success_count / len(recent)
