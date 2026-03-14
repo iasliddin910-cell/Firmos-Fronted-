@@ -3748,38 +3748,49 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         except Exception:
             return {}
     
-    def _select_tool_strict(
-        self, 
-        task: Task, 
-        required_tools: List[str], 
-        task_meta: Dict, 
+        def _select_tool_strict(
+        self,
+        task: Task,
+        required_tools: List[str],
+        task_meta: Dict,
         available_tools: List[str],
         tool_reliability: Dict[str, float],
         completed_tasks: Set[str]
     ) -> Optional[str]:
         """
-        STRICT Context-Aware Tool Selection.
+        COMPREHENSIVE Context-Aware Tool Selection.
         
         Considers:
         1. Required tools (explicit)
-        2. Tool reliability history
-        3. Task type
-        4. Risk level
+        2. Prior success rate (telemetry-based reliability)
+        3. Recent failure history
+        4. Environment context (sandbox compatibility)
+        5. Verifier needs (verification_type)
+        6. Artifact expectations
+        7. Approval friction (high-risk tools)
         """
-        # 1. Check required tools first
+        import time
+        from collections import deque
+        
+        if not hasattr(self, "_tool_failure_history"):
+            self._tool_failure_history = {}
+            self._tool_failure_window = 300
+        
         for rt in required_tools:
             if rt in available_tools:
+                logger.info(f"Tool selected (required): {rt}")
                 return rt
         
-        # 2. Analyze task type
-        task_type = task_meta.get('task_type', 'general')
         description = task.description.lower()
+        verification_type = task_meta.get('verification_type', 'manual')
+        expected_artifacts = task_meta.get('expected_artifacts', [])
+        sandbox_mode = task_meta.get('sandbox_mode', 'normal')
+        approval_policy = task_meta.get('approval_policy', 'auto')
         
-        # Tool keywords mapping
         TOOL_KEYWORDS = {
-            'read_file': ['read', 'file', 'content', 'load'],
-            'write_file': ['write', 'save', 'create', 'file'],
-            'execute_command': ['run', 'command', 'execute', 'shell'],
+            'read_file': ['read', 'file', 'content', 'load', 'open'],
+            'write_file': ['write', 'save', 'create', 'file', 'edit'],
+            'execute_command': ['run', 'command', 'execute', 'shell', 'bash'],
             'execute_code': ['code', 'python', 'script', 'run'],
             'web_search': ['search', 'find', 'web', 'google'],
             'browser_navigate': ['navigate', 'browse', 'open', 'url'],
@@ -3789,35 +3800,94 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             'web_request': ['request', 'http', 'api', 'fetch']
         }
         
-        # Score each tool
-        scores = {}
+        TOOL_VERIFIER_MAP = {
+            'browser_navigate': 'browser', 'take_screenshot': 'screenshot',
+            'execute_command': 'server', 'execute_code': 'code',
+            'read_file': 'file', 'write_file': 'file',
+        }
+        
+        SANDBOX_COMPAT = {
+            'safe': ['read_file', 'web_search', 'web_request'],
+            'normal': ['read_file', 'write_file', 'execute_command', 'web_search', 'web_request', 'browser_navigate'],
+            'advanced': ['read_file', 'write_file', 'execute_command', 'execute_code', 'install_package', 'browser_navigate']
+        }
+        
+        HIGH_FRICTION = ['execute_command', 'execute_code', 'install_package', 'delete_file']
+        
+        scores, diagnostics, current_time = {}, {}, time.time()
+        
         for tool in available_tools:
             score = 0
+            tool_diag = {'reliability': 0, 'failure_penalty': 0, 'keyword': 0, 'sandbox': 0, 'verifier': 0, 'artifact': 0, 'approval': 0}
             
-            # Reliability score (0-1)
             reliability = tool_reliability.get(tool, 0.5)
-            score += reliability * 10
+            score += reliability * 30
+            tool_diag['reliability'] = reliability * 30
             
-            # Keyword match
+            if tool in self._tool_failure_history:
+                failures = self._tool_failure_history[tool]
+                while failures and current_time - failures[0][0] > self._tool_failure_window:
+                    failures.popleft()
+                recent_failures = sum(1 for _, f in failures if f)
+                penalty = recent_failures * 5
+                score -= penalty
+                tool_diag['failure_penalty'] = -penalty
+            
             keywords = TOOL_KEYWORDS.get(tool, [])
-            for kw in keywords:
-                if kw in description:
-                    score += 5
+            matches = sum(1 for kw in keywords if kw in description)
+            score += matches * 5
+            tool_diag['keyword'] = matches * 5
             
-            # Risk penalty for dangerous tools
-            dangerous = ['execute_command', 'execute_code', 'delete_file', 'install_package']
-            if tool in dangerous:
-                score -= 2
+            allowed = SANDBOX_COMPAT.get(sandbox_mode, [])
+            if tool in allowed:
+                score += 10
+                tool_diag['sandbox'] = 10
+            else:
+                score -= 15
+                tool_diag['sandbox'] = -15
+            
+            if TOOL_VERIFIER_MAP.get(tool) == verification_type:
+                score += 10
+                tool_diag['verifier'] = 10
+            
+            if expected_artifacts:
+                if 'write' in tool and any('.py' in str(a) or '.js' in str(a) for a in expected_artifacts):
+                    score += 5
+                    tool_diag['artifact'] = 5
+                elif 'screenshot' in tool and any('.png' in str(a) for a in expected_artifacts):
+                    score += 5
+                    tool_diag['artifact'] = 5
+            
+            if tool in HIGH_FRICTION and approval_policy == 'auto':
+                score -= 5
+                tool_diag['approval'] = -5
             
             scores[tool] = score
+            diagnostics[tool] = tool_diag
         
-        # Select highest scoring tool
         if scores:
             best_tool = max(scores.items(), key=lambda x: x[1])[0]
+            logger.info(f"Tool selected: {best_tool} (score: {scores[best_tool]})")
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('tool_selection', {
+                    'task_id': task.id, 'tool': best_tool, 'score': scores[best_tool],
+                    'diagnostics': diagnostics[best_tool], 'verification_type': verification_type,
+                    'sandbox_mode': sandbox_mode, 'timestamp': current_time
+                })
             return best_tool
         
         return None
     
+    def _record_tool_failure(self, tool_name: str, failed: bool):
+        from collections import deque
+        if not hasattr(self, '_tool_failure_history'):
+            self._tool_failure_history = {}
+        if tool_name not in self._tool_failure_history:
+            self._tool_failure_history[tool_name] = deque()
+        self._tool_failure_history[tool_name].append((time.time(), failed))
+        while len(self._tool_failure_history[tool_name]) > 100:
+            self._tool_failure_history[tool_name].popleft()
+
     def _build_strict_args(self, tool_name: str, task: Task, task_meta: Dict) -> Dict[str, Any]:
         """
         STRICT Argument Builder for each tool.
