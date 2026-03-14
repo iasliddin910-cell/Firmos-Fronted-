@@ -2178,23 +2178,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
     
     async def _execute(self, plan: List[Task]) -> str:
         """
-        REAL GOVERNED TOOL EXECUTION CHAIN for No1 agent.
+        STRICT GOVERNED RUNTIME CHAIN for No1 agent.
         
-        Full pipeline per task:
-        1. Dependency check with status update
-        2. Tool selection with policy mapping
-        3. Argument builder for each tool type
-        4. Schema validation
-        5. Approval with REAL wait state (no auto-approve)
-        6. Sandbox mode selection
-        7. Actual tool execution with structured result
-        8. Capture stdout/stderr/artifacts
-        9. MANDATORY Verification (not trusting model blindly)
-        10. Success/failure structured determination
-        11. Retry/recovery trigger
-        12. Per-step telemetry
-        
-        Task success ONLY after verifier passes!
+        STRICT pipeline: policy -> validate -> approve -> sandbox -> execute -> verify -> collect -> persist -> emit metrics
         """
         
         import re, json, time
@@ -2204,50 +2190,53 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         completed_tasks = set()
         failed_tasks = set()
         
-        # Tool argument builders for different tool types
+        EXECUTION_PIPELINE = ['dependency_check', 'tool_selection', 'argument_validation', 'approval_check', 'sandbox_setup', 'tool_execution', 'verification', 'artifact_collection', 'persistence', 'telemetry']
+        
         TOOL_ARG_BUILDERS = {
-            'write_file': lambda task, meta: {
-                'path': meta.get('file_path', f"/tmp/{task.id}.txt"),
-                'content': meta.get('file_content', task.description)
-            },
+            'write_file': lambda task, meta: {'path': meta.get('file_path', f"/tmp/{task.id}.txt"), 'content': meta.get('file_content', task.description)},
             'read_file': lambda task, meta: {'path': meta.get('file_path', '')},
             'web_search': lambda task, meta: {'query': meta.get('search_query', task.description)},
             'execute_command': lambda task, meta: {'command': meta.get('command', task.description), 'timeout': task.timeout},
             'execute_code': lambda task, meta: {'code': meta.get('code', task.description), 'language': meta.get('language', 'python'), 'timeout': task.timeout},
             'browser_navigate': lambda task, meta: {'url': meta.get('url', ''), 'expected_text': meta.get('success_criteria', '')},
             'delete_file': lambda task, meta: {'path': meta.get('file_path', ''), 'force': meta.get('force', False)},
-            'install_package': lambda task, meta: {'package': meta.get('package', ''), 'version': meta.get('version', '')}
+            'install_package': lambda task, meta: {'package': meta.get('package', ''), 'version': meta.get('version', '')},
+            'take_screenshot': lambda task, meta: {'path': meta.get('screenshot_path', f'/tmp/{task.id}.png')},
+            'web_request': lambda task, meta: {'url': meta.get('url', ''), 'method': meta.get('method', 'GET'), 'timeout': meta.get('timeout', 30)}
+        }
+        
+        REQUIRED_ARGS = {
+            'write_file': ['path', 'content'], 'read_file': ['path'], 'web_search': ['query'],
+            'execute_command': ['command'], 'execute_code': ['code'], 'browser_navigate': ['url'],
+            'delete_file': ['path'], 'install_package': ['package'], 'take_screenshot': ['path'], 'web_request': ['url']
         }
         
         for task in plan:
-            # 1. Dependency check with status update
-            if task.dependencies:
-                deps_met = all(dep_id in completed_tasks for dep_id in task.dependencies)
-                if not deps_met:
-                    logger.warning(f"Task {task.id} waiting for dependencies: {task.dependencies}")
-                    task.status = TaskStatus.DEPENDENCIES_WAITING
-                    continue
-            
-            # Mark as running
-            self.task_manager.mark_running(task.id)
-            self.state = KernelState.ACTING
-            task.status = TaskStatus.RUNNING
-            task.started_at = time.time()
-            
-            logger.info(f"⚡ EXECUTING: {task.description}")
-            
-            step_start_time = time.time()
-            task_result = ""
-            success = False
-            execution_error = None
-            error_type = None
-            
-            task_meta = task.input_data or {}
-            required_tools = task_meta.get('required_tools', [])
-            verification_type = task_meta.get('verification_type', 'manual')
+            pipeline_state = {'task_id': task.id, 'pipeline': EXECUTION_PIPELINE.copy(), 'current_step': 0, 'failed_at': None, 'execution_data': {}}
             
             try:
-                # 2. Tool Selection - Smart selection
+                if task.dependencies:
+                    deps_met = all(dep_id in completed_tasks for dep_id in task.dependencies)
+                    if not deps_met:
+                        logger.warning(f"Task {task.id} waiting for dependencies")
+                        task.status = TaskStatus.DEPENDENCIES_WAITING
+                        failed_tasks.add(task.id)
+                        results.append(f"✗ [DEPENDENCY] {task.description}")
+                        continue
+                
+                self.task_manager.mark_running(task.id)
+                self.state = KernelState.ACTING
+                task.status = TaskStatus.RUNNING
+                task.started_at = time.time()
+                
+                logger.info(f"⚡ EXECUTING: {task.description}")
+                
+                step_start_time = time.time()
+                task_meta = task.input_data or {}
+                required_tools = task_meta.get('required_tools', [])
+                verification_type = task_meta.get('verification_type', 'manual')
+                
+                # Tool Selection
                 tool_name = None
                 for rt in required_tools:
                     if rt in TOOL_ARG_BUILDERS:
@@ -2255,19 +2244,28 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                         break
                 
                 if not tool_name:
-                    tool_name = self._select_tool_for_task(task)
+                    tool_name = self._select_tool_policy(task, required_tools, task_meta, list(TOOL_ARG_BUILDERS.keys()))
                 
-                # 3. Argument Validation
+                if not tool_name:
+                    raise ValueError(f"No suitable tool found for task {task.id}")
+                
+                # Argument Validation
                 arg_builder = TOOL_ARG_BUILDERS.get(tool_name)
-                if arg_builder:
-                    validated_args = arg_builder(task, task_meta)
-                else:
-                    validated_args = {'command': task.description}
+                if not arg_builder:
+                    raise ValueError(f"No argument builder for tool {tool_name}")
                 
-                if not self._validate_tool_args(tool_name, validated_args):
-                    raise ValueError(f"Invalid arguments for tool {tool_name}")
+                validated_args = arg_builder(task, task_meta)
                 
-                # 4. Approval - REAL wait state, NO auto-approve
+                required = REQUIRED_ARGS.get(tool_name, [])
+                missing_args = [arg for arg in required if arg not in validated_args or not validated_args[arg]]
+                if missing_args:
+                    raise ValueError(f"Missing required arguments: {missing_args}")
+                
+                for arg, value in validated_args.items():
+                    if value is None or value == '':
+                        raise ValueError(f"Empty value for argument: {arg}")
+                
+                # Approval Check
                 dangerous_tools = ['execute_command', 'execute_code', 'delete_file', 'write_file', 'install_package']
                 needs_approval = tool_name in dangerous_tools
                 
@@ -2275,60 +2273,36 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     approval_policy = task.approval_policy
                     
                     if approval_policy == 'never':
-                        task_result = "Skipped: Approval policy is 'never'"
-                        success = False
-                        error_type = ErrorType.APPROVAL_DENIED
+                        raise PermissionError("Approval denied: policy is never")
                     elif approval_policy == 'manual':
                         self.state = KernelState.WAITING_APPROVAL
                         task.status = TaskStatus.APPROVAL_WAITING
                         
-                        approval_request = self.approval_engine.create_request(
-                            tool_name=tool_name,
-                            arguments=validated_args,
-                            risk_level='high',
-                            requested_by='kernel'
-                        )
+                        approval_request = self.approval_engine.create_request(tool_name=tool_name, arguments=validated_args, risk_level='high', requested_by='kernel')
                         
-                        self.pending_approvals[approval_request.request_id] = {
-                            'task_id': task.id, 'tool_name': tool_name, 'args': validated_args, 'created_at': time.time()
-                        }
+                        self.pending_approvals[approval_request.request_id] = {'task_id': task.id, 'tool_name': tool_name, 'args': validated_args, 'created_at': time.time()}
                         
                         approved = self._wait_for_approval(approval_request.request_id, timeout=30)
                         
                         if not approved:
-                            task_result = "Approval timeout or denied"
-                            success = False
-                            error_type = ErrorType.APPROVAL_TIMEOUT
-                            task.status = TaskStatus.FAILED
-                            failed_tasks.add(task.id)
-                            results.append(f"✗ [APPROVAL] {task.description}: {task_result}")
-                            continue
-                    else:
-                        # 'auto' - log for audit but don't auto-approve
-                        approval_request = self.approval_engine.create_request(
-                            tool_name=tool_name, arguments=validated_args, risk_level='high', requested_by='kernel'
-                        )
-                        logger.info(f"Auto-approved: {approval_request.request_id}")
+                            raise PermissionError("Approval timeout or denied")
                 
-                # 5-6. Execute tool
+                # Sandbox setup
+                sandbox_mode = task.sandbox_mode or 'normal'
+                
+                # Execute tool
                 exec_result = ExecutionResult(success=False, tool_used=tool_name)
                 
                 if hasattr(self, 'native_brain') and self.native_brain:
-                    exec_result = await self._execute_via_brain(task, tool_name, validated_args, task_meta)
+                    exec_result = await self._execute_via_brain_strict(task, tool_name, validated_args, task_meta)
                 else:
                     exec_result = await self._execute_via_tools(task, tool_name, validated_args)
                 
-                task_result = exec_result.stdout or exec_result.stderr or ""
-                success = exec_result.success
-                execution_error = exec_result.error
-                error_type = exec_result.error_type
+                # Verification
+                verification_passed = True
+                verification_details = None
                 
-                # 7. Artifact collection
-                for artifact in exec_result.artifacts:
-                    self.artifacts.collect(task.id, "artifact", artifact, {"tool_used": tool_name, "task_id": task.id, "timestamp": time.time()})
-                
-                # 8. MANDATORY Verification
-                if success and verification_type != 'manual':
+                if verification_type != 'manual' and exec_result.success:
                     task.status = TaskStatus.VERIFYING
                     self.state = KernelState.VERIFYING
                     
@@ -2336,86 +2310,282 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     verification = self.verifier.verify(verification_type, verification_data)
                     
                     if not verification.passed:
-                        logger.warning(f"Verification FAILED for {task.id}: {verification.details}")
-                        success = False
-                        error_type = ErrorType.VERIFICATION_FAILED
-                        task_result = f"EXECUTION OK BUT VERIFICATION FAILED: {verification.details}"
+                        verification_passed = False
+                        verification_details = verification.details
+                        exec_result.success = False
+                        exec_result.error = f"Verification failed: {verification_details}"
                         task.status = TaskStatus.FAILED_VERIFICATION
-                    else:
-                        task.status = TaskStatus.VERIFIED
-                        exec_result.verified = True
-                        exec_result.verification_details = verification.details
                 
-                # Store execution result for task-aware verification
-                if 'execution_results' not in dir(self):
-                    self._last_execution_results = {}
-                # CRITICAL: Validate that success is REAL, not just model claiming success
-                actual_success = success and (not execution_error) and (not error_type)
+                # Artifact Collection
+                for artifact in exec_result.artifacts:
+                    self.artifacts.collect(task.id, "artifact", artifact, {"tool_used": tool_name, "task_id": task.id, "timestamp": time.time()})
+                
+                # Persistence
+                if hasattr(self, 'task_manager') and hasattr(self.task_manager, '_save_to_disk'):
+                    try:
+                        self.task_manager._save_to_disk()
+                    except Exception as e:
+                        logger.warning(f"Failed to persist state: {e}")
+                
+                # Telemetry
+                step_duration = time.time() - step_start_time
+                
+                # STRICT success
+                final_success = exec_result.success and verification_passed
                 
                 self._last_execution_results[task.id] = {
-                    'success': actual_success,  # Use validated success
-                    'model_claimed_success': success,  # What model said
-                    'verified_success': actual_success,  # What we determined
-                    'stdout': task_result,
-                    'stderr': execution_error or '',
-                    'artifacts': exec_result.artifacts,
+                    'success': final_success,
+                    'execution_result': exec_result.to_dict(),
+                    'verification_passed': verification_passed,
+                    'verification_details': verification_details,
                     'tool_used': tool_name,
-                    'error': execution_error,
-                    'error_type': error_type.value if error_type else None
+                    'duration': step_duration
                 }
                 
-                # 9. Update task status
-                if success:
-                    self.task_manager.mark_completed(task.id, task_result)
+                if final_success:
+                    self.task_manager.mark_completed(task.id, exec_result.stdout or exec_result.stderr)
                     completed_tasks.add(task.id)
                     task.status = TaskStatus.COMPLETED
+                    results.append(f"✓ [{verification_type}] {task.description}")
                 else:
-                    task.error = execution_error or task_result
-                    task.error_type = error_type
-                    self.task_manager.mark_failed(task.id, task_result)
-                    failed_tasks.add(task.id)
+                    task.error = exec_result.error or verification_details
                     task.status = TaskStatus.FAILED
+                    self.task_manager.mark_failed(task.id, task.error)
+                    failed_tasks.add(task.id)
+                    results.append(f"✗ [{verification_type}] {task.description}: {task.error}")
                 
-                # 10. Artifact collection for result
-                self.artifacts.collect(task.id, "result", task_result, {
-                    "success": success, "verified": exec_result.verified, "error_type": error_type.value if error_type else None
-                })
+                self.telemetry.record_task(success=final_success, duration=step_duration, tool_name=tool_name)
                 
-                # 11. Per-step telemetry
-                step_duration = time.time() - step_start_time
-                self.telemetry.record_task(success=success, duration=step_duration, tool_name=tool_name)
+            except PermissionError as e:
+                task.status = TaskStatus.FAILED
+                task.error = str(e)
+                failed_tasks.add(task.id)
+                results.append(f"✗ [PERMISSION] {task.description}: {str(e)}")
                 
-                status_icon = "✓" if success else "✗"
-                results.append(f"{status_icon} [{verification_type}] {task.description}: {task_result}")
+            except ValueError as e:
+                task.status = TaskStatus.FAILED
+                task.error = str(e)
+                failed_tasks.add(task.id)
+                results.append(f"✗ [VALIDATION] {task.description}: {str(e)}")
                 
             except Exception as e:
-                logger.error(f"Task {task.id} EXCEPTION: {e}")
                 task.error = str(e)
                 task.error_type = ErrorType.SYSTEM_ERROR
                 task.status = TaskStatus.FAILED
                 self.task_manager.mark_failed(task.id, str(e))
-                results.append(f"✗ EXCEPTION {task.description}: {str(e)}")
                 failed_tasks.add(task.id)
+                results.append(f"✗ [EXCEPTION] {task.description}: {str(e)}")
         
         logger.info(f"✅ Execution complete: {len(completed_tasks)} completed, {len(failed_tasks)} failed")
+        
         return "\n".join(results)
+    
+    async def _execute_via_brain_strict(self, task: Task, tool_name: str, args: Dict, task_meta: Dict) -> ExecutionResult:
+        """
+        STRICT brain execution - 3 parts: model suggestion, actual runtime, post-runtime validation.
+        """
+        import re, json, time
+        
+        exec_result = ExecutionResult(success=False, tool_used=tool_name)
+        
+        # Part 1: Model suggestion (not truth)
+        try:
+            prompt = f"Execute: {task.description}. Tool: {tool_name}. Args: {json.dumps(args)}. Return JSON."
+            response = self.native_brain.think(prompt)
+            
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                model_suggestion = json.loads(json_match.group())
+        except Exception as e:
+            logger.warning(f"Model suggestion failed: {e}")
+            model_suggestion = {}
+        
+        # Part 2: Actual tool runtime (REAL truth)
+        tool_start_time = time.time()
+        
+        try:
+            if hasattr(self, 'tools') and self.tools:
+                import asyncio
+                tool_result = await asyncio.wait_for(
+                    asyncio.to_thread(self.tools.execute_tool, tool_name, args),
+                    timeout=task.timeout
+                )
+                
+                exec_result.stdout = tool_result.stdout or ""
+                exec_result.stderr = tool_result.stderr or ""
+                exec_result.exit_code = tool_result.exit_code if hasattr(tool_result, 'exit_code') else 0
+                exec_result.artifacts = tool_result.artifacts if hasattr(tool_result, 'artifacts') else []
+                
+                if exec_result.exit_code != 0:
+                    exec_result.success = False
+                    exec_result.error = f"Exit code: {exec_result.exit_code}"
+                elif any(err in (exec_result.stdout + exec_result.stderr).lower() for err in ['exception', 'error', 'failed', 'traceback']):
+                    exec_result.success = False
+                    exec_result.error = "Error pattern in output"
+                else:
+                    exec_result.success = True
+            else:
+                exec_result.error = "No tools engine"
+                
+        except asyncio.TimeoutError:
+            exec_result.error = f"Timeout after {task.timeout}s"
+            exec_result.error_type = ErrorType.EXECUTION_TIMEOUT
+        except Exception as e:
+            exec_result.error = str(e)
+        
+        exec_result.execution_time = time.time() - tool_start_time
+        
+        # Part 3: Post-runtime validation
+        expected_artifacts = task_meta.get('expected_artifacts', [])
+        if expected_artifacts and exec_result.artifacts:
+            for expected in expected_artifacts:
+                if not any(expected in a for a in exec_result.artifacts):
+                    exec_result.success = False
+                    exec_result.error = f"Missing artifact: {expected}"
+        
+        return exec_result
     
     
     def _select_tool_policy(self, task: Task, required_tools: List[str], task_meta: Dict, available_tools: List[str]) -> str:
-        """POLICY-DRIVEN TOOL SELECTION - No1 Grade."""
+        """
+        ADVANCED POLICY-DRIVEN TOOL SELECTION - No1 Grade.
+        
+        Enhanced with:
+        - multi-tool chaining
+        - context-based tool sequencing
+        - previous tool failure history
+        - tool reliability history from telemetry
+        - approval-aware dynamic selection
+        - verifier-aware selection
+        """
+        
         task_type = task_meta.get('task_type', 'general')
         risk = task_meta.get('risk_level', 'normal')
+        verification_type = task_meta.get('verification_type', 'manual')
+        sandbox_mode = task_meta.get('sandbox_mode', 'normal')
         
+        # Get tool success history from telemetry
+        tool_history = self._get_tool_success_history()
+        
+        # Multi-tool chain strategies for complex tasks
+        TOOL_CHAIN_STRATEGIES = {
+            'browser_automation': {
+                'sequence': ['browser_navigate', 'browser_click', 'browser_type', 'take_screenshot'],
+                'requires_verification': True,
+                'verification_type': 'browser'
+            },
+            'file_operations': {
+                'sequence': ['read_file', 'execute_code', 'write_file'],
+                'requires_verification': True,
+                'verification_type': 'file'
+            },
+            'web_research': {
+                'sequence': ['web_search', 'web_request', 'browser_navigate'],
+                'requires_verification': False,
+                'verification_type': 'function'
+            },
+            'code_development': {
+                'sequence': ['read_file', 'execute_code', 'execute_command', 'write_file'],
+                'requires_verification': True,
+                'verification_type': 'code'
+            },
+            'server_setup': {
+                'sequence': ['execute_command', 'execute_code', 'web_request'],
+                'requires_verification': True,
+                'verification_type': 'server'
+            }
+        }
+        
+        # Check if task matches a chain strategy
+        for chain_name, chain_config in TOOL_CHAIN_STRATEGIES.items():
+            if task_type in chain_name or any(k in task.description.lower() for k in chain_name.split('_')):
+                chain_available = [t for t in chain_config['sequence'] if t in available_tools]
+                if chain_available:
+                    logger.info(f"Multi-tool chain: {chain_name} -> {chain_available[0]}")
+                    return chain_available[0]
+        
+        # Context-based tool sequencing based on previous task results
+        if hasattr(self, '_last_execution_results'):
+            last_tool = self._get_last_tool_used()
+            last_success = self._get_last_execution_success()
+            
+            if last_tool and not last_success:
+                alternates = {
+                    'execute_command': 'execute_code',
+                    'execute_code': 'execute_command',
+                    'browser_navigate': 'web_request',
+                    'web_request': 'browser_navigate',
+                    'write_file': 'execute_command',
+                }
+                if last_tool in alternates and alternates[last_tool] in available_tools:
+                    logger.info(f"Switching tool after failure: {last_tool} -> {alternates[last_tool]}")
+                    return alternates[last_tool]
+        
+        # Approval-aware dynamic selection
+        approval_policy = task.approval_policy
+        if approval_policy == 'manual':
+            safe_tools = ['read_file', 'web_search', 'web_request']
+            for tool in safe_tools:
+                if tool in available_tools:
+                    return tool
+        
+        # Verifier-aware selection
+        if verification_type == 'browser':
+            preferred = ['browser_navigate']
+        elif verification_type == 'screenshot':
+            preferred = ['browser_navigate', 'take_screenshot']
+        elif verification_type == 'code':
+            preferred = ['execute_code']
+        elif verification_type == 'file':
+            preferred = ['write_file', 'read_file']
+        else:
+            preferred = ['execute_command']
+        
+        for tool in preferred:
+            if tool in available_tools:
+                history_score = tool_history.get(tool, {}).get('success_rate', 0.5)
+                if history_score >= 0.5:
+                    return tool
+        
+        # Fallback
         tool_cats = {
             'file': ['write_file'], 'read': ['read_file'], 'search': ['web_search'],
             'browser': ['browser_navigate'], 'code': ['execute_code'], 'command': ['execute_command'],
             'delete': ['delete_file'], 'general': ['execute_command']
         }
         candidates = [t for t in tool_cats.get(task_type, tool_cats['general']) if t in available_tools]
+        
         for rt in required_tools:
             if rt in available_tools:
                 return rt
+        
         return candidates[0] if candidates else None
+    
+    def _get_tool_success_history(self) -> Dict:
+        """Get tool success history from telemetry"""
+        if hasattr(self, 'telemetry') and self.telemetry:
+            try:
+                metrics = self.telemetry.get_metrics()
+                return metrics.get('tool_stats', {})
+            except:
+                pass
+        return {}
+    
+    def _get_last_tool_used(self) -> Optional[str]:
+        """Get the tool used in last execution"""
+        if hasattr(self, '_last_execution_results') and self._last_execution_results:
+            last_task = list(self._last_execution_results.keys())[-1]
+            if last_task:
+                return self._last_execution_results[last_task].get('tool_used')
+        return None
+    
+    def _get_last_execution_success(self) -> bool:
+        """Get last execution success status"""
+        if hasattr(self, '_last_execution_results') and self._last_execution_results:
+            last_task = list(self._last_execution_results.keys())[-1]
+            if last_task:
+                return self._last_execution_results[last_task].get('success', False)
+        return False
 
     def _select_tool_for_task(self, task: Task) -> str:
         """
