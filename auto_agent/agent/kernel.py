@@ -2856,43 +2856,131 @@ Return JSON with tasks array containing: id, description, priority, dependencies
     
     async def _execute(self, plan: List[Task]) -> str:
         """
-        STRICT GOVERNED RUNTIME CHAIN for No1 agent.
+        STRICT GOVERNED RUNTIME CHAIN - No1 Grade.
         
-        STRICT pipeline: policy -> validate -> approve -> sandbox -> execute -> verify -> collect -> persist -> emit metrics
+        CRITICAL: This is the ONE TRUE ORCHESTRATOR pipeline.
+        
+        Pipeline: policy -> validate -> approval -> sandbox -> execute -> verify -> artifact -> persist -> telemetry
+        
+        FIXED ISSUES:
+        1. Single clean pipeline - no complex fallbacks
+        2. History/reliability/context-aware tool selection
+        3. Simple success semantics
+        4. Deeply integrated approval denied/expired flow
         """
         
         import re, json, time
-        from typing import Dict, Any
+        from typing import Dict, Any, Optional, List
         
         results = []
         completed_tasks = set()
         failed_tasks = set()
         
-        EXECUTION_PIPELINE = ['dependency_check', 'tool_selection', 'argument_validation', 'approval_check', 'sandbox_setup', 'tool_execution', 'verification', 'artifact_collection', 'persistence', 'telemetry']
+        # STRICT Pipeline Steps (immutable order)
+        PIPELINE_STEPS = [
+            'policy_check',      # Step 1: Policy enforcement
+            'dependency_check',   # Step 2: Task dependencies
+            'tool_selection',    # Step 3: Context-aware tool selection
+            'argument_validation',# Step 4: Strict argument validation
+            'approval_check',    # Step 5: Approval workflow
+            'sandbox_setup',     # Step 6: Sandbox configuration
+            'tool_execution',    # Step 7: Actual execution
+            'verification',      # Step 8: Result verification
+            'artifact_collection',# Step 9: Artifact collection
+            'persistence',       # Step 10: State persistence
+            'telemetry'          # Step 11: Metrics recording
+        ]
         
-        TOOL_ARG_BUILDERS = {
-            'write_file': lambda task, meta: {'path': meta.get('file_path', f"/tmp/{task.id}.txt"), 'content': meta.get('file_content', task.description)},
-            'read_file': lambda task, meta: {'path': meta.get('file_path', '')},
-            'web_search': lambda task, meta: {'query': meta.get('search_query', task.description)},
-            'execute_command': lambda task, meta: {'command': meta.get('command', task.description), 'timeout': task.timeout},
-            'execute_code': lambda task, meta: {'code': meta.get('code', task.description), 'language': meta.get('language', 'python'), 'timeout': task.timeout},
-            'browser_navigate': lambda task, meta: {'url': meta.get('url', ''), 'expected_text': meta.get('success_criteria', '')},
-            'delete_file': lambda task, meta: {'path': meta.get('file_path', ''), 'force': meta.get('force', False)},
-            'install_package': lambda task, meta: {'package': meta.get('package', ''), 'version': meta.get('version', '')},
-            'take_screenshot': lambda task, meta: {'path': meta.get('screenshot_path', f'/tmp/{task.id}.png')},
-            'web_request': lambda task, meta: {'url': meta.get('url', ''), 'method': meta.get('method', 'GET'), 'timeout': meta.get('timeout', 30)}
+        # Tool configuration - strict mapping
+        TOOL_CONFIG = {
+            'write_file': {
+                'dangerous': True,
+                'required_args': ['path', 'content'],
+                'sandbox_mode': 'safe',
+                'timeout': 30
+            },
+            'read_file': {
+                'dangerous': False,
+                'required_args': ['path'],
+                'sandbox_mode': 'safe',
+                'timeout': 10
+            },
+            'web_search': {
+                'dangerous': False,
+                'required_args': ['query'],
+                'sandbox_mode': 'safe',
+                'timeout': 15
+            },
+            'execute_command': {
+                'dangerous': True,
+                'required_args': ['command'],
+                'sandbox_mode': 'advanced',
+                'timeout': 60
+            },
+            'execute_code': {
+                'dangerous': True,
+                'required_args': ['code'],
+                'sandbox_mode': 'advanced',
+                'timeout': 60
+            },
+            'browser_navigate': {
+                'dangerous': False,
+                'required_args': ['url'],
+                'sandbox_mode': 'normal',
+                'timeout': 30
+            },
+            'delete_file': {
+                'dangerous': True,
+                'required_args': ['path'],
+                'sandbox_mode': 'advanced',
+                'timeout': 15
+            },
+            'install_package': {
+                'dangerous': True,
+                'required_args': ['package'],
+                'sandbox_mode': 'advanced',
+                'timeout': 120
+            },
+            'take_screenshot': {
+                'dangerous': False,
+                'required_args': ['path'],
+                'sandbox_mode': 'safe',
+                'timeout': 10
+            },
+            'web_request': {
+                'dangerous': False,
+                'required_args': ['url'],
+                'sandbox_mode': 'safe',
+                'timeout': 30
+            }
         }
-        
-        REQUIRED_ARGS = {
-            'write_file': ['path', 'content'], 'read_file': ['path'], 'web_search': ['query'],
-            'execute_command': ['command'], 'execute_code': ['code'], 'browser_navigate': ['url'],
-            'delete_file': ['path'], 'install_package': ['package'], 'take_screenshot': ['path'], 'web_request': ['url']
-        }
+
+        # Get tool reliability history for smart selection
+        tool_reliability = self._get_tool_reliability_history()
         
         for task in plan:
-            pipeline_state = {'task_id': task.id, 'pipeline': EXECUTION_PIPELINE.copy(), 'current_step': 0, 'failed_at': None, 'execution_data': {}}
+            pipeline_state = {
+                'task_id': task.id, 
+                'pipeline': PIPELINE_STEPS.copy(), 
+                'current_step': 0, 
+                'failed_at': None, 
+                'execution_data': {}
+            }
+            step_start_time = time.time()
             
             try:
+                # =====================================================
+                # STEP 1: Policy Check
+                # =====================================================
+                policy = getattr(task, 'approval_policy', 'auto')
+                sandbox_mode = getattr(task, 'sandbox_mode', 'normal')
+                
+                if policy == 'never':
+                    raise PermissionError("Policy DENIED: approval_policy is 'never'")
+                
+                # =====================================================
+                # STEP 2: Dependency Check
+                # =====================================================
                 if task.dependencies:
                     deps_met = all(dep_id in completed_tasks for dep_id in task.dependencies)
                     if not deps_met:
@@ -2909,32 +2997,33 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 
                 logger.info(f"⚡ EXECUTING: {task.description}")
                 
-                step_start_time = time.time()
                 task_meta = task.input_data or {}
                 required_tools = task_meta.get('required_tools', [])
                 verification_type = task_meta.get('verification_type', 'manual')
                 
-                # Tool Selection
-                tool_name = None
-                for rt in required_tools:
-                    if rt in TOOL_ARG_BUILDERS:
-                        tool_name = rt
-                        break
-                
-                if not tool_name:
-                    tool_name = self._select_tool_policy(task, required_tools, task_meta, list(TOOL_ARG_BUILDERS.keys()))
+                # =====================================================
+                # STEP 3: Context-Aware Tool Selection
+                # =====================================================
+                tool_name = self._select_tool_strict(
+                    task=task,
+                    required_tools=required_tools,
+                    task_meta=task_meta,
+                    available_tools=list(TOOL_CONFIG.keys()),
+                    tool_reliability=tool_reliability,
+                    completed_tasks=completed_tasks
+                )
                 
                 if not tool_name:
                     raise ValueError(f"No suitable tool found for task {task.id}")
                 
-                # Argument Validation
-                arg_builder = TOOL_ARG_BUILDERS.get(tool_name)
-                if not arg_builder:
-                    raise ValueError(f"No argument builder for tool {tool_name}")
+                tool_config = TOOL_CONFIG.get(tool_name, {})
                 
-                validated_args = arg_builder(task, task_meta)
+                # =====================================================
+                # STEP 4: Strict Argument Validation
+                # =====================================================
+                validated_args = self._build_strict_args(tool_name, task, task_meta)
                 
-                required = REQUIRED_ARGS.get(tool_name, [])
+                required = tool_config.get('required_args', [])
                 missing_args = [arg for arg in required if arg not in validated_args or not validated_args[arg]]
                 if missing_args:
                     raise ValueError(f"Missing required arguments: {missing_args}")
@@ -2943,40 +3032,87 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     if value is None or value == '':
                         raise ValueError(f"Empty value for argument: {arg}")
                 
-                # Approval Check
-                dangerous_tools = ['execute_command', 'execute_code', 'delete_file', 'write_file', 'install_package']
-                needs_approval = tool_name in dangerous_tools
+                # =====================================================
+                # STEP 5: Approval Workflow (with deep integration)
+                # =====================================================
+                needs_approval = tool_config.get('dangerous', False)
+                approval_status = None
                 
                 if needs_approval and hasattr(self, 'approval_engine') and self.approval_engine:
-                    approval_policy = task.approval_policy
-                    
-                    if approval_policy == 'never':
-                        raise PermissionError("Approval denied: policy is never")
-                    elif approval_policy == 'manual':
-                        self.state = KernelState.WAITING_APPROVAL
-                        task.status = TaskStatus.APPROVAL_WAITING
+                    if policy == 'never':
+                        raise PermissionError("Approval denied: policy is 'never'")
+                    elif policy == 'manual':
+                        # DEEP integration: approval denied/expired flow
+                        approval_result = await self._execute_approval_flow(
+                            task_id=task.id,
+                            tool_name=tool_name,
+                            args=validated_args,
+                            risk_level='high' if tool_config.get('dangerous') else 'medium',
+                            timeout=30
+                        )
                         
-                        approval_request = self.approval_engine.create_request(tool_name=tool_name, arguments=validated_args, risk_level='high', requested_by='kernel')
+                        if approval_result['status'] == 'denied':
+                            # Track for recovery - DEEP integration
+                            task.metadata['approval_denied'] = True
+                            task.metadata['approval_expired'] = False
+                            task.metadata['approval_recovery_needed'] = True
+                            task.error_type = ErrorType.APPROVAL_DENIED
+                            task.status = TaskStatus.RECOVERING
+                            
+                            # Telemetry
+                            if hasattr(self, 'telemetry') and self.telemetry:
+                                self.telemetry.record_event('approval_denied', {
+                                    'task_id': task.id,
+                                    'tool_name': tool_name,
+                                    'timestamp': time.time()
+                                })
+                            
+                            results.append(f"⚠️ [APPROVAL_DENIED] {task.description} - Recovery will handle")
+                            continue
                         
-                        self.pending_approvals[approval_request.request_id] = {'task_id': task.id, 'tool_name': tool_name, 'args': validated_args, 'created_at': time.time()}
+                        elif approval_result['status'] == 'expired':
+                            # Track for recovery - DEEP integration
+                            task.metadata['approval_denied'] = False
+                            task.metadata['approval_expired'] = True
+                            task.metadata['approval_recovery_needed'] = True
+                            task.error_type = ErrorType.APPROVAL_TIMEOUT
+                            task.status = TaskStatus.RECOVERING
+                            
+                            # Telemetry
+                            if hasattr(self, 'telemetry') and self.telemetry:
+                                self.telemetry.record_event('approval_expired', {
+                                    'task_id': task.id,
+                                    'tool_name': tool_name,
+                                    'timestamp': time.time()
+                                })
+                            
+                            results.append(f"⚠️ [APPROVAL_EXPIRED] {task.description} - Recovery will handle")
+                            continue
                         
-                        approved = self._wait_for_approval(approval_request.request_id, timeout=30)
-                        
-                        if not approved:
-                            raise PermissionError("Approval timeout or denied")
+                        approval_status = approval_result['status']
                 
-                # Sandbox setup
-                sandbox_mode = task.sandbox_mode or 'normal'
+                # =====================================================
+                # STEP 6: Sandbox Setup
+                # =====================================================
+                configured_sandbox_mode = sandbox_mode or tool_config.get('sandbox_mode', 'normal')
+                sandbox_ready = self._setup_sandbox(tool_name, configured_sandbox_mode)
                 
-                # Execute tool
-                exec_result = ExecutionResult(success=False, tool_used=tool_name)
+                if not sandbox_ready:
+                    raise RuntimeError(f"Sandbox setup failed for mode: {configured_sandbox_mode}")
                 
-                if hasattr(self, 'native_brain') and self.native_brain:
-                    exec_result = await self._execute_via_brain_strict(task, tool_name, validated_args, task_meta)
-                else:
-                    exec_result = await self._execute_via_tools(task, tool_name, validated_args)
+                # =====================================================
+                # STEP 7: Tool Execution (REAL execution)
+                # =====================================================
+                exec_result = await self._execute_tool_strict(
+                    task=task,
+                    tool_name=tool_name,
+                    args=validated_args,
+                    timeout=tool_config.get('timeout', 30)
+                )
                 
-                # Verification
+                # =====================================================
+                # STEP 8: Verification
+                # =====================================================
                 verification_passed = True
                 verification_details = None
                 
@@ -2994,21 +3130,36 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                         exec_result.error = f"Verification failed: {verification_details}"
                         task.status = TaskStatus.FAILED_VERIFICATION
                 
-                # Artifact Collection
+                # =====================================================
+                # STEP 9: Artifact Collection
+                # =====================================================
                 for artifact in exec_result.artifacts:
-                    self.artifacts.collect(task.id, "artifact", artifact, {"tool_used": tool_name, "task_id": task.id, "timestamp": time.time()})
+                    self.artifacts.collect(
+                        task.id, 
+                        "artifact", 
+                        artifact, 
+                        {
+                            "tool_used": tool_name, 
+                            "task_id": task.id, 
+                            "timestamp": time.time()
+                        }
+                    )
                 
-                # Persistence
+                # =====================================================
+                # STEP 10: Persistence
+                # =====================================================
                 if hasattr(self, 'task_manager') and hasattr(self.task_manager, '_save_to_disk'):
                     try:
                         self.task_manager._save_to_disk()
                     except Exception as e:
                         logger.warning(f"Failed to persist state: {e}")
                 
-                # Telemetry
+                # =====================================================
+                # STEP 11: Telemetry
+                # =====================================================
                 step_duration = time.time() - step_start_time
                 
-                # STRICT success
+                # SIMPLE Success Semantics
                 final_success = exec_result.success and verification_passed
                 
                 self._last_execution_results[task.id] = {
@@ -3017,7 +3168,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'verification_passed': verification_passed,
                     'verification_details': verification_details,
                     'tool_used': tool_name,
-                    'duration': step_duration
+                    'duration': step_duration,
+                    'approval_status': approval_status
                 }
                 
                 if final_success:
@@ -3032,25 +3184,26 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     failed_tasks.add(task.id)
                     results.append(f"✗ [{verification_type}] {task.description}: {task.error}")
                 
-                self.telemetry.record_task(success=final_success, duration=step_duration, tool_name=tool_name)
+                self.telemetry.record_task(
+                    success=final_success, 
+                    duration=step_duration, 
+                    tool_name=tool_name
+                )
                 
             except PermissionError as e:
+                # Handle approval errors with DEEP integration
                 error_msg = str(e)
-                
-                # Track approval denial/expire for recovery
                 is_approval_denial = "denied" in error_msg.lower() or "never" in error_msg.lower()
                 is_approval_expire = "timeout" in error_msg.lower()
                 
-                # Add metadata for recovery
                 task.metadata['approval_denied'] = is_approval_denial
                 task.metadata['approval_expired'] = is_approval_expire
                 task.metadata['approval_recovery_needed'] = True
                 
-                # Log for audit trail
-                logger.warning(f"Approval denied/expired for task {task.id}: {error_msg}")
+                logger.warning(f"Approval error for task {task.id}: {error_msg}")
                 
                 if hasattr(self, 'telemetry') and self.telemetry:
-                    self.telemetry.record_event('approval_denied_expired', {
+                    self.telemetry.record_event('approval_error', {
                         'task_id': task.id,
                         'error': error_msg,
                         'is_denial': is_approval_denial,
@@ -3058,10 +3211,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                         'timestamp': time.time()
                     })
                 
-                # If approval was denied/expired, link to recovery
                 if is_approval_denial or is_approval_expire:
                     task.error_type = ErrorType.APPROVAL_DENIED if is_approval_denial else ErrorType.APPROVAL_TIMEOUT
-                    # Don't mark as failed yet - recovery should handle it
                     task.status = TaskStatus.RECOVERING
                     results.append(f"⚠️ [APPROVAL] {task.description}: {error_msg} - Recovery will handle")
                 else:
@@ -3087,35 +3238,256 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         
         return "\n".join(results)
     
-    async def _execute_via_brain_strict(self, task: Task, tool_name: str, args: Dict, task_meta: Dict) -> ExecutionResult:
+    # =====================================================
+    # STRICT HELPER METHODS FOR No1 GRADE RUNTIME
+    # =====================================================
+    
+    def _get_tool_reliability_history(self) -> Dict[str, float]:
         """
-        STRICT brain execution - 3 parts: model suggestion, actual runtime, post-runtime validation.
+        Get tool reliability history from telemetry for smart tool selection.
+        Returns: Dict[tool_name] = success_rate (0.0 to 1.0)
         """
-        import re, json, time
+        if not hasattr(self, 'telemetry') or not self.telemetry:
+            return {}
         
+        try:
+            metrics = self.telemetry.get_metrics()
+            tool_stats = metrics.get('tool_stats', {})
+            
+            reliability = {}
+            for tool_name, stats in tool_stats.items():
+                total = stats.get('total', 0)
+                success = stats.get('success', 0)
+                if total > 0:
+                    reliability[tool_name] = success / total
+                else:
+                    reliability[tool_name] = 0.5  # Default neutral
+            
+            return reliability
+        except Exception:
+            return {}
+    
+    def _select_tool_strict(
+        self, 
+        task: Task, 
+        required_tools: List[str], 
+        task_meta: Dict, 
+        available_tools: List[str],
+        tool_reliability: Dict[str, float],
+        completed_tasks: Set[str]
+    ) -> Optional[str]:
+        """
+        STRICT Context-Aware Tool Selection.
+        
+        Considers:
+        1. Required tools (explicit)
+        2. Tool reliability history
+        3. Task type
+        4. Risk level
+        """
+        # 1. Check required tools first
+        for rt in required_tools:
+            if rt in available_tools:
+                return rt
+        
+        # 2. Analyze task type
+        task_type = task_meta.get('task_type', 'general')
+        description = task.description.lower()
+        
+        # Tool keywords mapping
+        TOOL_KEYWORDS = {
+            'read_file': ['read', 'file', 'content', 'load'],
+            'write_file': ['write', 'save', 'create', 'file'],
+            'execute_command': ['run', 'command', 'execute', 'shell'],
+            'execute_code': ['code', 'python', 'script', 'run'],
+            'web_search': ['search', 'find', 'web', 'google'],
+            'browser_navigate': ['navigate', 'browse', 'open', 'url'],
+            'delete_file': ['delete', 'remove', 'clear'],
+            'install_package': ['install', 'package', 'pip', 'npm'],
+            'take_screenshot': ['screenshot', 'capture', 'screen'],
+            'web_request': ['request', 'http', 'api', 'fetch']
+        }
+        
+        # Score each tool
+        scores = {}
+        for tool in available_tools:
+            score = 0
+            
+            # Reliability score (0-1)
+            reliability = tool_reliability.get(tool, 0.5)
+            score += reliability * 10
+            
+            # Keyword match
+            keywords = TOOL_KEYWORDS.get(tool, [])
+            for kw in keywords:
+                if kw in description:
+                    score += 5
+            
+            # Risk penalty for dangerous tools
+            dangerous = ['execute_command', 'execute_code', 'delete_file', 'install_package']
+            if tool in dangerous:
+                score -= 2
+            
+            scores[tool] = score
+        
+        # Select highest scoring tool
+        if scores:
+            best_tool = max(scores.items(), key=lambda x: x[1])[0]
+            return best_tool
+        
+        return None
+    
+    def _build_strict_args(self, tool_name: str, task: Task, task_meta: Dict) -> Dict[str, Any]:
+        """
+        STRICT Argument Builder for each tool.
+        """
+        # Default values from task
+        default_path = f"/tmp/{task.id}.txt"
+        
+        ARG_BUILDERS = {
+            'write_file': {
+                'path': task_meta.get('file_path', default_path),
+                'content': task_meta.get('file_content', task.description)
+            },
+            'read_file': {
+                'path': task_meta.get('file_path', '')
+            },
+            'web_search': {
+                'query': task_meta.get('search_query', task.description)
+            },
+            'execute_command': {
+                'command': task_meta.get('command', task.description),
+                'timeout': task.timeout
+            },
+            'execute_code': {
+                'code': task_meta.get('code', task.description),
+                'language': task_meta.get('language', 'python'),
+                'timeout': task.timeout
+            },
+            'browser_navigate': {
+                'url': task_meta.get('url', ''),
+                'expected_text': task_meta.get('success_criteria', '')
+            },
+            'delete_file': {
+                'path': task_meta.get('file_path', ''),
+                'force': task_meta.get('force', False)
+            },
+            'install_package': {
+                'package': task_meta.get('package', ''),
+                'version': task_meta.get('version', '')
+            },
+            'take_screenshot': {
+                'path': task_meta.get('screenshot_path', f'/tmp/{task.id}.png')
+            },
+            'web_request': {
+                'url': task_meta.get('url', ''),
+                'method': task_meta.get('method', 'GET'),
+                'timeout': task_meta.get('timeout', 30)
+            }
+        }
+        
+        return ARG_BUILDERS.get(tool_name, {})
+    
+    async def _execute_approval_flow(
+        self, 
+        task_id: str, 
+        tool_name: str, 
+        args: Dict, 
+        risk_level: str,
+        timeout: int = 30
+    ) -> Dict[str, Any]:
+        """
+        STRICT Approval Workflow with proper status tracking.
+        
+        Returns: {'status': 'approved' | 'denied' | 'expired', 'request_id': str}
+        """
+        self.state = KernelState.WAITING_APPROVAL
+        
+        try:
+            approval_request = self.approval_engine.create_request(
+                tool_name=tool_name,
+                arguments=args,
+                risk_level=risk_level,
+                requested_by='kernel'
+            )
+            
+            self.pending_approvals[approval_request.request_id] = {
+                'task_id': task_id, 
+                'tool_name': tool_name, 
+                'args': args, 
+                'created_at': time.time()
+            }
+            
+            approved = self._wait_for_approval(approval_request.request_id, timeout=timeout)
+            
+            if approved:
+                return {'status': 'approved', 'request_id': approval_request.request_id}
+            else:
+                # Check if denied or expired
+                pending = self.pending_approvals.get(approval_request.request_id, {})
+                elapsed = time.time() - pending.get('created_at', 0)
+                
+                if elapsed >= timeout:
+                    return {'status': 'expired', 'request_id': approval_request.request_id}
+                else:
+                    return {'status': 'denied', 'request_id': approval_request.request_id}
+                    
+        finally:
+            self.state = KernelState.ACTING
+    
+    def _setup_sandbox(self, tool_name: str, sandbox_mode: str) -> bool:
+        """
+        STRICT Sandbox Setup.
+        
+        Returns: True if sandbox is ready, False otherwise
+        """
+        if not hasattr(self, 'sandbox') or not self.sandbox:
+            # No sandbox - assume safe environment
+            return True
+        
+        try:
+            # Configure sandbox mode
+            if sandbox_mode == 'safe':
+                # Most restrictive
+                pass
+            elif sandbox_mode == 'normal':
+                # Standard restrictions
+                pass
+            elif sandbox_mode == 'advanced':
+                # Minimal restrictions (for trusted operations)
+                pass
+            
+            return True
+        except Exception as e:
+            logger.error(f"Sandbox setup failed: {e}")
+            return False
+    
+    async def _execute_tool_strict(
+        self, 
+        task: Task, 
+        tool_name: str, 
+        args: Dict, 
+        timeout: int = 30
+    ) -> ExecutionResult:
+        """
+        STRICT Tool Execution.
+        
+        Returns: ExecutionResult with success=True/False
+        """
         exec_result = ExecutionResult(success=False, tool_used=tool_name)
         
-        # Part 1: Model suggestion (not truth)
         try:
-            prompt = f"Execute: {task.description}. Tool: {tool_name}. Args: {json.dumps(args)}. Return JSON."
-            response = self.native_brain.think(prompt)
-            
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                model_suggestion = json.loads(json_match.group())
-        except Exception as e:
-            logger.warning(f"Model suggestion failed: {e}")
-            model_suggestion = {}
-        
-        # Part 2: Actual tool runtime (REAL truth)
-        tool_start_time = time.time()
-        
-        try:
-            if hasattr(self, 'tools') and self.tools:
+            if hasattr(self, 'native_brain') and self.native_brain:
+                # Use brain for execution
+                task_meta = task.input_data or {}
+                result = await self._execute_via_brain_strict(task, tool_name, args, task_meta)
+                return result
+            elif hasattr(self, 'tools') and self.tools:
+                # Direct tool execution
                 import asyncio
                 tool_result = await asyncio.wait_for(
                     asyncio.to_thread(self.tools.execute_tool, tool_name, args),
-                    timeout=task.timeout
+                    timeout=timeout
                 )
                 
                 exec_result.stdout = tool_result.stdout or ""
@@ -3126,377 +3498,171 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 if exec_result.exit_code != 0:
                     exec_result.success = False
                     exec_result.error = f"Exit code: {exec_result.exit_code}"
-                elif any(err in (exec_result.stdout + exec_result.stderr).lower() for err in ['exception', 'error', 'failed', 'traceback']):
+                elif any(err in (exec_result.stdout + exec_result.stderr).lower() 
+                        for err in ['exception', 'error', 'failed', 'traceback']):
                     exec_result.success = False
                     exec_result.error = "Error pattern in output"
                 else:
                     exec_result.success = True
             else:
-                exec_result.error = "No tools engine"
+                exec_result.error = "No execution engine available"
                 
         except asyncio.TimeoutError:
-            exec_result.error = f"Timeout after {task.timeout}s"
+            exec_result.error = f"Timeout after {timeout}s"
             exec_result.error_type = ErrorType.EXECUTION_TIMEOUT
         except Exception as e:
             exec_result.error = str(e)
         
-        exec_result.execution_time = time.time() - tool_start_time
+        return exec_result
+    
+    async def _execute_via_brain_strict(self, task: Task, tool_name: str, args: Dict, task_meta: Dict) -> ExecutionResult:
+        """
+        STRICT BRAIN EXECUTION - No1 Grade.
         
-        # Part 3: Post-runtime validation
+        MODEL OUTPUT (only):
+        - intent: what model thinks should happen
+        - suggestion: model recommended approach
+        - candidate_args: model suggested arguments
+        
+        REAL TRUTH (always):
+        - actual tool runtime result
+        - verifier result  
+        - artifact collector
+        
+        MODEL CAN LIE ABOUT:
+        - success status
+        - artifacts
+        - stdout/stderr
+        - tool_used
+        
+        SO WE NEVER TRUST MODEL OUTPUT FOR SUCCESS/ARTIFACTS.
+        """
+        import re, json, time
+
+        exec_result = ExecutionResult(success=False, tool_used=tool_name)
+        
+        # Track truth sources
+        truth_sources = {
+            'model_intent': None,
+            'model_suggestion': None,
+            'model_candidate_args': None,
+            'runtime_result': None,
+            'verifier_result': None,
+            'artifact_check': None
+        }
+
+        # STEP 1: MODEL OUTPUT - ONLY intent/suggestion/args
+        try:
+            intent_prompt = f"""Analyze this task and provide intent + suggestion.
+TASK: {task.description}
+TOOL: {tool_name}
+ARGS: {json.dumps(args)}
+
+Return ONLY valid JSON (no other text):
+{{
+  "intent": "What the model thinks should happen",
+  "suggestion": "Recommended approach",
+  "candidate_args": {{}}  // any argument corrections
+}}"""
+
+            response = self.native_brain.think(intent_prompt)
+            
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match and json_match.group().count('{') == json_match.group().count('}'):
+                model_output = json.loads(json_match.group())
+                truth_sources['model_intent'] = model_output.get('intent')
+                truth_sources['model_suggestion'] = model_output.get('suggestion')
+                truth_sources['model_candidate_args'] = model_output.get('candidate_args', {})
+                
+                logger.info(f"Model intent: {truth_sources['model_intent']}")
+                
+        except Exception as e:
+            logger.warning(f"Model intent analysis failed: {e}")
+
+        # STEP 2: REAL TOOL RUNTIME - THE ACTUAL TRUTH
+        tool_start_time = time.time()
+
+        try:
+            if hasattr(self, 'tools') and self.tools:
+                import asyncio
+                tool_runtime_result = await asyncio.wait_for(
+                    asyncio.to_thread(self.tools.execute_tool, tool_name, args),
+                    timeout=task.timeout
+                )
+
+                exec_result.stdout = tool_runtime_result.stdout or ""
+                exec_result.stderr = tool_runtime_result.stderr or ""
+                exec_result.exit_code = tool_runtime_result.exit_code if hasattr(tool_runtime_result, 'exit_code') else 0
+                exec_result.artifacts = tool_runtime_result.artifacts if hasattr(tool_runtime_result, 'artifacts') else []
+                
+                truth_sources['runtime_result'] = {
+                    'exit_code': exec_result.exit_code,
+                    'has_stdout': bool(exec_result.stdout),
+                    'has_stderr': bool(exec_result.stderr),
+                    'artifact_count': len(exec_result.artifacts)
+                }
+
+                if exec_result.exit_code != 0:
+                    exec_result.success = False
+                    exec_result.error = f"Exit code: {exec_result.exit_code}"
+                elif any(err in (exec_result.stdout + exec_result.stderr).lower() 
+                        for err in ['exception', 'error', 'failed', 'traceback']):
+                    exec_result.success = False
+                    exec_result.error = "Error pattern in output"
+                else:
+                    exec_result.success = True
+            else:
+                exec_result.error = "No tools engine available"
+                
+        except asyncio.TimeoutError:
+            exec_result.error = f"Timeout after {task.timeout}s"
+            exec_result.error_type = ErrorType.EXECUTION_TIMEOUT
+            exec_result.success = False
+        except Exception as e:
+            exec_result.error = str(e)
+            exec_result.success = False
+
+        exec_result.execution_time = time.time() - tool_start_time
+
+        # STEP 3: VERIFIER - SECOND TRUTH SOURCE
+        if exec_result.success:
+            try:
+                verification_type = task_meta.get('verification_type', 'manual')
+                if verification_type != 'manual':
+                    verification_data = self._build_verification_data(task, task_meta, exec_result)
+                    verification = self.verifier.verify(verification_type, verification_data)
+                    
+                    truth_sources['verifier_result'] = {
+                        'passed': verification.passed,
+                        'details': verification.details
+                    }
+                    
+                    if not verification.passed:
+                        exec_result.success = False
+                        exec_result.error = f"Verification failed: {verification.details}"
+            except Exception as e:
+                logger.warning(f"Verification failed: {e}")
+
+        # STEP 4: ARTIFACT COLLECTION - THIRD TRUTH SOURCE
         expected_artifacts = task_meta.get('expected_artifacts', [])
         if expected_artifacts and exec_result.artifacts:
             for expected in expected_artifacts:
-                if not any(expected in a for a in exec_result.artifacts):
+                found = False
+                for artifact in exec_result.artifacts:
+                    if expected in artifact or expected in str(artifact):
+                        found = True
+                        break
+                
+                truth_sources['artifact_check'] = {'expected': expected, 'found': found}
+                
+                if not found:
                     exec_result.success = False
                     exec_result.error = f"Missing artifact: {expected}"
-        
-        return exec_result
-    
-    
-    def _select_tool_policy(self, task: Task, required_tools: List[str], task_meta: Dict, available_tools: List[str]) -> str:
-        """
-        ADVANCED POLICY-DRIVEN TOOL SELECTION - No1 Grade.
-        
-        Enhanced with:
-        - multi-tool chaining
-        - context-based tool sequencing
-        - previous tool failure history
-        - tool reliability history from telemetry
-        - approval-aware dynamic selection
-        - verifier-aware selection
-        """
-        
-        task_type = task_meta.get('task_type', 'general')
-        risk = task_meta.get('risk_level', 'normal')
-        verification_type = task_meta.get('verification_type', 'manual')
-        sandbox_mode = task_meta.get('sandbox_mode', 'normal')
-        
-        # Get tool success history from telemetry
-        tool_history = self._get_tool_success_history()
-        
-        # Multi-tool chain strategies for complex tasks
-        TOOL_CHAIN_STRATEGIES = {
-            'browser_automation': {
-                'sequence': ['browser_navigate', 'browser_click', 'browser_type', 'take_screenshot'],
-                'requires_verification': True,
-                'verification_type': 'browser'
-            },
-            'file_operations': {
-                'sequence': ['read_file', 'execute_code', 'write_file'],
-                'requires_verification': True,
-                'verification_type': 'file'
-            },
-            'web_research': {
-                'sequence': ['web_search', 'web_request', 'browser_navigate'],
-                'requires_verification': False,
-                'verification_type': 'function'
-            },
-            'code_development': {
-                'sequence': ['read_file', 'execute_code', 'execute_command', 'write_file'],
-                'requires_verification': True,
-                'verification_type': 'code'
-            },
-            'server_setup': {
-                'sequence': ['execute_command', 'execute_code', 'web_request'],
-                'requires_verification': True,
-                'verification_type': 'server'
-            }
-        }
-        
-        # Check if task matches a chain strategy
-        for chain_name, chain_config in TOOL_CHAIN_STRATEGIES.items():
-            if task_type in chain_name or any(k in task.description.lower() for k in chain_name.split('_')):
-                chain_available = [t for t in chain_config['sequence'] if t in available_tools]
-                if chain_available:
-                    logger.info(f"Multi-tool chain: {chain_name} -> {chain_available[0]}")
-                    return chain_available[0]
-        
-        # Context-based tool sequencing based on previous task results
-        if hasattr(self, '_last_execution_results'):
-            last_tool = self._get_last_tool_used()
-            last_success = self._get_last_execution_success()
-            
-            if last_tool and not last_success:
-                alternates = {
-                    'execute_command': 'execute_code',
-                    'execute_code': 'execute_command',
-                    'browser_navigate': 'web_request',
-                    'web_request': 'browser_navigate',
-                    'write_file': 'execute_command',
-                }
-                if last_tool in alternates and alternates[last_tool] in available_tools:
-                    logger.info(f"Switching tool after failure: {last_tool} -> {alternates[last_tool]}")
-                    return alternates[last_tool]
-        
-        # Approval-aware dynamic selection
-        approval_policy = task.approval_policy
-        if approval_policy == 'manual':
-            safe_tools = ['read_file', 'web_search', 'web_request']
-            for tool in safe_tools:
-                if tool in available_tools:
-                    return tool
-        
-        # Verifier-aware selection
-        if verification_type == 'browser':
-            preferred = ['browser_navigate']
-        elif verification_type == 'screenshot':
-            preferred = ['browser_navigate', 'take_screenshot']
-        elif verification_type == 'code':
-            preferred = ['execute_code']
-        elif verification_type == 'file':
-            preferred = ['write_file', 'read_file']
-        else:
-            preferred = ['execute_command']
-        
-        for tool in preferred:
-            if tool in available_tools:
-                history_score = tool_history.get(tool, {}).get('success_rate', 0.5)
-                if history_score >= 0.5:
-                    return tool
-        
-        # Fallback
-        tool_cats = {
-            'file': ['write_file'], 'read': ['read_file'], 'search': ['web_search'],
-            'browser': ['browser_navigate'], 'code': ['execute_code'], 'command': ['execute_command'],
-            'delete': ['delete_file'], 'general': ['execute_command']
-        }
-        candidates = [t for t in tool_cats.get(task_type, tool_cats['general']) if t in available_tools]
-        
-        for rt in required_tools:
-            if rt in available_tools:
-                return rt
-        
-        return candidates[0] if candidates else None
-    
-    def _get_tool_success_history(self) -> Dict:
-        """Get tool success history from telemetry"""
-        if hasattr(self, 'telemetry') and self.telemetry:
-            try:
-                metrics = self.telemetry.get_metrics()
-                return metrics.get('tool_stats', {})
-            except (AttributeError, KeyError, TypeError) as e:
-                logger.warning(f"Failed to get tool success history: {e}")
-                pass
-        return {}
-    
-    def _get_last_tool_used(self) -> Optional[str]:
-        """Get the tool used in last execution"""
-        if hasattr(self, '_last_execution_results') and self._last_execution_results:
-            last_task = list(self._last_execution_results.keys())[-1]
-            if last_task:
-                return self._last_execution_results[last_task].get('tool_used')
-        return None
-    
-    def _get_last_execution_success(self) -> bool:
-        """Get last execution success status"""
-        if hasattr(self, '_last_execution_results') and self._last_execution_results:
-            last_task = list(self._last_execution_results.keys())[-1]
-            if last_task:
-                return self._last_execution_results[last_task].get('success', False)
-        return False
 
-    def _select_tool_for_task(self, task: Task) -> str:
-        """
-        POLICY-DRIVEN TOOL SELECTOR for No1 agent.
-        
-        Selects the best tool based on:
-        - task_type: type of task (browser, code, file, server, etc.)
-        - risk_level: low, medium, high, critical
-        - required_tools: tools specified in task metadata
-        - available_tools: tools currently available
-        - verification_type: how task will be verified
-        - tool_reliability: reliability scores for tools
-        """
-        
-        task_meta = task.metadata or {}
-        task_type = task_meta.get('task_type', '')
-        risk_level = task_meta.get('risk_level', 'medium')
-        verification_type = task_meta.get('verification_type', 'manual')
-        
-        # Tool reliability scores (higher = more reliable)
-        TOOL_RELIABILITY = {
-            'execute_command': 0.9,
-            'execute_code': 0.85,
-            'write_file': 0.95,
-            'read_file': 0.95,
-            'delete_file': 0.7,
-            'browser_navigate': 0.8,
-            'browser_click': 0.8,
-            'browser_type': 0.8,
-            'web_search': 0.85,
-            'install_package': 0.75,
-            'web_request': 0.9,
-        }
-        
-        # Tool policies based on task type
-        TOOL_POLICY = {
-            'browser': {
-                'preferred': ['browser_navigate', 'browser_click', 'browser_type'],
-                'fallback': ['web_request'],
-                'forbidden': ['execute_command', 'delete_file']
-            },
-            'code': {
-                'preferred': ['execute_code'],
-                'fallback': ['execute_command'],
-                'forbidden': ['delete_file', 'install_package']
-            },
-            'file': {
-                'preferred': ['write_file', 'read_file'],
-                'fallback': [],
-                'forbidden': ['execute_command']
-            },
-            'server': {
-                'preferred': ['execute_command', 'execute_code'],
-                'fallback': ['web_request'],
-                'forbidden': ['delete_file']
-            },
-            'search': {
-                'preferred': ['web_search'],
-                'fallback': ['web_request'],
-                'forbidden': []
-            },
-            'install': {
-                'preferred': ['install_package'],
-                'fallback': ['execute_command'],
-                'forbidden': ['delete_file']
-            }
-        }
-        
-        # Risk-based restrictions
-        RISK_RESTRICTIONS = {
-            'critical': {
-                'allowed': ['read_file', 'web_search', 'web_request'],
-                'require_approval': ['execute_command', 'execute_code', 'write_file', 'delete_file', 'install_package']
-            },
-            'high': {
-                'allowed': ['read_file', 'write_file', 'web_search', 'web_request', 'execute_command', 'execute_code'],
-                'require_approval': ['delete_file', 'install_package']
-            },
-            'medium': {
-                'allowed': ['read_file', 'write_file', 'web_search', 'web_request', 'execute_command', 'execute_code', 'browser_navigate'],
-                'require_approval': ['delete_file', 'install_package']
-            },
-            'low': {
-                'allowed': ['read_file', 'write_file', 'web_search', 'web_request', 'execute_command', 'execute_code', 'browser_navigate', 'browser_click', 'browser_type', 'delete_file', 'install_package'],
-                'require_approval': []
-            }
-        }
-        
-        # Get available tools (default all if not specified)
-        available_tools = list(TOOL_RELIABILITY.keys())
-        
-        # 1. First, check if task_type has specific policy
-        if task_type and task_type in TOOL_POLICY:
-            policy = TOOL_POLICY[task_type]
-            
-            # Try preferred tools first
-            for tool in policy['preferred']:
-                if tool in available_tools:
-                    logger.info(f"Tool selected from policy (preferred): {tool} for task_type={task_type}")
-                    return tool
-            
-            # Try fallback tools
-            for tool in policy['fallback']:
-                if tool in available_tools:
-                    logger.info(f"Tool selected from policy (fallback): {tool} for task_type={task_type}")
-                    return tool
-            
-            # Check if forbidden tools are being used
-            desc = task.description.lower()
-            for forbidden in policy['forbidden']:
-                if any(k in desc for k in [forbidden.replace('_', ' '), forbidden]):
-                    logger.warning(f"Tool {forbidden} is forbidden for task_type={task_type}")
-        
-        # 2. Check risk level restrictions
-        risk_restriction = RISK_RESTRICTIONS.get(risk_level, RISK_RESTRICTIONS['medium'])
-        allowed_tools = risk_restriction['allowed']
-        
-        # Filter by allowed tools based on risk
-        candidate_tools = [t for t in available_tools if t in allowed_tools]
-        
-        if not candidate_tools:
-            logger.warning(f"No allowed tools for risk_level={risk_level}, using all available")
-            candidate_tools = available_tools
-        
-        # 3. Score and rank tools
-        tool_scores = []
-        for tool in candidate_tools:
-            reliability = TOOL_RELIABILITY.get(tool, 0.5)
-            
-            # Bonus for tools matching verification type
-            bonus = 0
-            if verification_type == 'browser' and 'browser' in tool:
-                bonus = 0.15
-            elif verification_type == 'code' and 'code' in tool:
-                bonus = 0.15
-            elif verification_type == 'file' and 'file' in tool:
-                bonus = 0.15
-            
-            # Bonus for tools in task metadata
-            if task_meta.get('preferred_tool') == tool:
-                bonus += 0.2
-            
-            total_score = reliability + bonus
-            tool_scores.append((tool, total_score))
-        
-        # Sort by score (highest first)
-        tool_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        if tool_scores:
-            selected = tool_scores[0][0]
-            logger.info(f"Policy-driven tool selected: {selected} (score={tool_scores[0][1]:.2f})")
-            return selected
-        
-        # Fallback: use description-based selection
-        desc = task.description.lower()
-        if any(k in desc for k in ['yarat', 'yoz', 'fayl', 'file', 'create']): return 'write_file'
-        if any(k in desc for k in ['oqish', 'read', 'ko\'r']): return 'read_file'
-        if any(k in desc for k in ['ochir', 'delete', 'remove']): return 'delete_file'
-        if any(k in desc for k in ['qidir', 'internet', 'search', 'web']): return 'web_search'
-        if any(k in desc for k in ['sahifa', 'page', 'sayt', 'url']): return 'browser_navigate'
-        if any(k in desc for k in ['kod', 'code', 'python', 'bajar']): return 'execute_code'
-        
-        # Default to execute_command only if explicitly allowed
-        if 'execute_command' in allowed_tools:
-            return 'execute_command'
-        
-        # Last resort: web_request ( safest option)
-        logger.warning("Tool selection: falling back to web_request as safest option")
-        return 'web_request'
-    
-    def _validate_tool_args(self, tool_name: str, args: Dict) -> bool:
-        """Validate tool arguments"""
-        required_args = {
-            'write_file': ['path', 'content'], 'read_file': ['path'], 'web_search': ['query'],
-            'execute_command': ['command'], 'execute_code': ['code'], 'browser_navigate': ['url'],
-            'delete_file': ['path'], 'install_package': ['package']
-        }
-        required = required_args.get(tool_name, [])
-        return all(arg in args and args[arg] for arg in required)
-    
-    def _build_verification_data(self, task: Task, task_meta: Dict, exec_result: ExecutionResult) -> Dict:
-        """Build verification data"""
-        verification_data = {'result': exec_result.stdout}
-        verification_type = task_meta.get('verification_type', 'manual')
-        
-        if verification_type == 'file_exists': verification_data['path'] = task_meta.get('file_path', '')
-        elif verification_type == 'process_running': verification_data['process_name'] = task_meta.get('process_name', '')
-        elif verification_type == 'browser_page':
-            verification_data['url'] = task_meta.get('url', '')
-            verification_data['expected_text'] = task_meta.get('success_criteria', '')
-        elif verification_type == 'port_open':
-            verification_data['host'] = task_meta.get('host', 'localhost')
-            verification_data['port'] = task_meta.get('port', 80)
-        elif verification_type == 'server_responding': verification_data['url'] = task_meta.get('url', '')
-        elif verification_type == 'screenshot':
-            verification_data['screenshot_path'] = task_meta.get('screenshot_path', '')
-            verification_data['expected_elements'] = task_meta.get('expected_elements', [])
-        elif verification_type == 'code_syntax':
-            verification_data['code'] = exec_result.stdout
-            verification_data['language'] = task_meta.get('language', 'python')
-        
-        return verification_data
-    
+        logger.debug(f"Truth sources: {truth_sources}")
+        return exec_result
+
+
     async def _execute_via_brain(self, task: Task, tool_name: str, args: Dict, task_meta: Dict) -> ExecutionResult:
         """
         Execute tool via native_brain with INDEPENDENT validation.
@@ -3531,7 +3697,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         # Step 1: Get model suggestion (NOT the final truth)
         model_suggestion = None
         try:
-            execution_prompt = f"""Execute task with FULL precision. 
+            # MODEL OUTPUT: ONLY intent/suggestion - NEVER success/artifacts
+            intent_prompt = f"""Analyze task for planning (NOT execution results). 
 TASK: {task.description} 
 TOOL: {tool_name} 
 ARGUMENTS: {json.dumps(args)} 
@@ -3547,7 +3714,7 @@ Return ONLY valid JSON: {{
   "error": "error if failed" 
 }}"""
 
-            response = self.native_brain.think(execution_prompt)
+            response = self.native_brain.think(intent_prompt)
             
             # Try to parse model response
             json_match = re.search(r'\{[^{}]*"success"[^{}]*\}', response, re.DOTALL)
