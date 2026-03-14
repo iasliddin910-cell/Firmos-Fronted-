@@ -431,13 +431,14 @@ class VerificationEngine:
                         content = page.content()
                         text_found = expected_text.lower() in content.lower()
                     
-                    # Check for expected selector
+                    # Check for expected selector (FIXED: proper exception handling)
                     selector_found = True
                     if expected_selector:
                         try:
                             page.wait_for_selector(expected_selector, timeout=3000)
                             selector_found = True
-                        except:
+                        except Exception as selector_err:
+                            logger.warning(f"Selector wait error: {selector_err}")
                             selector_found = False
                     
                     browser.close()
@@ -551,10 +552,12 @@ class VerificationEngine:
                 }
             )
         except ImportError:
+            # CRITICAL: OCR not available = FAIL (not soft pass!)
             return VerificationResult(
-                passed=True,
-                details="Screenshot file exists (OCR not available)",
-                evidence={"path": screenshot_path, "note": "File exists but content not verified"}
+                passed=False,
+                details="Screenshot verification FAILED: pytesseract not available - cannot verify screenshot content",
+                severity="error",
+                evidence={"path": screenshot_path, "error": "OCR library not installed", "required": "pytesseract"}
             )
         except Exception as e:
             return VerificationResult(
@@ -1350,7 +1353,17 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'language': t.get('language', 'python')
                 }
                 tasks.append(task)
-            except: continue
+            except Exception as e:
+                logger.warning(f"Failed to create task: {e}, task_data: {t}")
+                try:
+                    minimal_task = Task(
+                        id=str(uuid.uuid4())[:8],
+                        description=str(t.get('description', 'Unknown')),
+                        priority=TaskPriority.NORMAL
+                    )
+                    tasks.append(minimal_task)
+                except Exception as fallback_err:
+                    logger.error(f"Fallback task creation failed: {fallback_err}")
         return tasks
     
     def _heuristic_planner(self, message: str) -> List[Task]:
@@ -1565,6 +1578,19 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                         task.status = TaskStatus.VERIFIED
                         exec_result.verified = True
                         exec_result.verification_details = verification.details
+                
+                # Store execution result for task-aware verification
+                if 'execution_results' not in dir(self):
+                    self._last_execution_results = {}
+                self._last_execution_results[task.id] = {
+                    'success': success,
+                    'stdout': task_result,
+                    'stderr': execution_error or '',
+                    'artifacts': exec_result.artifacts,
+                    'tool_used': tool_name,
+                    'error': execution_error,
+                    'error_type': error_type.value if error_type else None
+                }
                 
                 # 9. Update task status
                 if success:
