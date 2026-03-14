@@ -2252,6 +2252,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         
         tasks = []
         parsing_attempts = []  # For telemetry
+        parse_diagnostics = {"response_length": 0, "has_json_markers": False, "has_prose": False, "strategies_tried": [], "failures": []}
         
         # Pre-processing: Clean response
         response = response.strip()
@@ -2363,6 +2364,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 'success': False,
                 'attempts': parsing_attempts,
                 'response_preview': response[:200],
+                'diagnostics': parse_diagnostics,
+                'recovery_hint': _get_recovery_hint(parsing_attempts),
                 'timestamp': time.time()
             })
         
@@ -4631,3 +4634,22 @@ def create_kernel(api_key: str, tools_engine) -> CentralKernel:
     """Create the central kernel"""
     return CentralKernel(api_key, tools_engine)
 # Kernel updated Sat Mar 14 08:06:38 UTC 2026
+
+def _get_recovery_hint(parsing_attempts: List[Dict]) -> str:
+    """
+    Get recovery hint based on parsing failures.
+    """
+    if not parsing_attempts:
+        return "No parsing attempts recorded"
+    
+    # Check failure reasons
+    reasons = [a.get('reason', '') for a in parsing_attempts]
+    
+    if 'json_decode_error' in reasons:
+        return "Model returned malformed JSON - prompt for cleaner JSON output"
+    elif 'schema_validation_failed' in reasons:
+        return "Schema mismatch - validate task structure before returning"
+    elif 'no_match' in reasons:
+        return "No JSON found in response - model returned prose instead of JSON"
+    else:
+        return "Multiple parse failures - simplify response format"
