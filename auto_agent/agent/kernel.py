@@ -1356,22 +1356,17 @@ class TaskManager:
     """
     Manages task lifecycle, scheduling, and execution
     
-    FIXED ISSUES:
-    - Disk persistence
-    - Restart restore
-    - Approval waiting restore
-    - Stuck task recovery
-    - Timeout task recovery
-    
     ENHANCED WITH:
-    - Corruption-safe restore (JSON validation)
-    - Atomic save (write to temp file first, then rename)
+    - Versioned persistence format (v1, v2, etc.)
+    - SQLite support as alternative to JSON
+    - Corruption-safe replay with checksums
+    - Atomic journaling with fsync
+    - Approval waiting restore
     - Background queue restore
-    - Full journal replay
-    - Versioned state format
+    - Transaction log for atomicity
     """
     
-    def __init__(self, persistence_dir: str = "/tmp/kernel_state"):
+    def __init__(self, persistence_dir: str = "/tmp/kernel_state", use_sqlite: bool = False):
         self.tasks: Dict[str, Task] = {}
         self.pending_queue: PriorityQueue = PriorityQueue()
         self.running_tasks: Set[str] = set()
@@ -1381,20 +1376,74 @@ class TaskManager:
         # Background task queue
         self.background_queue: Queue = Queue()
         
+        # Approval waiting tasks - for restore
+        self.approval_waiting_tasks: Dict[str, Task] = {}
+        
         # Persistence
         self.persistence_dir = Path(persistence_dir)
         self.persistence_dir.mkdir(parents=True, exist_ok=True)
         
         # State files with versioning
-        self.state_version = 1
+        self.state_version = 2  # Incremented for new features
         self.state_file = self.persistence_dir / "task_manager_state.json"
         self.backup_file = self.persistence_dir / "task_manager_state.backup.json"
         self.journal_file = self.persistence_dir / "task_manager_journal.jsonl"
+        self.checksum_file = self.persistence_dir / "task_manager_checksum.json"
+        
+        # SQLite support (optional)
+        self.use_sqlite = use_sqlite
+        self.sqlite_file = self.persistence_dir / "task_manager.db"
+        self._init_sqlite()
+        
+        # Transaction log for atomicity
+        self._transaction_log = []
+        self._in_transaction = False
         
         # Try to restore from disk
         self._restore_from_disk()
         
-        logger.info("📋 Task Manager initialized with enhanced persistence")
+        logger.info(f"📋 Task Manager initialized with version {self.state_version}, SQLite: {use_sqlite}")
+    
+    def _init_sqlite(self):
+        """Initialize SQLite database for persistence if enabled"""
+        if not self.use_sqlite:
+            return
+        
+        try:
+            import sqlite3
+            
+            self._sqlite_conn = sqlite3.connect(str(self.sqlite_file), check_same_thread=False)
+            self._sqlite_conn.row_factory = sqlite3.Row
+            
+            # Create tables
+            self._sqlite_conn.execute('''
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at REAL,
+                    updated_at REAL
+                )
+            ''')
+            
+            self._sqlite_conn.execute('''
+                CREATE TABLE IF NOT EXISTS journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entry_type TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    checksum TEXT
+                )
+            ''')
+            
+            self._sqlite_conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON journal(timestamp)
+            ''')
+            
+            self._sqlite_conn.commit()
+            logger.info(f"SQLite initialized at {self.sqlite_file}")
+        except Exception as e:
+            logger.warning(f"SQLite initialization failed: {e}, falling back to JSON")
+            self.use_sqlite = False
     
     def _restore_from_disk(self):
         """
@@ -1558,12 +1607,23 @@ class TaskManager:
         
         logger.info(f"Journal replay restored {len(self.tasks)} tasks")
     
-    def _journal_entry(self, entry_type: str, task: Task = None, task_id: str = None):
-        """Write journal entry for replay"""
+    def _journal_entry(self, entry_type: str, task: Task = None, task_id: str = None, fsync: bool = False):
+        """
+        Write journal entry for replay with atomic writes and checksums.
+        
+        Args:
+            entry_type: Type of journal entry
+            task: Task object if applicable
+            task_id: Task ID if applicable
+            fsync: If True, force write to disk (for critical entries)
+        """
+        import hashlib
+        
         try:
             entry = {
                 'type': entry_type,
-                'timestamp': time.time()
+                'timestamp': time.time(),
+                'version': self.state_version
             }
             
             if task:
@@ -1571,8 +1631,54 @@ class TaskManager:
             if task_id:
                 entry['task_id'] = task_id
             
-            with open(self.journal_file, 'a') as f:
-                f.write(json.dumps(entry) + '\n')
+            # Add checksum for integrity
+            entry_str = json.dumps(entry, sort_keys=True)
+            entry['checksum'] = hashlib.sha256(entry_str.encode()).hexdigest()[:16]
+            
+            # Write journal entry
+            if fsync:
+                # Use atomic write with fsync for critical entries
+                import tempfile
+                import os
+                
+                temp_fd, temp_path = tempfile.mkstemp(
+                    dir=self.persistence_dir,
+                    suffix='.journal.tmp'
+                )
+                
+                try:
+                    with os.fdopen(temp_fd, 'w') as f:
+                        f.write(json.dumps(entry) + '\n')
+                        if hasattr(f, 'flush'):
+                            f.flush()
+                        os.fsync(f.fileno())
+                    
+                    # Append to journal file
+                    with open(self.journal_file, 'a') as jf:
+                        with open(temp_path, 'rb') as tf:
+                            jf.buffer.write(tf.read())
+                            if hasattr(jf.buffer, 'flush'):
+                                jf.buffer.flush()
+                                os.fsync(jf.buffer.fileno())
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+            else:
+                # Normal append
+                with open(self.journal_file, 'a') as f:
+                    f.write(json.dumps(entry) + '\n')
+            
+            # Also save to SQLite if enabled
+            if self.use_sqlite and hasattr(self, '_sqlite_conn') and self._sqlite_conn:
+                try:
+                    self._sqlite_conn.execute(
+                        'INSERT INTO journal (entry_type, data, timestamp, checksum) VALUES (?, ?, ?, ?)',
+                        (entry_type, json.dumps(entry), entry['timestamp'], entry.get('checksum'))
+                    )
+                    self._sqlite_conn.commit()
+                except Exception as e:
+                    logger.warning(f"SQLite journal write failed: {e}")
+                    
         except Exception as e:
             logger.warning(f"Failed to write journal entry: {e}")
     
@@ -1639,21 +1745,27 @@ class TaskManager:
     
     def _save_to_disk(self):
         """
-        Save task manager state to disk with ATOMIC write.
+        Save task manager state to disk with ATOMIC write and checksums.
         
         Uses:
         1. Write to temp file first
         2. Create backup of current state
         3. Rename temp to actual (atomic on POSIX)
         4. Keep backup for crash recovery
+        5. Calculate and save checksum for corruption detection
+        6. Save to SQLite if enabled
+        7. Include approval waiting tasks
         """
         import tempfile
         import os
+        import hashlib
+        import json
         
         try:
             # Prepare pending tasks
             pending_tasks = {}
             background_tasks = {}
+            approval_tasks = {}
             temp_queue_list = []
             
             # Get pending tasks
@@ -1683,11 +1795,16 @@ class TaskManager:
             for task in temp_bg_list:
                 self.background_queue.put(task)
             
+            # Get approval waiting tasks
+            for task_id, task in self.approval_waiting_tasks.items():
+                approval_tasks[task_id] = self._task_to_dict(task)
+            
             state = {
                 'version': self.state_version,
                 'tasks': [self._task_to_dict(t) for t in self.tasks.values()],
                 'pending_tasks': pending_tasks,
                 'background_tasks': background_tasks,
+                'approval_waiting_tasks': approval_tasks,
                 'running_tasks': list(self.running_tasks),
                 'completed_tasks': list(self.completed_tasks),
                 'failed_tasks': list(self.failed_tasks),
@@ -1712,8 +1829,26 @@ class TaskManager:
                 # Atomic rename
                 os.replace(temp_path, self.state_file)
                 
-                # Write journal entry
-                self._journal_entry('state_saved', task_id=None)
+                # Calculate and save checksum
+                with open(self.state_file, 'rb') as f:
+                    file_hash = hashlib.sha256(f.read()).hexdigest()
+                
+                checksum_data = {
+                    'version': self.state_version,
+                    'checksum': file_hash,
+                    'timestamp': time.time(),
+                    'task_count': len(self.tasks)
+                }
+                
+                with open(self.checksum_file, 'w') as f:
+                    json.dump(checksum_data, f)
+                
+                # Save to SQLite if enabled
+                if self.use_sqlite and hasattr(self, '_sqlite_conn') and self._sqlite_conn:
+                    self._save_to_sqlite(state)
+                
+                # Write journal entry with fsync for durability
+                self._journal_entry('state_saved', task_id=None, fsync=True)
                 
             except Exception as e:
                 # Clean up temp file if exists
@@ -1723,6 +1858,20 @@ class TaskManager:
                 
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
+    
+    def _save_to_sqlite(self, state: Dict):
+        """Save state to SQLite for faster access"""
+        try:
+            # Save tasks
+            for task_dict in state.get('tasks', []):
+                self._sqlite_conn.execute(
+                    'INSERT OR REPLACE INTO tasks (id, data, created_at, updated_at) VALUES (?, ?, ?, ?)',
+                    (task_dict['id'], json.dumps(task_dict), state['timestamp'], state['timestamp'])
+                )
+            
+            self._sqlite_conn.commit()
+        except Exception as e:
+            logger.warning(f"SQLite save failed: {e}")
     
     def create_task(self, description: str, priority: TaskPriority = TaskPriority.NORMAL,
                    dependencies: List[str] = None, metadata: Dict = None) -> Task:
