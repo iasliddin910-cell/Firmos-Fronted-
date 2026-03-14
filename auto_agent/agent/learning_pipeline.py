@@ -449,8 +449,16 @@ class KnowledgeGovernance:
             "success": 0.1,
             "failure": -0.1,
             "contradiction": -0.2,
-            "verification": 0.05
+            "verification": 0.05,
+            "partial": 0.05,
+            "outdated": -0.15,
+            "accurate": 0.15,
+            "helpful": 0.05,
+            "not_helpful": -0.1,
+            "error": -0.15
         }
+        # Feedback queue for observed-world closed loop
+        self.feedback_queue: List[Dict] = []
         
     def governance_loop(self):
         """Main governance loop - run periodically"""
@@ -514,11 +522,206 @@ class KnowledgeGovernance:
                 
         if promoted or demoted:
             logger.info(f"Governance: {promoted} promoted, {demoted} demoted")
-            
+    
+    # Feedback types for observed-world closed loop
+    class FeedbackType(Enum):
+        """Types of feedback from observed world"""
+        SUCCESS = "success"           # Task completed successfully
+        FAILURE = "failure"           # Task failed
+        PARTIAL_SUCCESS = "partial"    # Task partially completed
+        CONTRADICTION = "contradiction"  # Found contradicting evidence
+        VERIFICATION = "verification" # Manually verified
+        OUTDATED = "outdated"         # Information is outdated
+        ACCURATE = "accurate"         # Confirmed accurate
+        HELPFUL = "helpful"           # User marked as helpful
+        NOT_HELPFUL = "not_helpful"   # User marked as not helpful
+        ERROR = "error"               # Error when using knowledge
+    
     def _process_feedback(self):
-        """Process observed-world feedback"""
-        # This would integrate with actual task execution feedback
-        pass
+        """
+        Process observed-world feedback from real task execution.
+        
+        This is the critical 24/7 learning loop that integrates
+        actual task outcomes into knowledge quality.
+        """
+        # Process pending feedback queue
+        for feedback in list(self.feedback_queue):
+            try:
+                self._apply_feedback(feedback)
+                self.feedback_queue.remove(feedback)
+            except Exception as e:
+                logger.error(f"Failed to process feedback: {e}")
+        
+        # Process task outcomes if available
+        self._process_task_outcomes()
+        
+        # Update source trust based on aggregate feedback
+        self._update_source_trust_from_feedback()
+        
+        # Check for knowledge that needs re-verification
+        self._flag_for_reverification()
+    
+    def _apply_feedback(self, feedback: Dict):
+        """Apply a single feedback item to knowledge entries"""
+        entry_id = feedback.get("entry_id")
+        feedback_type = feedback.get("type")
+        details = feedback.get("details", {})
+        
+        if entry_id not in self.pipeline.knowledge:
+            logger.warning(f"Feedback for unknown entry: {entry_id}")
+            return
+        
+        entry = self.pipeline.knowledge[entry_id]
+        
+        # Calculate feedback weight
+        weight = self.feedback_weights.get(feedback_type, 0)
+        
+        # Adjust confidence based on feedback type
+        if feedback_type == self.FeedbackType.SUCCESS.value:
+            entry.success_count += 1
+            entry.usage_count += 1
+            # Positive reinforcement
+            entry.confidence = min(1.0, entry.confidence + weight)
+            entry.last_verified = time.time()
+            
+        elif feedback_type == self.FeedbackType.FAILURE.value:
+            entry.usage_count += 1
+            # Negative reinforcement
+            entry.confidence = max(0.0, entry.confidence + weight)
+            
+        elif feedback_type == self.FeedbackType.CONTRADICTION.value:
+            # Check for contradiction and flag
+            self._handle_contradiction_feedback(entry, details)
+            entry.confidence = max(0.0, entry.confidence - 0.2)
+            
+        elif feedback_type == self.FeedbackType.OUTDATED.value:
+            # Mark as stale, trigger re-verification
+            entry.stale_score = 1.0
+            entry.last_verified = time.time()
+            
+        elif feedback_type == self.FeedbackType.ACCURATE.value:
+            # Manual verification - boost confidence
+            entry.confidence = min(1.0, entry.confidence + 0.15)
+            entry.last_verified = time.time()
+            
+        elif feedback_type == self.FeedbackType.HELPFUL.value:
+            # User feedback - positive signal
+            entry.confidence = min(1.0, entry.confidence + 0.05)
+            
+        elif feedback_type == self.FeedbackType.NOT_HELPFUL.value:
+            # User feedback - negative signal
+            entry.confidence = max(0.0, entry.confidence - 0.1)
+        
+        logger.info(f"Applied feedback: {entry_id} {feedback_type} -> confidence: {entry.confidence:.3f}")
+    
+    def _handle_contradiction_feedback(self, entry: KnowledgeEntry, details: Dict):
+        """Handle feedback about contradicting information"""
+        contradicting_entry_id = details.get("contradicting_entry_id")
+        
+        if contradicting_entry_id and contradicting_entry_id in self.pipeline.knowledge:
+            # Create contradiction record
+            contradiction = Contradiction(
+                entry_a=entry.entry_id,
+                entry_b=contradicting_entry_id,
+                contradiction_type="feedback_reported",
+                severity=0.9,  # High severity since reported by user
+                detected_at=time.time(),
+                resolution="pending"
+            )
+            self.pipeline.contradiction_detector.contradictions.append(contradiction)
+            logger.warning(f"Contradiction detected via feedback: {entry.entry_id} vs {contradicting_entry_id}")
+    
+    def _process_task_outcomes(self):
+        """Process task execution outcomes from the observed world"""
+        # Check for task outcome file (written by agent)
+        task_file = Path("/tmp/learning_task_outcomes.json")
+        
+        if not task_file.exists():
+            return
+        
+        try:
+            with open(task_file) as f:
+                outcomes = json.load(f)
+            
+            for outcome in outcomes:
+                entry_id = outcome.get("knowledge_entry_id")
+                if not entry_id:
+                    continue
+                    
+                if outcome.get("success"):
+                    self.record_feedback(entry_id, "success")
+                else:
+                    self.record_feedback(entry_id, "failure")
+            
+            # Clear processed outcomes
+            task_file.unlink()
+            
+        except Exception as e:
+            logger.debug(f"Could not process task outcomes: {e}")
+    
+    def _update_source_trust_from_feedback(self):
+        """Update source trust based on aggregate feedback"""
+        source_performance = defaultdict(lambda: {"success": 0, "failure": 0})
+        
+        # Aggregate feedback by source
+        for entry in self.pipeline.knowledge.values():
+            if entry.usage_count > 0:
+                source = entry.source
+                source_performance[source]["total"] = source_performance[source].get("total", 0) + entry.usage_count
+                source_performance[source]["success"] += entry.success_count
+        
+        # Adjust trust based on performance
+        for source_url, perf in source_performance.items():
+            if source_url in self.pipeline.sources:
+                source = self.pipeline.sources[source_url]
+                total = perf.get("total", 0)
+                
+                if total >= 5:  # Need minimum sample size
+                    success_rate = perf["success"] / total
+                    
+                    # Adjust trust level
+                    if success_rate >= 0.9:
+                        source.trust_level = TrustLevel.HIGH
+                    elif success_rate >= 0.7:
+                        source.trust_level = TrustLevel.MEDIUM
+                    elif success_rate < 0.3:
+                        source.trust_level = TrustLevel.LOW
+                        self.quarantined_sources.add(source_url)
+                    else:
+                        source.trust_level = TrustLevel.MEDIUM
+    
+    def _flag_for_reverification(self):
+        """Flag knowledge entries that need re-verification"""
+        current_time = time.time()
+        
+        for entry in self.pipeline.knowledge.values():
+            # Flag if:
+            # 1. Not verified in 180 days
+            # 2. Has high usage but declining success rate
+            # 3. Marked as potentially outdated
+            
+            days_since_verify = (current_time - entry.last_verified) / 86400
+            
+            if days_since_verify > 180:
+                entry.metadata["needs_verification"] = True
+                entry.metadata["verification_reason"] = "stale"
+                
+            elif entry.usage_count >= 10:
+                success_rate = entry.success_count / entry.usage_count
+                if success_rate < 0.5:
+                    entry.metadata["needs_verification"] = True
+                    entry.metadata["verification_reason"] = "declining_success"
+    
+    def queue_feedback(self, entry_id: str, feedback_type: str, details: Dict = None):
+        """Queue feedback for processing in governance loop"""
+        feedback = {
+            "entry_id": entry_id,
+            "type": feedback_type,
+            "details": details or {},
+            "timestamp": time.time()
+        }
+        self.feedback_queue.append(feedback)
+        logger.debug(f"Queued feedback: {entry_id} - {feedback_type}")
     
     def record_feedback(self, entry_id: str, feedback_type: str):
         """Record feedback on a knowledge entry"""

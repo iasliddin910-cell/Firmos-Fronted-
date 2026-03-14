@@ -64,12 +64,27 @@ class VectorMemory:
         logger.info("💾 Vector Memory initialized")
     
     def _load_json(self, filepath: Path) -> Dict:
-        """Load JSON file"""
+        """Load JSON file with proper error handling"""
         if filepath.exists():
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except Exception as e: logger.warning(f"Exception: {e}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Corrupted JSON file {filepath}: {e}")
+                # Backup corrupted file
+                backup_path = filepath.with_suffix('.json.backup')
+                try:
+                    filepath.rename(backup_path)
+                    logger.info(f"Backed up corrupted file to {backup_path}")
+                except Exception as backup_err:
+                    logger.error(f"Failed to backup corrupted file: {backup_err}")
+                return {}
+            except PermissionError as e:
+                logger.error(f"Permission denied reading {filepath}: {e}")
+                return {}
+            except Exception as e:
+                logger.error(f"Error loading {filepath}: {e}")
+                return {}
         return {}
     
     def _save_json(self, filepath: Path, data: Dict):
@@ -828,7 +843,45 @@ class ProceduralStore:
         return results
 
 
-# Add imports
-import time
-from collections import defaultdict
+# ==================== MEMORY GOVERNANCE ====================
+
+class MemoryGovernance:
+    LAYER_CONFIG = {
+        "working": {"max_items": 100, "ttl_seconds": 3600, "eviction": "lru"},
+        "episodic": {"max_items": 1000, "ttl_seconds": 86400*30, "eviction": "importance"},
+        "semantic": {"max_items": 10000, "ttl_seconds": 86400*365, "eviction": "confidence"},
+        "procedural": {"max_items": 5000, "ttl_seconds": 86400*365*5, "eviction": "usage"}
+    }
+    
+    def __init__(self):
+        self.layer_stats = defaultdict(dict)
+        self.last_gc = time.time()
+        self.gc_interval = 3600
+    
+    def should_evict(self, layer, current_count):
+        config = self.LAYER_CONFIG.get(layer, {})
+        return current_count >= config.get("max_items", 1000)
+    
+    def run_gc(self, memory_system):
+        current_time = time.time()
+        results = {"evicted": {}, "preserved": {}}
+        if current_time - self.last_gc < self.gc_interval:
+            return results
+        self.last_gc = current_time
+        return results
+    
+    def get_layer_health(self, memory_system):
+        health = {}
+        for layer_name in ["working", "episodic", "semantic", "procedural"]:
+            layer = getattr(memory_system, layer_name, None)
+            if not layer:
+                continue
+            config = self.LAYER_CONFIG[layer_name]
+            count = len(getattr(layer, 'memories', {}) or getattr(layer, 'contexts', {}) or getattr(layer, 'procedures', {}))
+            health[layer_name] = {"count": count, "max": config["max_items"], "usage_percent": (count/config["max_items"])*100}
+        return health
+
+
+def create_memory_system(data_dir=None):
+    return UnifiedMemory(data_dir=data_dir)
 

@@ -1,7 +1,19 @@
 """
-OmniAgent X - Self-Learning Engine (Mustaqil O'rganish)
-=========================================================
-Agent learns from interactions and improves over time
+OmniAgent X - Self-Learning Engine (Legacy Helper)
+==================================================
+DEPRECATED: Use learning_pipeline.py instead.
+
+This module is kept for backward compatibility.
+The main learning functionality is now in learning_pipeline.py.
+
+Migration:
+    from agent.learning_pipeline import UnifiedLearning, create_unified_learning
+    
+    # Instead of:
+    learning = SelfLearningEngine()
+    
+    # Use:
+    learning = create_unified_learning()
 """
 import os
 import json
@@ -14,11 +26,32 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
+# Import from learning_pipeline for unified interface
+try:
+    from agent.learning_pipeline import (
+        UnifiedLearning,
+        create_unified_learning as _create_pipeline,
+        SourceType,
+        KnowledgeType,
+        TrustLevel,
+        ConfidenceLevel
+    )
+    HAS_PIPELINE = True
+except ImportError:
+    HAS_PIPELINE = False
+    logger.warning("learning_pipeline not available, using legacy mode")
+
 
 class SelfLearningEngine:
     """
     Mustaqil o'rganish tizimi - xatolaridan o'rganadi va yaxshi bo'lib boradi
+    
+    DEPRECATED: This class is maintained for backward compatibility.
+    Use UnifiedLearning from learning_pipeline.py for new code.
     """
+    
+    # Reference to unified learning pipeline (if available)
+    _unified: Optional[Any] = None
     
     def __init__(self, data_dir: Path = None):
         if data_dir is None:
@@ -27,7 +60,15 @@ class SelfLearningEngine:
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
-        # Knowledge files
+        # Try to use unified pipeline if available
+        if HAS_PIPELINE and SelfLearningEngine._unified is None:
+            try:
+                SelfLearningEngine._unified = _create_pipeline(str(data_dir))
+                logger.info("Using UnifiedLearning from learning_pipeline")
+            except Exception as e:
+                logger.warning(f"Could not initialize unified pipeline: {e}")
+        
+        # Legacy file-based storage (for backward compatibility)
         self.errors_file = self.data_dir / "errors.json"
         self.patterns_file = self.data_dir / "patterns.json"
         self.preferences_file = self.data_dir / "preferences.json"
@@ -46,10 +87,12 @@ class SelfLearningEngine:
             "total_interactions": 0,
             "successful": 0,
             "failed": 0,
-            "start_time": datetime.now().isoformat()
+            "start_time": datetime.now().isoformat(),
+            "legacy_mode": not HAS_PIPELINE
         }
         
-        logger.info("🧠 Self-Learning Engine initialized")
+        logger.warning("⚠️ SelfLearningEngine is DEPRECATED. Use learning_pipeline.py instead.")
+        logger.info("🧠 Self-Learning Engine initialized (legacy mode: %s)", not HAS_PIPELINE)
     
     def _load_json(self, filepath: Path) -> Dict:
         """Load JSON file or return empty dict"""
@@ -57,7 +100,12 @@ class SelfLearningEngine:
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except Exception as e: logger.warning(f"Exception: {e}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Corrupted JSON file {filepath}: {e}")
+                return {}
+            except Exception as e:
+                logger.error(f"Error loading {filepath}: {e}")
+                return {}
         return {}
     
     def _save_json(self, filepath: Path, data: Dict):
