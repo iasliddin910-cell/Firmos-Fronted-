@@ -1367,3 +1367,212 @@ def create_multi_agent_coordinator(api_key: str, tools=None, config: Dict = None
     logger.info("✅ Multi-Agent Coordinator ready!")
     
     return coordinator
+
+
+# ==================== STAGE-BASED PARALLEL EXECUTION ====================
+
+    async def execute_stage_based_parallel(self, tasks: List[WorkerTask]) -> Dict[str, Any]:
+        """
+        Execute tasks with stage-based parallel processing.
+        
+        Pipeline stages:
+        1. RESEARCH (parallel for all tasks) - Gather context
+        2. PLAN (parallel for all tasks) - Create execution plans
+        3. CRITIQUE (parallel for all tasks) - Evaluate plans
+        4. EXECUTE (parallel for approved tasks) - Run tasks
+        5. VERIFY (parallel for executed tasks) - Verify results
+        
+        Each stage runs all tasks in parallel, then moves to next stage.
+        """
+        logger.info(f"🎯 Starting STAGE-BASED parallel execution for {len(tasks)} tasks")
+        
+        start_time = time.time()
+        
+        # Initialize results storage
+        task_results = {}
+        
+        # Stage 1: RESEARCH (parallel)
+        logger.info("📊 Stage 1: RESEARCH (parallel)...")
+        research_tasks = []
+        for task in tasks:
+            worker_task = WorkerTask(
+                id=f"{task.id}_research",
+                description=task.description,
+                context=task.context.copy()
+            )
+            research_tasks.append(worker_task)
+        
+        research_results = await asyncio.gather(
+            *[self._run_worker("researcher", t) for t in research_tasks],
+            return_exceptions=True
+        )
+        
+        # Store research results
+        for i, task in enumerate(tasks):
+            task_results[task.id] = {
+                "research": research_results[i] if not isinstance(research_results[i], Exception) else {"success": False, "error": str(research_results[i])},
+                "task": task
+            }
+            # Add research to context for next stage
+            if task_results[task.id]["research"].get("success"):
+                task.context["research"] = task_results[task.id]["research"].get("output", {})
+        
+        # Stage 2: PLAN (parallel)
+        logger.info("📋 Stage 2: PLAN (parallel)...")
+        plan_tasks = []
+        for task in tasks:
+            worker_task = WorkerTask(
+                id=f"{task.id}_plan",
+                description=task.description,
+                context=task.context.copy()
+            )
+            plan_tasks.append(worker_task)
+        
+        plan_results = await asyncio.gather(
+            *[self._run_worker("planner", t) for t in plan_tasks],
+            return_exceptions=True
+        )
+        
+        # Store plan results and check approval
+        approved_tasks = []
+        for i, task in enumerate(tasks):
+            plan_result = plan_results[i] if not isinstance(plan_results[i], Exception) else {"success": False, "error": str(plan_results[i])}
+            task_results[task.id]["plan"] = plan_result
+            
+            # Add plan to context
+            if plan_result.get("success"):
+                task.context["plan"] = plan_result.get("output", {})
+                approved_tasks.append(task)
+            else:
+                logger.warning(f"Task {task.id} planning failed, skipping execution")
+        
+        # Stage 3: CRITIQUE (parallel for approved tasks)
+        logger.info("🔍 Stage 3: CRITIQUE (parallel)...")
+        critique_tasks = []
+        for task in approved_tasks:
+            worker_task = WorkerTask(
+                id=f"{task.id}_critique",
+                description=task.description,
+                context=task.context.copy()
+            )
+            critique_tasks.append((task, worker_task))
+        
+        critique_results = await asyncio.gather(
+            *[self._run_worker("critic", wt[1]) for wt in critique_tasks],
+            return_exceptions=True
+        )
+        
+        # Store critique results and determine which to execute
+        executable_tasks = []
+        for i, (task, _) in enumerate(critique_tasks):
+            critique_result = critique_results[i] if not isinstance(critique_results[i], Exception) else {"success": False, "output": {}}
+            task_results[task.id]["critique"] = critique_result
+            
+            # Check approval
+            critique_output = critique_result.get("output", {})
+            if critique_output.get("approved", False):
+                executable_tasks.append(task)
+            else:
+                logger.warning(f"Task {task.id} not approved by critic")
+        
+        # Stage 4: EXECUTE (parallel for approved tasks)
+        logger.info("⚡ Stage 4: EXECUTE (parallel)...")
+        execution_tasks = []
+        for task in executable_tasks:
+            worker_task = WorkerTask(
+                id=f"{task.id}_execute",
+                description=task.description,
+                context=task.context.copy()
+            )
+            execution_tasks.append((task, worker_task))
+        
+        if execution_tasks:
+            execution_results = await asyncio.gather(
+                *[self._run_worker("executor", wt[1]) for wt in execution_tasks],
+                return_exceptions=True
+            )
+            
+            # Store execution results
+            for i, (task, _) in enumerate(execution_tasks):
+                execution_result = execution_results[i] if not isinstance(execution_results[i], Exception) else {"success": False, "error": str(execution_results[i])}
+                task_results[task.id]["execution"] = execution_result
+                task.context["execution_results"] = execution_result.get("output", {})
+        else:
+            logger.info("No tasks approved for execution")
+        
+        # Stage 5: VERIFY (parallel for executed tasks)
+        logger.info("✅ Stage 5: VERIFY (parallel)...")
+        verify_tasks = []
+        for task in executable_tasks:
+            if task_results[task.id].get("execution", {}).get("success"):
+                worker_task = WorkerTask(
+                    id=f"{task.id}_verify",
+                    description=task.description,
+                    context=task.context.copy()
+                )
+                verify_tasks.append((task, worker_task))
+        
+        if verify_tasks:
+            verify_results = await asyncio.gather(
+                *[self._run_worker("verifier", wt[1]) for wt in verify_tasks],
+                return_exceptions=True
+            )
+            
+            # Store verification results
+            for i, (task, _) in enumerate(verify_tasks):
+                verify_result = verify_results[i] if not isinstance(verify_results[i], Exception) else {"success": False, "output": {}}
+                task_results[task.id]["verification"] = verify_result
+                task_results[task.id]["success"] = verify_result.get("output", {}).get("passed", False)
+        
+        # Calculate final results
+        total_duration = time.time() - start_time
+        success_count = sum(1 for r in task_results.values() if r.get("success", False))
+        
+        logger.info(f"🏁 Stage-based parallel execution completed in {total_duration:.2f}s")
+        logger.info(f"   Success: {success_count}/{len(tasks)}")
+        
+        return {
+            "success": success_count > 0,
+            "task_results": task_results,
+            "total_tasks": len(tasks),
+            "success_count": success_count,
+            "total_duration": total_duration,
+            "execution_mode": "stage_based_parallel"
+        }
+
+    async def execute_stage(self, stage_name: str, tasks: List[WorkerTask], context: Dict = None) -> Dict[str, Any]:
+        """
+        Execute a single stage for multiple tasks in parallel.
+        
+        Args:
+            stage_name: One of "research", "plan", "critique", "execute", "verify", "tool_builder"
+            tasks: List of tasks to process
+            context: Optional shared context
+        """
+        valid_stages = ["researcher", "planner", "critic", "executor", "verifier", "tool_builder"]
+        if stage_name not in valid_stages:
+            return {"success": False, "error": f"Invalid stage: {stage_name}"}
+        
+        worker_tasks = []
+        for task in tasks:
+            worker_task = WorkerTask(
+                id=f"{task.id}_{stage_name}",
+                description=task.description,
+                context=task.context.copy()
+            )
+            worker_tasks.append(worker_task)
+        
+        logger.info(f"🎯 Executing stage '{stage_name}' for {len(tasks)} tasks (parallel)")
+        
+        results = await asyncio.gather(
+            *[self._run_worker(stage_name, t) for t in worker_tasks],
+            return_exceptions=True
+        )
+        
+        return {
+            "success": True,
+            "stage": stage_name,
+            "results": results,
+            "count": len(results)
+        }
+
