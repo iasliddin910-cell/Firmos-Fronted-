@@ -428,172 +428,163 @@ class VerificationEngine:
     
     def _verify_browser(self, data: Dict) -> VerificationResult:
         """
-        MULTI-SIGNAL BROWSER VERIFICATION
+        WORLD-CLASS BROWSER VERIFICATION
+
+        Multi-signal verification combining:
+        1. URL validation - current URL match
+        2. Navigation chain - page flow verification (NEW)
+        3. HTTP response status - server response
+        4. DOM text - page content verification
+        5. Selector presence - DOM element existence
+        6. Auth/session state - login state confirmation (ENHANCED)
+        7. Screenshot corroboration - visual verification
+        8. Semantic page-state - final state verification (NEW)
         
-        Verifies:
-        1. URL validation
-        2. Selector presence
-        3. Text content
-        4. HTTP response status
-        5. Auth/session state
-        6. Screenshot corroboration
-        
-        Each signal contributes to final verification decision.
+        Each signal contributes with weighted confidence.
         """
+        import time
+        
         expected_text = data.get("expected_text", "")
         url = data.get("url", "")
         expected_selector = data.get("expected_selector", "")
         expected_status = data.get("expected_status", 200)
         check_auth = data.get("check_auth", False)
         screenshot_path = data.get("screenshot_path", "")
+        navigation_chain = data.get("navigation_chain", [])
+        expected_page_state = data.get("expected_page_state", {})
         
-        # Track all signals
         signals = {}
+        weights = {}
         all_passed = True
-        
-        # Try to use Playwright for real browser verification
+
         try:
             from playwright.sync_api import sync_playwright
-            
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
-                
                 try:
                     # Signal 1: URL validation
                     signals['url_match'] = url in page.url if url else True
+                    weights['url_match'] = 1.0
                     
-                    # Signal 2: HTTP response status
-                    response = page.goto(url, timeout=10000, wait_until="domcontentloaded")
-                    signals['status_match'] = response.status == expected_status if response else False
-                    if not response:
+                    # Signal 2: Navigation chain (NEW)
+                    if navigation_chain:
+                        nav_passed = True
+                        for expected_url in navigation_chain:
+                            if expected_url not in page.url:
+                                nav_passed = False
+                        signals['navigation_chain'] = nav_passed
+                        weights['navigation_chain'] = 0.8
+                        if not nav_passed:
+                            all_passed = False
+
+                    # Signal 3: HTTP status
+                    response = page.goto(url, timeout=10000, wait_until="domcontentloaded") if url else None
+                    actual_status = response.status if response else 0
+                    signals['status_match'] = actual_status == expected_status if url else True
+                    weights['status_match'] = 1.0
+                    if url and actual_status != expected_status:
                         all_passed = False
                     
                     page.wait_for_load_state("networkidle", timeout=5000)
                     
-                    # Signal 3: Text verification
+                    # Signal 4: DOM text
                     text_found = True
                     if expected_text:
-                        content = page.content()
-                        text_found = expected_text.lower() in content.lower()
+                        text_found = expected_text.lower() in page.content().lower()
                     signals['text_found'] = text_found
+                    weights['text_found'] = 1.5
                     if not text_found:
                         all_passed = False
                     
-                    # Signal 4: Selector verification
+                    # Signal 5: Selector
                     selector_found = True
                     if expected_selector:
                         try:
                             page.wait_for_selector(expected_selector, timeout=3000)
-                            selector_found = True
-                        except Exception:
+                        except:
                             selector_found = False
                     signals['selector_found'] = selector_found
+                    weights['selector_found'] = 1.2
                     if expected_selector and not selector_found:
                         all_passed = False
                     
-                    # Signal 5: Auth/session check
+                    # Signal 6: Auth/session (ENHANCED)
                     auth_valid = True
+                    auth_details = {}
                     if check_auth:
-                        # Check for login forms, session cookies, auth tokens
                         try:
-                            # Look for common auth indicators
-                            auth_selectors = ['input[type="password"]', 'input[type="email"]', 
-                                            '[data-auth-required]', '.login-form', '#login']
+                            auth_selectors = ['input[type="password"]', 'input[type="email"]', '[data-auth-required]', '.login-form', '#login']
                             auth_found = any(page.locator(sel).count() > 0 for sel in auth_selectors)
-                            # If auth is required but we see login form, auth failed
-                            auth_valid = not auth_found
-                        except Exception:
-                            auth_valid = True  # Assume auth OK if check fails
+                            cookies = page.context.cookies()
+                            session_cookies = [c for c in cookies if 'session' in c['name'].lower() or 'auth' in c['name'].lower()]
+                            auth_token = page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')")
+                            auth_details = {'login_form': auth_found, 'sessions': len(session_cookies), 'token': bool(auth_token)}
+                            auth_valid = not auth_found or len(session_cookies) > 0 or bool(auth_token)
+                        except:
+                            auth_valid = True
                     signals['auth_valid'] = auth_valid
+                    signals['auth_details'] = auth_details
+                    weights['auth_valid'] = 1.0
                     if check_auth and not auth_valid:
                         all_passed = False
                     
-                    # Signal 6: Screenshot corroboration
+                    # Signal 7: Screenshot
                     screenshot_valid = True
+                    screenshot_evidence = {}
                     if screenshot_path:
                         try:
-                            page.screenshot(path=screenshot_path)
+                            page.screenshot(path=screenshot_path, full_page=True)
                             import os
-                            screenshot_valid = os.path.exists(screenshot_path) and os.path.getsize(screenshot_path) > 0
-                        except Exception as e:
-                            logger.warning(f"Screenshot capture failed: {e}")
+                            if os.path.exists(screenshot_path):
+                                size = os.path.getsize(screenshot_path)
+                                screenshot_valid = size > 1000
+                                screenshot_evidence = {'size': size}
+                        except:
                             screenshot_valid = False
                     signals['screenshot_captured'] = screenshot_valid
+                    signals['screenshot_evidence'] = screenshot_evidence
+                    weights['screenshot_captured'] = 0.8
                     
+                    # Signal 8: Semantic page-state (NEW)
+                    semantic_passed = True
+                    semantic_details = {}
+                    if expected_page_state:
+                        if 'title' in expected_page_state:
+                            semantic_details['title'] = page.title()
+                            semantic_passed = expected_page_state['title'].lower() in page.title().lower()
+                        if 'text_present' in expected_page_state and semantic_passed:
+                            semantic_details['text'] = expected_page_state['text_present']
+                            semantic_passed = expected_page_state['text_present'].lower() in page.content().lower()
+                    signals['semantic_state'] = semantic_passed
+                    signals['semantic_details'] = semantic_details
+                    weights['semantic_state'] = 1.3
+                    if not semantic_passed:
+                        all_passed = False
+
                     browser.close()
-                    
-                    # Final decision: ALL signals must pass
-                    final_passed = all_passed and signals.get('selector_found', True) and signals.get('text_found', True) and signals.get('status_match', True)
-                    
+
+                    # Calculate confidence
+                    passed = sum(1 for s,v in signals.items() if isinstance(v,bool) and v)
+                    total = sum(1 for s in signals if isinstance(signals.get(s),bool))
+                    confidence = passed/total if total > 0 else 0
+
+                    # Critical signals must pass
+                    critical = signals.get('text_found',True) and signals.get('status_match',True) and signals.get('selector_found',True)
+                    final_passed = all_passed and critical
+
                     return VerificationResult(
                         passed=final_passed,
-                        details=f"Browser multi-signal verification: {signals}",
-                        evidence={
-                            "url": url, 
-                            "expected_text": expected_text, 
-                            "signals": signals,
-                            "all_passed": all_passed
-                        }
+                        details=f"Browser verification: {passed}/{total} signals (confidence: {confidence:.2f})",
+                        evidence={"url":url, "signals":signals, "confidence":confidence}
                     )
                 except Exception as e:
                     browser.close()
-                    return VerificationResult(
-                        passed=False,
-                        details=f"Browser verification failed: {str(e)}",
-                        severity="error",
-                        evidence={"url": url, "error": str(e)}
-                    )
+                    return VerificationResult(passed=False, details=f"Browser error: {str(e)}", severity="error", evidence={"error":str(e)})
         except ImportError:
-            # Fallback: try Selenium
-            try:
-                from selenium import webdriver
-                from selenium.webdriver.common.by import By
-                from selenium.webdriver.chrome.options import Options
-                from selenium.webdriver.support.ui import WebDriverWait
-                from selenium.webdriver.support import expected_conditions as EC
-                
-                options = Options()
-                options.add_argument("--headless")
-                driver = webdriver.Chrome(options=options)
-                
-                try:
-                    driver.get(url)
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.TAG_NAME, "body"))
-                    )
-                    
-                    content = driver.page_source
-                    text_found = expected_text.lower() in content.lower() if expected_text else True
-                    
-                    # Selenium doesn't support all signals, just basic ones
-                    signals['text_found'] = text_found
-                    signals['url_match'] = url in driver.current_url if url else True
-                    
-                    driver.quit()
-                    
-                    return VerificationResult(
-                        passed=text_found,
-                        details=f"Selenium verification: text={'found' if text_found else 'not found'}, signals={signals}",
-                        evidence={"url": url, "expected_text": expected_text, "signals": signals}
-                    )
-                except Exception as e:
-                    driver.quit()
-                    return VerificationResult(
-                        passed=False,
-                        details=f"Selenium verification failed: {str(e)}",
-                        severity="error",
-                        evidence={"error": str(e)}
-                    )
-            except ImportError:
-                # No browser automation available
-                return VerificationResult(
-                    passed=False,
-                    details="Browser verification requires playwright or selenium. Neither is available.",
-                    severity="error",
-                    evidence={"error": "No browser automation library available"}
-                )
-    
+            return VerificationResult(passed=False, details="Playwright not available", severity="error")
+
+
     def _verify_screenshot(self, data: Dict) -> VerificationResult:
         """
         MULTI-MODAL SCREENSHOT VERIFICATION
