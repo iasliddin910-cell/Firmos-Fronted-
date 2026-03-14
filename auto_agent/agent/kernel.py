@@ -1636,6 +1636,23 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         logger.info(f"✅ Execution complete: {len(completed_tasks)} completed, {len(failed_tasks)} failed")
         return "\n".join(results)
     
+    
+    def _select_tool_policy(self, task: Task, required_tools: List[str], task_meta: Dict, available_tools: List[str]) -> str:
+        """POLICY-DRIVEN TOOL SELECTION - No1 Grade."""
+        task_type = task_meta.get('task_type', 'general')
+        risk = task_meta.get('risk_level', 'normal')
+        
+        tool_cats = {
+            'file': ['write_file'], 'read': ['read_file'], 'search': ['web_search'],
+            'browser': ['browser_navigate'], 'code': ['execute_code'], 'command': ['execute_command'],
+            'delete': ['delete_file'], 'general': ['execute_command']
+        }
+        candidates = [t for t in tool_cats.get(task_type, tool_cats['general']) if t in available_tools]
+        for rt in required_tools:
+            if rt in available_tools:
+                return rt
+        return candidates[0] if candidates else None
+
     def _select_tool_for_task(self, task: Task) -> str:
         """Smart tool selection based on task description"""
         desc = task.description.lower()
