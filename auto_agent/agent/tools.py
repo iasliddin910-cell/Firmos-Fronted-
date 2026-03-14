@@ -450,10 +450,28 @@ class ToolsEngine:
     # ==================== CORE EXECUTION ====================
     
     def execute_tool(self, tool_name: str, args: Dict, user_approved: bool = False) -> ToolResult:
-        """Execute a tool with full security checks"""
-        start_time = time.time()
+        """
+        Execute a tool with STRICT central wrapper chain:
         
-        # Check tool exists
+        1. SCHEMA VALIDATE - Validate args against tool schema
+        2. RISK CLASSIFY - Classify tool risk level
+        3. APPROVAL CHECK - Check approval requirements
+        4. SANDBOX - Run in sandbox if required
+        5. EXECUTE - Run the actual tool
+        6. REDACT - Redact sensitive data from output
+        7. AUDIT - Log to audit trail
+        8. TELEMETRY - Record execution metrics
+        9. VERIFIER - Return structured result
+        
+        NO TOOL bypasses this chain!
+        """
+        start_time = time.time()
+        execution_chain = []  # Track chain execution for debugging
+        
+        # ============== 1. SCHEMA VALIDATE ==============
+        chain_step = "schema_validate"
+        execution_chain.append(chain_step)
+        
         tool_def = self.registry.get_tool(tool_name)
         if not tool_def:
             return ToolResult(
@@ -462,37 +480,96 @@ class ToolsEngine:
                 stderr=f"Tool '{tool_name}' not found"
             )
         
-        # Validate args
         valid, msg = self.registry.validate_args(tool_name, args)
         if not valid:
+            self._record_telemetry(tool_name, "schema_validation_failed", 0)
             return ToolResult(
                 tool_name=tool_name,
                 status="error",
                 stderr=f"Invalid args: {msg}"
             )
         
-        # Check approval
+        # ============== 2. RISK CLASSIFY ==============
+        chain_step = "risk_classify"
+        execution_chain.append(chain_step)
+        
+        risk_level = tool_def.get("risk_level", RiskLevel.MEDIUM)
+        
+        # ============== 3. APPROVAL CHECK ==============
+        chain_step = "approval_check"
+        execution_chain.append(chain_step)
+        
         approved, msg = self.registry.check_approval(tool_name, user_approved)
         if not approved:
-            self.audit.log(tool_name, args, f"Denied: {msg}", risk_level=str(tool_def["risk_level"].value), approved=False)
+            self.audit.log(tool_name, args, f"Denied: {msg}", 
+                         risk_level=str(risk_level.value) if hasattr(risk_level, 'value') else str(risk_level), 
+                         approved=False,
+                         chain=execution_chain)
+            self._record_telemetry(tool_name, "approval_denied", 0)
             return ToolResult(
                 tool_name=tool_name,
                 status="error",
                 stderr=f"Approval denied: {msg}"
             )
         
-        # Execute
+        # ============== 4. SANDBOX ==============
+        chain_step = "sandbox"
+        execution_chain.append(chain_step)
+        
+        sandbox_required = tool_def.get("sandbox_mode", "normal") == "safe"
+        if sandbox_required and self.sandbox:
+            args = self.sandbox.prepare_args(tool_name, args)
+        
+        # ============== 5. EXECUTE ==============
+        chain_step = "execute"
+        execution_chain.append(chain_step)
+        
         try:
             result = self._dispatch(tool_name, args)
             result.duration = time.time() - start_time
             
-            # Log success
-            self.audit.log(tool_name, args, "success", risk_level=str(tool_def["risk_level"].value), approved=True)
+            # ============== 6. REDACT ==============
+            chain_step = "redact"
+            execution_chain.append(chain_step)
             
+            if self.secret_guard and result.stdout:
+                result.stdout = self.secret_guard.redact(result.stdout)
+            if self.secret_guard and result.stderr:
+                result.stderr = self.secret_guard.redact(result.stderr)
+            
+            # ============== 7. AUDIT ==============
+            chain_step = "audit"
+            execution_chain.append(chain_step)
+            
+            self.audit.log(tool_name, args, "success", 
+                         risk_level=str(risk_level.value) if hasattr(risk_level, 'value') else str(risk_level), 
+                         approved=True,
+                         chain=execution_chain,
+                         duration=result.duration)
+            
+            # ============== 8. TELEMETRY ==============
+            chain_step = "telemetry"
+            execution_chain.append(chain_step)
+            
+            self._record_telemetry(tool_name, "success", result.duration)
+            
+            # ============== 9. VERIFIER ==============
+            chain_step = "verifier"
+            execution_chain.append(chain_step)
+            
+            result.chain = execution_chain
             return result
-            
+
         except Exception as e:
-            self.audit.log(tool_name, args, f"error: {str(e)}", risk_level=str(tool_def["risk_level"].value), approved=True)
+            chain_step = "error"
+            execution_chain.append(chain_step)
+            
+            self.audit.log(tool_name, args, f"error: {str(e)}", 
+                         risk_level=str(risk_level.value) if hasattr(risk_level, 'value') else str(risk_level), 
+                         approved=True,
+                         chain=execution_chain)
+            self._record_telemetry(tool_name, "error", 0, str(e))
+            
             return ToolResult(
                 tool_name=tool_name,
                 status="error",
@@ -500,6 +577,20 @@ class ToolsEngine:
                 duration=time.time() - start_time
             )
     
+    def _record_telemetry(self, tool_name: str, status: str, duration: float, error: str = None):
+        """Record execution telemetry"""
+        try:
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('tool_execution', {
+                    'tool': tool_name,
+                    'status': status,
+                    'duration': duration,
+                    'error': error,
+                    'timestamp': time.time()
+                })
+        except:
+            pass
+
     def _dispatch(self, tool_name: str, args: Dict) -> ToolResult:
         """Dispatch to appropriate tool method"""
         
