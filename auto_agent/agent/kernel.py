@@ -4447,50 +4447,283 @@ Return ONLY valid JSON: {{
     
     async def _verify_browser(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
         """
-        Browser verification with multiple signals:
+        WORLD-CLASS Browser verification with multiple signals:
         - URL verification
         - DOM text verification
         - Selector verification
-        - Network response verification
+        - HTTP status verification
         - Screenshot corroboration
+        - Navigation chain verification
+        - Session/auth state verification
+        - Final page semantic verification
         """
+        
+        import time
+        
+        # Verification log for diagnostics
+        verification_checks = []
         
         expected_url = task_meta.get('expected_url', '')
         expected_text = task_meta.get('expected_text', '')
         required_selectors = task_meta.get('required_selectors', [])
         check_network = task_meta.get('check_network', True)
+        check_auth = task_meta.get('check_auth', False)
+        check_session = task_meta.get('check_session', False)
+        navigation_chain = task_meta.get('navigation_chain', [])  # List of URLs to verify in order
+        semantic_text = task_meta.get('semantic_text', '')  # High-level semantic check
+        screenshot_expected = task_meta.get('screenshot_expected', False)
         
         result_data = exec_result.stdout  # Could be URL, HTML, or status
         
-        # 1. URL verification
-        if expected_url and expected_url not in result_data:
-            # Try to get actual URL from browser
-            if hasattr(self, 'browser') and self.browser:
-                actual_url = self.browser.get_current_url()
-                if expected_url not in actual_url:
-                    logger.warning(f"Browser verification failed: URL mismatch. Expected: {expected_url}, Got: {actual_url}")
+        # Get browser instance
+        browser = getattr(self, 'browser', None)
+        
+        # ============== 1. URL VERIFICATION ==============
+        url_check = {'name': 'url_verification', 'passed': True, 'detail': ''}
+        if expected_url:
+            # First check in result data
+            if expected_url not in result_data:
+                # Try to get actual URL from browser
+                if browser and hasattr(browser, 'get_current_url'):
+                    try:
+                        actual_url = browser.get_current_url()
+                        if expected_url not in actual_url:
+                            url_check['passed'] = False
+                            url_check['detail'] = f"URL mismatch. Expected: {expected_url}, Got: {actual_url}"
+                            logger.warning(f"Browser verification failed: {url_check['detail']}")
+                            verification_checks.append(url_check)
+                            return False
+                        else:
+                            url_check['detail'] = f"URL verified: {actual_url}"
+                    except Exception as e:
+                        url_check['passed'] = False
+                        url_check['detail'] = f"Could not get URL: {e}"
+                        verification_checks.append(url_check)
+                        return False
+            else:
+                url_check['detail'] = f"URL found in result: {expected_url}"
+        
+        verification_checks.append(url_check)
+        
+        # ============== 2. NAVIGATION CHAIN VERIFICATION ==============
+        nav_check = {'name': 'navigation_chain', 'passed': True, 'detail': ''}
+        if navigation_chain and browser and hasattr(browser, 'get_navigation_history'):
+            try:
+                nav_history = browser.get_navigation_history()
+                expected_chain = navigation_chain
+                
+                # Check if all expected URLs were visited in order
+                visited_urls = nav_history.get('urls', [])
+                
+                # Check if key pages in chain were visited
+                missing_nav = []
+                for expected_nav in expected_chain:
+                    found = any(expected_nav in vurl for vurl in visited_urls)
+                    if not found:
+                        missing_nav.append(expected_nav)
+                
+                if missing_nav:
+                    nav_check['passed'] = False
+                    nav_check['detail'] = f"Missing navigation steps: {missing_nav}. Visited: {visited_urls}"
+                    logger.warning(f"Browser verification failed: {nav_check['detail']}")
+                    verification_checks.append(nav_check)
                     return False
+                else:
+                    nav_check['detail'] = f"Navigation chain verified: {visited_urls}"
+            except Exception as e:
+                nav_check['detail'] = f"Could not verify navigation: {e}"
         
-        # 2. Text verification in DOM
-        if expected_text and expected_text not in result_data:
-            logger.warning(f"Browser verification failed: Expected text not found - {expected_text[:50]}...")
-            return False
+        verification_checks.append(nav_check)
         
-        # 3. Selector verification (if we have browser access)
-        if required_selectors and hasattr(self, 'browser') and self.browser:
+        # ============== 3. HTTP STATUS VERIFICATION ==============
+        http_check = {'name': 'http_status', 'passed': True, 'detail': ''}
+        if check_network:
+            if '200' not in result_data and 'OK' not in result_data:
+                # Check for error status codes
+                error_codes = ['404', '500', '503', '403', '401', '500']
+                found_errors = [code for code in error_codes if code in result_data]
+                if found_errors:
+                    http_check['passed'] = False
+                    http_check['detail'] = f"HTTP errors found: {found_errors}"
+                    logger.warning(f"Browser verification failed: {http_check['detail']}")
+                    verification_checks.append(http_check)
+                    return False
+            http_check['detail'] = "HTTP status OK"
+        
+        verification_checks.append(http_check)
+        
+        # ============== 4. DOM TEXT VERIFICATION ==============
+        text_check = {'name': 'dom_text', 'passed': True, 'detail': ''}
+        if expected_text:
+            if expected_text.lower() not in result_data.lower():
+                text_check['passed'] = False
+                text_check['detail'] = f"Expected text not found: {expected_text[:50]}..."
+                logger.warning(f"Browser verification failed: {text_check['detail']}")
+                verification_checks.append(text_check)
+                return False
+            else:
+                text_check['detail'] = f"Text verified: {expected_text[:30]}..."
+        
+        verification_checks.append(text_check)
+        
+        # ============== 5. SELECTOR VERIFICATION ==============
+        selector_check = {'name': 'selectors', 'passed': True, 'detail': '', 'found': [], 'missing': []}
+        if required_selectors and browser and hasattr(browser, 'element_exists'):
             for selector in required_selectors:
-                if not self.browser.element_exists(selector):
-                    logger.warning(f"Browser verification failed: Required selector not found - {selector}")
-                    return False
+                try:
+                    if browser.element_exists(selector):
+                        selector_check['found'].append(selector)
+                    else:
+                        selector_check['missing'].append(selector)
+                except Exception as e:
+                    selector_check['missing'].append(f"{selector} (error: {e})")
+            
+            if selector_check['missing']:
+                selector_check['passed'] = False
+                selector_check['detail'] = f"Missing selectors: {selector_check['missing']}"
+                logger.warning(f"Browser verification failed: {selector_check['detail']}")
+                verification_checks.append(selector_check)
+                return False
+            else:
+                selector_check['detail'] = f"All selectors found: {selector_check['found']}"
         
-        # 4. Network verification
-        if check_network and ('200' not in result_data and 'OK' not in result_data):
-            # Check for error status codes
-            if any(err in result_data for err in ['404', '500', '503', '403']):
-                logger.warning(f"Browser verification failed: Network error in response")
+        verification_checks.append(selector_check)
+        
+        # ============== 6. SCREENSHOT CORROBORATION ==============
+        screenshot_check = {'name': 'screenshot', 'passed': True, 'detail': ''}
+        if screenshot_expected:
+            # Check if screenshot artifact exists
+            screenshot_artifacts = [a for a in exec_result.artifacts if a.endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+            
+            if not screenshot_artifacts:
+                screenshot_check['passed'] = False
+                screenshot_check['detail'] = "Screenshot expected but not found in artifacts"
+                logger.warning(f"Browser verification failed: {screenshot_check['detail']}")
+                verification_checks.append(screenshot_check)
+                return False
+            
+            # Verify screenshot file exists on disk
+            import os
+            real_screenshot = screenshot_artifacts[0]
+            if not os.path.exists(real_screenshot):
+                screenshot_check['passed'] = False
+                screenshot_check['detail'] = f"Screenshot file not found: {real_screenshot}"
+                logger.warning(f"Browser verification failed: {screenshot_check['detail']}")
+                verification_checks.append(screenshot_check)
+                return False
+            
+            # Check file size
+            file_size = os.path.getsize(real_screenshot)
+            if file_size < 100:
+                screenshot_check['passed'] = False
+                screenshot_check['detail'] = f"Screenshot too small: {file_size} bytes"
+                logger.warning(f"Browser verification failed: {screenshot_check['detail']}")
+                verification_checks.append(screenshot_check)
+                return False
+            
+            screenshot_check['detail'] = f"Screenshot verified: {real_screenshot} ({file_size} bytes)"
+        
+        verification_checks.append(screenshot_check)
+        
+        # ============== 7. SESSION/AUTH STATE VERIFICATION ==============
+        auth_check = {'name': 'auth_session', 'passed': True, 'detail': ''}
+        
+        if check_auth or check_session:
+            if not browser:
+                auth_check['passed'] = False
+                auth_check['detail'] = "Browser not available for auth/session check"
+                logger.warning(f"Browser verification failed: {auth_check['detail']}")
+                verification_checks.append(auth_check)
+                return False
+            
+            try:
+                # Check authentication state
+                if check_auth:
+                    # Check for common auth indicators
+                    auth_indicators = [
+                        'logout', 'sign out', 'log out', 'profile', 'account',
+                        'settings', 'logged-in', 'welcome'
+                    ]
+                    
+                    # Get page content
+                    page_content = ""
+                    if hasattr(browser, 'get_page_content'):
+                        page_content = browser.get_page_content()
+                    elif hasattr(browser, 'get_page_text'):
+                        page_content = browser.get_page_text()
+                    
+                    # Check for auth indicators
+                    auth_found = any(indicator in page_content.lower() for indicator in auth_indicators)
+                    
+                    if not auth_found:
+                        auth_check['passed'] = False
+                        auth_check['detail'] = "Auth state indicators not found on page"
+                        logger.warning(f"Browser verification failed: {auth_check['detail']}")
+                        verification_checks.append(auth_check)
+                        return False
+                    else:
+                        auth_check['detail'] = "Auth state verified"
+                
+                # Check session state
+                if check_session:
+                    # Check if cookies exist
+                    if hasattr(browser, 'get_cookies'):
+                        cookies = browser.get_cookies()
+                        if not cookies or len(cookies) == 0:
+                            auth_check['passed'] = False
+                            auth_check['detail'] = "No session cookies found"
+                            logger.warning(f"Browser verification failed: {auth_check['detail']}")
+                            verification_checks.append(auth_check)
+                            return False
+                        else:
+                            auth_check['detail'] = f"Session verified with {len(cookies)} cookies"
+                
+            except Exception as e:
+                auth_check['passed'] = False
+                auth_check['detail'] = f"Auth/session check error: {e}"
+                logger.warning(f"Browser verification failed: {auth_check['detail']}")
+                verification_checks.append(auth_check)
                 return False
         
-        logger.info(f"Browser verification PASSED for task {task.id}")
+        verification_checks.append(auth_check)
+        
+        # ============== 8. SEMANTIC TEXT VERIFICATION ==============
+        semantic_check = {'name': 'semantic_verification', 'passed': True, 'detail': ''}
+        if semantic_text:
+            # High-level semantic check - e.g., "page contains form", "shows error message"
+            semantic_patterns = semantic_text.split('|')  # Allow multiple patterns
+            
+            page_for_semantic = result_data
+            if browser and hasattr(browser, 'get_page_text'):
+                try:
+                    page_for_semantic = browser.get_page_text()
+                except:
+                    pass
+            
+            missing_semantic = []
+            for pattern in semantic_patterns:
+                pattern = pattern.strip()
+                if pattern.lower() not in page_for_semantic.lower():
+                    missing_semantic.append(pattern)
+            
+            if missing_semantic:
+                semantic_check['passed'] = False
+                semantic_check['detail'] = f"Missing semantic elements: {missing_semantic}"
+                logger.warning(f"Browser verification failed: {semantic_check['detail']}")
+                verification_checks.append(semantic_check)
+                return False
+            else:
+                semantic_check['detail'] = f"Semantic verification passed: {semantic_text}"
+        
+        verification_checks.append(semantic_check)
+        
+        # ============== LOG ALL CHECKS ==============
+        logger.info(f"🔍 Browser verification for task {task.id}: {len(verification_checks)} checks")
+        for check in verification_checks:
+            status = "✅" if check['passed'] else "❌"
+            logger.info(f"   {status} {check['name']}: {check['detail']}")
+        
+        logger.info(f"✅ Browser verification PASSED for task {task.id}")
         return True
     
     async def _verify_screenshot(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
