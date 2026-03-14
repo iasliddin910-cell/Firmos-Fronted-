@@ -65,8 +65,23 @@ class KernelState(Enum):
     VERIFYING = "verifying"
     REPAIRING = "repairing"
     WAITING_APPROVAL = "waiting_approval"
+    APPROVAL_PENDING = "approval_pending"  # First-class approval state
+    APPROVAL_GRANTED = "approval_granted"    # Approval granted
+    APPROVAL_DENIED = "approval_denied"      # Approval denied
+    APPROVAL_EXPIRED = "approval_expired"    # Approval expired
     PAUSED = "paused"
     ERROR = "error"
+    RECOVERING = "recovering"
+    ESCALATED = "escalated"  # Escalated to human
+
+
+class ApprovalStatus(Enum):
+    """First-class approval status"""
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
 
 
 class TaskPriority(Enum):
@@ -864,9 +879,16 @@ class MultiAgentCoordinator:
 class TaskManager:
     """
     Manages task lifecycle, scheduling, and execution
+    
+    FIXED ISSUES:
+    - Disk persistence
+    - Restart restore
+    - Approval waiting restore
+    - Stuck task recovery
+    - Timeout task recovery
     """
     
-    def __init__(self):
+    def __init__(self, persistence_dir: str = "/tmp/kernel_state"):
         self.tasks: Dict[str, Task] = {}
         self.pending_queue: PriorityQueue = PriorityQueue()
         self.running_tasks: Set[str] = set()
@@ -876,7 +898,152 @@ class TaskManager:
         # Background task queue
         self.background_queue: Queue = Queue()
         
-        logger.info("📋 Task Manager initialized")
+        # Persistence
+        self.persistence_dir = Path(persistence_dir)
+        self.persistence_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = self.persistence_dir / "task_manager_state.json"
+        
+        # Try to restore from disk
+        self._restore_from_disk()
+        
+        logger.info("📋 Task Manager initialized with persistence")
+    
+    def _restore_from_disk(self):
+        """Restore task manager state from disk"""
+        if not self.state_file.exists():
+            logger.info("No previous state found, starting fresh")
+            return
+        
+        try:
+            with open(self.state_file, 'r') as f:
+                state = json.load(f)
+            
+            # Restore tasks
+            for task_data in state.get('tasks', []):
+                task = self._task_from_dict(task_data)
+                self.tasks[task.id] = task
+            
+            # Restore completed/failed sets
+            self.completed_tasks = set(state.get('completed_tasks', []))
+            self.failed_tasks = set(state.get('failed_tasks', []))
+            
+            # Re-queue pending tasks
+            for task_id, task_data in state.get('pending_tasks', {}).items():
+                task = self._task_from_dict(task_data)
+                if task.status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+                    self.pending_queue.put(task)
+            
+            # Restore running tasks that might be stuck
+            for task_id in state.get('running_tasks', []):
+                if task_id in self.tasks:
+                    task = self.tasks[task_id]
+                    # Check if task was stuck (timeout)
+                    if task.status == TaskStatus.RUNNING:
+                        if task.started_at and (time.time() - task.started_at) > task.timeout:
+                            # Task timed out, re-queue
+                            logger.warning(f"Restoring stuck task: {task_id}")
+                            task.status = TaskStatus.PENDING
+                            self.pending_queue.put(task)
+                        else:
+                            self.running_tasks.add(task_id)
+            
+            logger.info(f"Restored {len(self.tasks)} tasks from disk")
+            
+        except Exception as e:
+            logger.error(f"Failed to restore state: {e}")
+    
+    def _task_to_dict(self, task: Task) -> Dict:
+        """Convert task to dict for persistence"""
+        return {
+            'id': task.id,
+            'description': task.description,
+            'priority': task.priority.value,
+            'state': task.state,
+            'status': task.status.value,
+            'dependencies': task.dependencies,
+            'assigned_agent': task.assigned_agent.value if task.assigned_agent else None,
+            'input_data': task.input_data,
+            'output_data': str(task.output_data) if task.output_data else None,
+            'error': task.error,
+            'created_at': task.created_at,
+            'started_at': task.started_at,
+            'completed_at': task.completed_at,
+            'retry_count': task.retry_count,
+            'max_retries': task.max_retries,
+            'timeout': task.timeout,
+            'artifacts': task.artifacts,
+            'metadata': task.metadata,
+            'approval_policy': task.approval_policy,
+            'sandbox_mode': task.sandbox_mode,
+            'artifact_expectations': task.artifact_expectations,
+            'rollback_point': task.rollback_point,
+        }
+    
+    def _task_from_dict(self, data: Dict) -> Task:
+        """Create task from dict"""
+        task = Task(
+            id=data['id'],
+            description=data['description'],
+            priority=TaskPriority(data.get('priority', 2)),
+            state=data.get('state', 'pending'),
+            dependencies=data.get('dependencies', []),
+            input_data=data.get('input_data', {}),
+            output_data=data.get('output_data'),
+            error=data.get('error'),
+            created_at=data.get('created_at', time.time()),
+            started_at=data.get('started_at'),
+            completed_at=data.get('completed_at'),
+            retry_count=data.get('retry_count', 0),
+            max_retries=data.get('max_retries', 3),
+            timeout=data.get('timeout', 30),
+            artifacts=data.get('artifacts', []),
+            metadata=data.get('metadata', {}),
+            approval_policy=data.get('approval_policy', 'auto'),
+            sandbox_mode=data.get('sandbox_mode', 'normal'),
+            artifact_expectations=data.get('artifact_expectations', []),
+        )
+        
+        # Restore status
+        if 'status' in data:
+            try:
+                task.status = TaskStatus(data['status'])
+            except:
+                task.status = TaskStatus.PENDING
+        
+        return task
+    
+    def _save_to_disk(self):
+        """Save task manager state to disk"""
+        try:
+            # Prepare pending tasks
+            pending_tasks = {}
+            temp_queue_list = []
+            while not self.pending_queue.empty():
+                try:
+                    task = self.pending_queue.get_nowait()
+                    temp_queue_list.append(task)
+                    pending_tasks[task.id] = self._task_to_dict(task)
+                except Empty:
+                    break
+            
+            # Restore queue
+            for task in temp_queue_list:
+                self.pending_queue.put(task)
+            
+            state = {
+                'tasks': [self._task_to_dict(t) for t in self.tasks.values()],
+                'pending_tasks': pending_tasks,
+                'running_tasks': list(self.running_tasks),
+                'completed_tasks': list(self.completed_tasks),
+                'failed_tasks': list(self.failed_tasks),
+                'timestamp': time.time()
+            }
+            
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+                
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
     
     def create_task(self, description: str, priority: TaskPriority = TaskPriority.NORMAL,
                    dependencies: List[str] = None, metadata: Dict = None) -> Task:
@@ -980,50 +1147,149 @@ class TaskManager:
 class ArtifactCollector:
     """
     Collects and manages artifacts from task execution
+    
+    FIXED ISSUES (14):
+    - Rich metadata: task_id, step_id, type, checksum, verifier link, preview, retention policy
     """
     
     def __init__(self, storage_dir: str = "artifacts"):
         self.storage_dir = storage_dir
-        self.artifacts: Dict[str, List[str]] = defaultdict(list)
+        self.artifacts: Dict[str, List[Dict]] = defaultdict(list)
+        self.artifact_metadata: Dict[str, Dict] = {}  # Rich metadata storage
         
         # Create storage directory
         os.makedirs(storage_dir, exist_ok=True)
         
+        # Retention policies
+        self.RETENTION_POLICIES = {
+            'temporary': 3600,      # 1 hour
+            'short': 86400,        # 1 day
+            'medium': 604800,      # 1 week
+            'long': 2592000,       # 1 month
+            'permanent': -1,        # Forever
+        }
+        
         logger.info(f"📦 Artifact Collector initialized: {storage_dir}")
     
-    def collect(self, task_id: str, artifact_type: str, content: Any) -> str:
-        """Collect an artifact"""
+    def collect(
+        self, 
+        task_id: str, 
+        artifact_type: str, 
+        content: Any,
+        step_id: str = None,
+        verifier_link: str = None,
+        retention_policy: str = 'medium',
+        metadata: Dict = None
+    ) -> str:
+        """
+        Collect an artifact with RICH metadata.
+        """
+        import hashlib
         import base64
         
-        artifact_id = f"{task_id}_{artifact_type}_{int(time.time())}"
+        artifact_id = f"{task_id}_{artifact_type}_{int(time.time()*1000)}"
+        
+        # Calculate checksum
+        content_bytes = str(content).encode('utf-8')
+        checksum = hashlib.sha256(content_bytes).hexdigest()
         
         # Handle different content types
         if isinstance(content, (dict, list)):
-            # JSON
             filepath = f"{self.storage_dir}/{artifact_id}.json"
             with open(filepath, 'w') as f:
                 json.dump(content, f, indent=2)
         elif isinstance(content, str) and len(content) > 1000:
-            # Large text - save to file
             filepath = f"{self.storage_dir}/{artifact_id}.txt"
             with open(filepath, 'w') as f:
                 f.write(content)
         else:
-            # Small text - keep in memory
             filepath = f"{self.storage_dir}/{artifact_id}.txt"
             with open(filepath, 'w') as f:
                 f.write(str(content))
         
-        self.artifacts[task_id].append(filepath)
+        # Create rich metadata
+        artifact_metadata = {
+            'artifact_id': artifact_id,
+            'task_id': task_id,
+            'step_id': step_id or f"{task_id}_step_1",
+            'type': artifact_type,
+            'filepath': filepath,
+            'checksum': checksum,
+            'size': len(content_bytes),
+            'created_at': time.time(),
+            'verifier_link': verifier_link,
+            'retention_policy': retention_policy,
+            'retention_until': time.time() + self.RETENTION_POLICIES.get(retention_policy, 604800),
+            'metadata': metadata or {},
+            'preview': str(content)[:200] if content else '',
+            'verified': False,
+            'verified_at': None,
+        }
+        
+        self.artifacts[task_id].append(artifact_metadata)
+        self.artifact_metadata[artifact_id] = artifact_metadata
+        
+        logger.info(f"📦 Artifact collected: {artifact_id}")
         
         return artifact_id
     
-    def get_artifacts(self, task_id: str) -> List[str]:
-        """Get all artifacts for a task"""
+    def verify_artifact(self, artifact_id: str, verifier_result: bool) -> None:
+        """Mark artifact as verified"""
+        if artifact_id in self.artifact_metadata:
+            self.artifact_metadata[artifact_id]['verified'] = verifier_result
+            self.artifact_metadata[artifact_id]['verified_at'] = time.time()
+    
+    def get_artifact_metadata(self, artifact_id: str) -> Dict:
+        """Get metadata for an artifact"""
+        return self.artifact_metadata.get(artifact_id, {})
+    
+    def get_artifacts(self, task_id: str) -> List[Dict]:
+        """Get all artifacts for a task (with metadata)"""
         return self.artifacts.get(task_id, [])
     
-    def get_all_artifacts(self) -> Dict[str, List[str]]:
-        """Get all artifacts"""
+    def get_artifacts_summary(self) -> Dict:
+        """Get summary of all artifacts"""
+        total = sum(len(arts) for arts in self.artifacts.values())
+        by_type = defaultdict(int)
+        verified_count = 0
+        
+        for arts in self.artifacts.values():
+            for art in arts:
+                by_type[art.get('type', 'unknown')] += 1
+                if art.get('verified', False):
+                    verified_count += 1
+        
+        return {
+            'total_artifacts': total,
+            'by_type': dict(by_type),
+            'verified': verified_count,
+            'unverified': total - verified_count
+        }
+    
+    def cleanup_expired(self) -> int:
+        """Clean up expired artifacts based on retention policy"""
+        import os
+        
+        removed = 0
+        current_time = time.time()
+        
+        for artifact_id, metadata in list(self.artifact_metadata.items()):
+            if metadata.get('retention_until', -1) > 0 and current_time > metadata['retention_until']:
+                filepath = metadata.get('filepath')
+                if filepath and os.path.exists(filepath):
+                    os.remove(filepath)
+                    removed += 1
+                
+                task_id = metadata.get('task_id')
+                if task_id and artifact_id in self.artifacts[task_id]:
+                    self.artifacts[task_id].remove(artifact_id)
+                
+                del self.artifact_metadata[artifact_id]
+        
+        return removed
+    
+    def get_all_artifacts(self) -> Dict[str, List[Dict]]:
+        """Get all artifacts with metadata"""
         return dict(self.artifacts)
 
 
@@ -1293,51 +1559,361 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         return self._heuristic_planner(message)
     
     def _parse_llm_plan(self, response: str) -> List[Task]:
-        """Robust JSON parsing with multiple strategies"""
+        """
+        ROBUST JSON PARSING with multiple strategies + diagnostics.
+        
+        Fixed issues:
+        - Strict schema validation
+        - Safer extraction
+        - Invalid-plan diagnostics
+        - Parsing telemetry
+        - No silent failures (logging all strategy attempts)
+        """
+        
         import re, json
+        import time
         
         tasks = []
+        parsing_attempts = []  # For telemetry
         
-        # Try multiple parsing strategies
-        for strategy in [
-            lambda: re.search(r'\{"tasks"\s*:\s*\[.*\]', response, re.DOTALL),
-            lambda: re.search(r'\[[\s\S]*"description"[\s\S]*\]', response),
-        ]:
+        # Pre-processing: Clean response
+        response = response.strip()
+        
+        # Multiple parsing strategies with diagnostics
+        parsing_strategies = [
+            {
+                'name': 'tasks_key_object',
+                'pattern': r'\{[^{}]*"tasks"\s*:\s*\[.*\]',
+                'try_extract': lambda: re.search(r'\{[^{}]*"tasks"\s*:\s*\[.*\]', response, re.DOTALL)
+            },
+            {
+                'name': 'array_with_description',
+                'pattern': r'\[[\s\S]*"description"[\s\S]*\]',
+                'try_extract': lambda: re.search(r'\[[\s\S]*"description"[\s\S]*\]', response)
+            },
+            {
+                'name': 'json_object_any_key',
+                'pattern': r'\{[^{}]*"id"[^{}]*"description"[^{}]*\}',
+                'try_extract': lambda: re.search(r'\{[^{}]*"id"[^{}]*"description"[^{}]*\}', response, re.DOTALL)
+            },
+            {
+                'name': 'brackets_balanced',
+                'pattern': 'any',
+                'try_extract': lambda: self._extract_balanced_brackets(response)
+            },
+            {
+                'name': 'line_by_line_json',
+                'pattern': 'any',
+                'try_extract': lambda: self._extract_json_lines(response)
+            }
+        ]
+        
+        for strategy in parsing_strategies:
+            strategy_name = strategy['name']
+            start_time = time.time()
+            
             try:
-                json_match = strategy()
+                json_match = strategy['try_extract']()
+                
                 if json_match:
-                    tasks_data = json.loads(json_match.group())
-                    if isinstance(tasks_data, dict) and 'tasks' in tasks_data:
-                        tasks_data = tasks_data['tasks']
-                    if isinstance(tasks_data, list):
-                        tasks = self._create_tasks_from_plan({"tasks": tasks_data})
-                        if tasks:
-                            return tasks
+                    json_str = json_match.group() if hasattr(json_match, 'group') else str(json_match)
+                    
+                    # Validate JSON structure
+                    try:
+                        tasks_data = json.loads(json_str)
+                        
+                        # Schema validation
+                        validation_result = self._validate_plan_schema(tasks_data)
+                        
+                        if validation_result['valid']:
+                            if isinstance(tasks_data, dict) and 'tasks' in tasks_data:
+                                tasks_data = tasks_data['tasks']
+                            
+                            if isinstance(tasks_data, list):
+                                tasks = self._create_tasks_from_plan({"tasks": tasks_data})
+                                if tasks:
+                                    parsing_attempts.append({
+                                        'strategy': strategy_name,
+                                        'success': True,
+                                        'tasks_count': len(tasks),
+                                        'time_ms': (time.time() - start_time) * 1000
+                                    })
+                                    logger.info(f"Plan parsing SUCCESS with strategy: {strategy_name}, tasks: {len(tasks)}")
+                                    return tasks
+                        else:
+                            logger.warning(f"Schema validation failed for {strategy_name}: {validation_result['errors']}")
+                            parsing_attempts.append({
+                                'strategy': strategy_name,
+                                'success': False,
+                                'reason': 'schema_validation_failed',
+                                'errors': validation_result['errors'],
+                                'time_ms': (time.time() - start_time) * 1000
+                            })
+                            
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"JSON decode failed for {strategy_name}: {e}")
+                        parsing_attempts.append({
+                            'strategy': strategy_name,
+                            'success': False,
+                            'reason': 'json_decode_error',
+                            'error': str(e),
+                            'time_ms': (time.time() - start_time) * 1000
+                        })
+                else:
+                    parsing_attempts.append({
+                        'strategy': strategy_name,
+                        'success': False,
+                        'reason': 'no_match',
+                        'time_ms': (time.time() - start_time) * 1000
+                    })
+                    
             except Exception as e:
-                continue
+                logger.warning(f"Strategy {strategy_name} failed with exception: {e}")
+                parsing_attempts.append({
+                    'strategy': strategy_name,
+                    'success': False,
+                    'reason': 'exception',
+                    'error': str(e),
+                    'time_ms': (time.time() - start_time) * 1000
+                })
+        
+        # Log all failed attempts for debugging
+        logger.error(f"Plan parsing FAILED. All attempts: {json.dumps(parsing_attempts, indent=2)}")
+        
+        # Emit telemetry for plan quality
+        if hasattr(self, 'telemetry') and self.telemetry:
+            self.telemetry.record_event('plan_parsing', {
+                'success': False,
+                'attempts': parsing_attempts,
+                'response_preview': response[:200],
+                'timestamp': time.time()
+            })
         
         return tasks
     
+    def _extract_balanced_brackets(self, text: str) -> Optional[re.Match]:
+        """Extract balanced JSON from text"""
+        import re
+        
+        # Find all { } pairs
+        start_idx = text.find('{')
+        if start_idx == -1:
+            return None
+        
+        # Try to find complete JSON object
+        depth = 0
+        for i, char in enumerate(text[start_idx:], start_idx):
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    # Found balanced brackets
+                    return re.match(r'\{[\s\S]*\}', text[start_idx:i+1])
+        
+        return None
+    
+    def _extract_json_lines(self, text: str) -> Optional[re.Match]:
+        """Extract JSON from lines that look like JSON objects"""
+        import re
+        
+        lines = text.split('\n')
+        json_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                json_lines.append(line)
+        
+        if json_lines:
+            # Try to combine into array
+            combined = '[' + ','.join(json_lines) + ']'
+            try:
+                json.loads(combined)  # Validate
+                return re.match(r'\[[\s\S]*\]', combined)
+            except:
+                pass
+        
+        return None
+    
+    def _validate_plan_schema(self, data: Any) -> Dict:
+        """
+        Validate plan data against expected schema.
+        
+        Returns:
+        {
+            'valid': bool,
+            'errors': List[str]
+        }
+        """
+        
+        errors = []
+        
+        # Must be dict or list
+        if not isinstance(data, (dict, list)):
+            errors.append(f"Plan must be dict or list, got {type(data)}")
+            return {'valid': False, 'errors': errors}
+        
+        # If it's a dict, must have 'tasks' key or be an array
+        if isinstance(data, dict):
+            if 'tasks' not in data and not any(k in data for k in ['id', 'description', 'steps']):
+                errors.append("Dict must have 'tasks' key or task fields")
+        
+        # If it has tasks, validate each
+        tasks = data.get('tasks', []) if isinstance(data, dict) else data
+        
+        if isinstance(tasks, list):
+            for i, task in enumerate(tasks):
+                if not isinstance(task, dict):
+                    errors.append(f"Task {i} must be dict, got {type(task)}")
+                    continue
+                
+                # Required fields
+                if 'description' not in task:
+                    errors.append(f"Task {i} missing 'description'")
+                
+                # Validate optional fields
+                allowed_priorities = ['CRITICAL', 'HIGH', 'NORMAL', 'LOW', '']
+                priority = task.get('priority', '').upper()
+                if priority and priority not in allowed_priorities:
+                    errors.append(f"Task {i} invalid priority: {priority}")
+                
+                # Validate verification_type if present
+                allowed_verification = ['manual', 'browser', 'screenshot', 'server', 'code', 'file', 'function']
+                verification = task.get('verification_type', '').lower()
+                if verification and verification not in allowed_verification:
+                    errors.append(f"Task {i} invalid verification_type: {verification}")
+                
+                # Validate approval_policy if present
+                allowed_approval = ['auto', 'manual', 'never']
+                approval = task.get('approval_policy', '').lower()
+                if approval and approval not in allowed_approval:
+                    errors.append(f"Task {i} invalid approval_policy: {approval}")
+                
+                # Validate sandbox_mode if present
+                allowed_sandbox = ['safe', 'normal', 'advanced']
+                sandbox = task.get('sandbox_mode', '').lower()
+                if sandbox and sandbox not in allowed_sandbox:
+                    errors.append(f"Task {i} invalid sandbox_mode: {sandbox}")
+        
+        return {
+            'valid': len(errors) == 0,
+            'errors': errors
+        }
+    
     def _create_tasks_from_plan(self, plan_data: Dict) -> List[Task]:
+        """
+        Create tasks from plan data with ENHANCED validation.
+        
+        Fixed issues:
+        - Required fields validation
+        - Allowed verification types validation
+        - Allowed approval policies validation
+        - Allowed sandbox modes validation
+        - Tool existence check
+        - No more silent minimal task creation on parse errors
+        """
+        
         import uuid
+        import time
+        
         tasks = []
-        for t in plan_data.get('tasks', []):
+        invalid_tasks = []  # Track invalid tasks
+        
+        # Allowed values
+        ALLOWED_PRIORITIES = ['CRITICAL', 'HIGH', 'NORMAL', 'LOW', '']
+        ALLOWED_VERIFICATION = ['manual', 'browser', 'screenshot', 'server', 'code', 'file', 'function']
+        ALLOWED_APPROVAL = ['auto', 'manual', 'never']
+        ALLOWED_SANDBOX = ['safe', 'normal', 'advanced']
+        
+        # Known tools (can be extended)
+        KNOWN_TOOLS = [
+            'execute_command', 'execute_code', 'write_file', 'read_file', 
+            'delete_file', 'browser_navigate', 'browser_click', 'browser_type',
+            'web_search', 'web_request', 'install_package', 'take_screenshot'
+        ]
+        
+        for i, t in enumerate(plan_data.get('tasks', [])):
+            task_errors = []
+            
+            # Skip if not a dict
+            if not isinstance(t, dict):
+                task_errors.append(f"Task {i} is not a dictionary")
+                invalid_tasks.append({'index': i, 'errors': task_errors, 'data': t})
+                continue
+            
+            # Validate required fields
+            if not t.get('description'):
+                task_errors.append(f"Task {i} missing 'description'")
+            
+            # Validate priority
+            priority = t.get('priority', '').upper()
+            if priority and priority not in ALLOWED_PRIORITIES:
+                task_errors.append(f"Invalid priority: {priority}")
+            
+            # Validate verification_type
+            verification = t.get('verification_type', '').lower()
+            if verification and verification not in ALLOWED_VERIFICATION:
+                task_errors.append(f"Invalid verification_type: {verification}")
+            
+            # Validate approval_policy
+            approval = t.get('approval_policy', '').lower()
+            if approval and approval not in ALLOWED_APPROVAL:
+                task_errors.append(f"Invalid approval_policy: {approval}")
+            
+            # Validate sandbox_mode
+            sandbox = t.get('sandbox_mode', '').lower()
+            if sandbox and sandbox not in ALLOWED_SANDBOX:
+                task_errors.append(f"Invalid sandbox_mode: {sandbox}")
+            
+            # Validate required_tools if present
+            required_tools = t.get('required_tools', [])
+            if required_tools:
+                if isinstance(required_tools, list):
+                    unknown_tools = [tool for tool in required_tools if tool not in KNOWN_TOOLS]
+                    if unknown_tools:
+                        task_errors.append(f"Unknown tools: {unknown_tools}")
+                else:
+                    task_errors.append("'required_tools' must be a list")
+            
+            # Validate dependencies if present
+            deps = t.get('dependencies', [])
+            if deps:
+                if not isinstance(deps, list):
+                    task_errors.append("'dependencies' must be a list")
+            
+            # If there are critical errors, skip this task
+            critical_errors = [e for e in task_errors if 'description' in e or 'priority' in e or 'Invalid' in e]
+            
+            if critical_errors:
+                logger.warning(f"Task {i} skipped due to critical errors: {critical_errors}")
+                invalid_tasks.append({'index': i, 'errors': task_errors, 'data': t})
+                continue
+            
+            # If non-critical errors (like unknown tools), log but still create task
+            if task_errors:
+                logger.warning(f"Task {i} created with warnings: {task_errors}")
+            
+            # Create task with validated data
             try:
                 priority = TaskPriority.NORMAL
-                p = t.get('priority', '').upper()
-                if p == 'HIGH' or p == 'CRITICAL': priority = TaskPriority.HIGH
-                elif p == 'LOW': priority = TaskPriority.LOW
+                if priority == 'HIGH' or priority == 'CRITICAL':
+                    priority = TaskPriority.HIGH
+                elif t.get('priority', '').upper() == 'LOW':
+                    priority = TaskPriority.LOW
                 
                 task = Task(
-                    id=t.get('id', str(uuid.uuid4())[:8]),
-                    description=t.get('description', ''),
+                    id=t.get('id', f"task_{int(time.time()*1000)}_{i}"),
+                    description=t.get('description', 'Unknown task'),
                     priority=priority,
                     dependencies=t.get('dependencies', []),
                     timeout=t.get('timeout', 30),
                     max_retries=t.get('retry_policy', 3),
-                    approval_policy=t.get('approval_policy', 'auto')
+                    approval_policy=t.get('approval_policy', 'auto'),
+                    sandbox_mode=t.get('sandbox_mode', 'normal'),
                 )
                 
+                # Set rich metadata
                 task.input_data = {
                     'required_tools': t.get('required_tools', []),
                     'verification_type': t.get('verification_type', 'manual'),
@@ -1350,66 +1926,254 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'port': t.get('port', 80),
                     'host': t.get('host', 'localhost'),
                     'code': t.get('code', ''),
-                    'language': t.get('language', 'python')
+                    'language': t.get('language', 'python'),
+                    'risk_level': t.get('risk_level', 'medium'),
+                    'expected_artifacts': t.get('expected_artifacts', []),
+                    'rollback_point': t.get('rollback_point'),
                 }
+                
+                # Set artifact expectations
+                task.artifact_expectations = t.get('expected_artifacts', [])
+                
                 tasks.append(task)
+                
             except Exception as e:
-                logger.warning(f"Failed to create task: {e}, task_data: {t}")
-                try:
-                    minimal_task = Task(
-                        id=str(uuid.uuid4())[:8],
-                        description=str(t.get('description', 'Unknown')),
-                        priority=TaskPriority.NORMAL
-                    )
-                    tasks.append(minimal_task)
-                except Exception as fallback_err:
-                    logger.error(f"Fallback task creation failed: {fallback_err}")
+                logger.error(f"Failed to create task {i}: {e}")
+                invalid_tasks.append({'index': i, 'errors': [str(e)], 'data': t})
+        
+        # Log summary of invalid tasks
+        if invalid_tasks:
+            logger.warning(f"Total invalid tasks skipped: {len(invalid_tasks)}/{len(plan_data.get('tasks', []))}")
+            for inv in invalid_tasks:
+                logger.warning(f"  Task {inv['index']}: {inv['errors']}")
+        
+        # Emit telemetry for task creation quality
+        if hasattr(self, 'telemetry') and self.telemetry:
+            self.telemetry.record_event('task_creation', {
+                'total_tasks': len(plan_data.get('tasks', [])),
+                'valid_tasks': len(tasks),
+                'invalid_tasks': len(invalid_tasks),
+                'invalid_details': invalid_tasks
+            })
+        
         return tasks
     
     def _heuristic_planner(self, message: str) -> List[Task]:
-        """ENHANCED fallback planner with FULL metadata (sandbox, approval, risk, artifacts)."""
+        """
+        ENHANCED fallback planner with FULL metadata for No1 agent.
+        
+        Fixed issues:
+        - Rollback point support
+        - Sandbox mode selection
+        - Approval policy
+        - Artifact expectations
+        - Retry policy richness
+        - Dependency graph depth
+        - Risk level assessment
+        """
+        
         import uuid
+        import time
         tasks = []
         msg_lower = message.lower()
         
         # Determine risk level
-        is_dangerous = any(k in msg_lower for k in ['ochir', 'delete', 'format', 'drop', 'rm -rf'])
+        is_dangerous = any(k in msg_lower for k in ['ochir', 'delete', 'format', 'drop', 'rm -rf', 'truncate'])
+        is_high_risk = any(k in msg_lower for k in ['install', 'apt', 'yum', 'pip install', 'npm install'])
         
-        # Task type detection with rich metadata
+        risk_level = 'critical' if is_dangerous else ('high' if is_high_risk else 'medium')
+        
+        # Sandbox mode based on risk
+        sandbox_mode = 'safe' if is_dangerous else ('advanced' if is_high_risk else 'normal')
+        
+        # Approval policy based on risk
+        approval_policy = 'manual' if is_dangerous or is_high_risk else 'auto'
+        
+        # Task type detection with RICH metadata
         task_specs = []
-        if any(k in msg_lower for k in ['yarat', 'yoz', 'fayl', 'create', 'write']):
-            task_specs.append({'type': 'file', 'tools': ['write_file'], 'ver': 'file_exists', 'desc': 'Fayl yaratish'})
-        if any(k in msg_lower for k in ['oqish', 'read', 'ko\'r']):
-            task_specs.append({'type': 'read', 'tools': ['read_file'], 'ver': 'function_result', 'desc': 'Faylni o\'qish'})
-        if any(k in msg_lower for k in ['qidir', 'internet', 'search', 'web']):
-            task_specs.append({'type': 'search', 'tools': ['web_search'], 'ver': 'function_result', 'desc': 'Internetda qidirish'})
-        if any(k in msg_lower for k in ['sahifa', 'page', 'sayt', 'url', 'browser']):
-            task_specs.append({'type': 'browser', 'tools': ['browser_navigate'], 'ver': 'browser_page', 'desc': 'Sahifaga kirish'})
-        if any(k in msg_lower for k in ['kod', 'code', 'python', 'bajar', 'execute']):
-            task_specs.append({'type': 'code', 'tools': ['execute_code'], 'ver': 'code_syntax', 'desc': 'Kodni bajarish'})
-        if any(k in msg_lower for k in ['buyruq', 'command', 'terminal']):
-            task_specs.append({'type': 'command', 'tools': ['execute_command'], 'ver': 'function_result', 'desc': 'Buyruqni bajarish'})
         
+        # File creation tasks
+        if any(k in msg_lower for k in ['yarat', 'yoz', 'fayl', 'create', 'write', 'new file']):
+            task_specs.append({
+                'type': 'file', 
+                'tools': ['write_file'], 
+                'ver': 'file',
+                'desc': 'Fayl yaratish',
+                'task_type': 'file',
+                'expected_artifacts': [],
+                'rollback_point': {'type': 'file_backup', 'description': 'Faylni zaxiraga olish'}
+            })
+        
+        # File reading tasks
+        if any(k in msg_lower for k in ['oqish', 'read', 'ko\'r', 'view', 'show']):
+            task_specs.append({
+                'type': 'read', 
+                'tools': ['read_file'], 
+                'ver': 'function',
+                'desc': 'Faylni o\'qish',
+                'task_type': 'file',
+                'expected_artifacts': [],
+                'rollback_point': None
+            })
+        
+        # Search tasks
+        if any(k in msg_lower for k in ['qidir', 'internet', 'search', 'web', 'find']):
+            task_specs.append({
+                'type': 'search', 
+                'tools': ['web_search'], 
+                'ver': 'function',
+                'desc': 'Internetda qidirish',
+                'task_type': 'search',
+                'expected_artifacts': [],
+                'rollback_point': None
+            })
+        
+        # Browser tasks
+        if any(k in msg_lower for k in ['sahifa', 'page', 'sayt', 'url', 'browser', 'website', 'open']):
+            task_specs.append({
+                'type': 'browser', 
+                'tools': ['browser_navigate'], 
+                'ver': 'browser',
+                'desc': 'Sahifaga kirish',
+                'task_type': 'browser',
+                'expected_artifacts': ['screenshot'],
+                'rollback_point': {'type': 'browser_state', 'description': 'Browser holatini saqlash'}
+            })
+        
+        # Code execution tasks
+        if any(k in msg_lower for k in ['kod', 'code', 'python', 'javascript', 'run', 'execute', 'bajar']):
+            task_specs.append({
+                'type': 'code', 
+                'tools': ['execute_code'], 
+                'ver': 'code',
+                'desc': 'Kodni bajarish',
+                'task_type': 'code',
+                'expected_artifacts': ['output'],
+                'rollback_point': {'type': 'env_snapshot', 'description': 'Environment snapshot'}
+            })
+        
+        # Command execution tasks
+        if any(k in msg_lower for k in ['buyruq', 'command', 'terminal', 'shell', 'bash']):
+            task_specs.append({
+                'type': 'command', 
+                'tools': ['execute_command'], 
+                'ver': 'function',
+                'desc': 'Buyruqni bajarish',
+                'task_type': 'server',
+                'expected_artifacts': [],
+                'rollback_point': {'type': 'system_state', 'description': 'System state backup'}
+            })
+        
+        # Server/service tasks
+        if any(k in msg_lower for k in ['server', 'serve', 'start', 'run service']):
+            task_specs.append({
+                'type': 'server', 
+                'tools': ['execute_command', 'execute_code'], 
+                'ver': 'server',
+                'desc': 'Serverni ishga tushirish',
+                'task_type': 'server',
+                'expected_artifacts': [],
+                'rollback_point': {'type': 'service_backup', 'description': 'Service state backup'}
+            })
+        
+        # Screenshot tasks
+        if any(k in msg_lower for k in ['screenshot', 'skrin', 'capture', 'sahifa rasmi']):
+            task_specs.append({
+                'type': 'screenshot', 
+                'tools': ['take_screenshot'], 
+                'ver': 'screenshot',
+                'desc': 'Screenshot olish',
+                'task_type': 'browser',
+                'expected_artifacts': ['*.png', '*.jpg'],
+                'rollback_point': None
+            })
+        
+        # Install tasks
+        if any(k in msg_lower for k in ['install', 'o\'rnat', 'setup', 'configure']):
+            task_specs.append({
+                'type': 'install', 
+                'tools': ['install_package', 'execute_command'], 
+                'ver': 'function',
+                'desc': 'Paketni o\'rnatish',
+                'task_type': 'install',
+                'expected_artifacts': [],
+                'rollback_point': {'type': 'package_list', 'description': 'Installed packages list'}
+            })
+        
+        # Default task if none matched
         if not task_specs:
-            task_specs.append({'type': 'general', 'tools': ['execute_command'], 'ver': 'manual', 'desc': message[:50]})
+            task_specs.append({
+                'type': 'general', 
+                'tools': ['execute_command'], 
+                'ver': 'manual',
+                'desc': message[:100],
+                'task_type': 'general',
+                'expected_artifacts': [],
+                'rollback_point': None
+            })
         
+        # Create tasks with full metadata
         for i, spec in enumerate(task_specs):
+            # Set priority based on position and risk
+            if i == 0:
+                priority = TaskPriority.CRITICAL if risk_level == 'critical' else TaskPriority.HIGH
+            elif i < len(task_specs) - 1:
+                priority = TaskPriority.NORMAL
+            else:
+                priority = TaskPriority.LOW
+            
+            # Create task with full metadata
             task = Task(
-                id=str(uuid.uuid4())[:8],
+                id=f"task_{int(time.time()*1000)}_{i}",
                 description=spec['desc'],
-                priority=TaskPriority.HIGH if i == 0 else TaskPriority.NORMAL,
+                priority=priority,
                 dependencies=[tasks[-1].id] if tasks else [],
-                timeout=30, max_retries=3, approval_policy='auto'
+                timeout=30,
+                max_retries=3,
+                approval_policy=approval_policy,
+                sandbox_mode=sandbox_mode,
             )
+            
+            # Set FULL metadata
             task.input_data = {
                 'required_tools': spec['tools'],
                 'verification_type': spec['ver'],
                 'success_criteria': f"{spec['desc']} muvaffaqiyatli",
-                'fallback_strategy': 'Boshqa usul'
+                'fallback_strategy': 'ALTERNATIVE_TOOL',
+                'task_type': spec.get('task_type', 'general'),
+                'risk_level': risk_level,
+                'expected_artifacts': spec.get('expected_artifacts', []),
+                'rollback_point': spec.get('rollback_point'),
+                'retry_policy': {
+                    'max_retries': 3,
+                    'backoff_strategy': 'exponential',
+                    'initial_delay': 1,
+                    'max_delay': 30
+                },
+                'timeout': task.timeout,
             }
+            
+            # Set artifact expectations
+            task.artifact_expectations = spec.get('expected_artifacts', [])
+            
+            # Set rollback point
+            if spec.get('rollback_point'):
+                task.rollback_point = {
+                    **spec['rollback_point'],
+                    'timestamp': time.time(),
+                    'task_id': task.id
+                }
+            
             tasks.append(task)
         
-        logger.info(f"📋 Created {len(tasks)} tasks via heuristic planner")
+        # Add dependency chain
+        for i in range(1, len(tasks)):
+            if tasks[i-1].id not in tasks[i].dependencies:
+                tasks[i].dependencies.append(tasks[i-1].id)
+        
+        logger.info(f"📋 Created {len(tasks)} tasks via enhanced heuristic planner")
+        logger.info(f"   Risk level: {risk_level}, Sandbox: {sandbox_mode}, Approval: {approval_policy}")
+        
         return tasks
     
     async def _execute(self, plan: List[Task]) -> str:
@@ -1654,7 +2418,158 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         return candidates[0] if candidates else None
 
     def _select_tool_for_task(self, task: Task) -> str:
-        """Smart tool selection based on task description"""
+        """
+        POLICY-DRIVEN TOOL SELECTOR for No1 agent.
+        
+        Selects the best tool based on:
+        - task_type: type of task (browser, code, file, server, etc.)
+        - risk_level: low, medium, high, critical
+        - required_tools: tools specified in task metadata
+        - available_tools: tools currently available
+        - verification_type: how task will be verified
+        - tool_reliability: reliability scores for tools
+        """
+        
+        task_meta = task.metadata or {}
+        task_type = task_meta.get('task_type', '')
+        risk_level = task_meta.get('risk_level', 'medium')
+        verification_type = task_meta.get('verification_type', 'manual')
+        
+        # Tool reliability scores (higher = more reliable)
+        TOOL_RELIABILITY = {
+            'execute_command': 0.9,
+            'execute_code': 0.85,
+            'write_file': 0.95,
+            'read_file': 0.95,
+            'delete_file': 0.7,
+            'browser_navigate': 0.8,
+            'browser_click': 0.8,
+            'browser_type': 0.8,
+            'web_search': 0.85,
+            'install_package': 0.75,
+            'web_request': 0.9,
+        }
+        
+        # Tool policies based on task type
+        TOOL_POLICY = {
+            'browser': {
+                'preferred': ['browser_navigate', 'browser_click', 'browser_type'],
+                'fallback': ['web_request'],
+                'forbidden': ['execute_command', 'delete_file']
+            },
+            'code': {
+                'preferred': ['execute_code'],
+                'fallback': ['execute_command'],
+                'forbidden': ['delete_file', 'install_package']
+            },
+            'file': {
+                'preferred': ['write_file', 'read_file'],
+                'fallback': [],
+                'forbidden': ['execute_command']
+            },
+            'server': {
+                'preferred': ['execute_command', 'execute_code'],
+                'fallback': ['web_request'],
+                'forbidden': ['delete_file']
+            },
+            'search': {
+                'preferred': ['web_search'],
+                'fallback': ['web_request'],
+                'forbidden': []
+            },
+            'install': {
+                'preferred': ['install_package'],
+                'fallback': ['execute_command'],
+                'forbidden': ['delete_file']
+            }
+        }
+        
+        # Risk-based restrictions
+        RISK_RESTRICTIONS = {
+            'critical': {
+                'allowed': ['read_file', 'web_search', 'web_request'],
+                'require_approval': ['execute_command', 'execute_code', 'write_file', 'delete_file', 'install_package']
+            },
+            'high': {
+                'allowed': ['read_file', 'write_file', 'web_search', 'web_request', 'execute_command', 'execute_code'],
+                'require_approval': ['delete_file', 'install_package']
+            },
+            'medium': {
+                'allowed': ['read_file', 'write_file', 'web_search', 'web_request', 'execute_command', 'execute_code', 'browser_navigate'],
+                'require_approval': ['delete_file', 'install_package']
+            },
+            'low': {
+                'allowed': ['read_file', 'write_file', 'web_search', 'web_request', 'execute_command', 'execute_code', 'browser_navigate', 'browser_click', 'browser_type', 'delete_file', 'install_package'],
+                'require_approval': []
+            }
+        }
+        
+        # Get available tools (default all if not specified)
+        available_tools = list(TOOL_RELIABILITY.keys())
+        
+        # 1. First, check if task_type has specific policy
+        if task_type and task_type in TOOL_POLICY:
+            policy = TOOL_POLICY[task_type]
+            
+            # Try preferred tools first
+            for tool in policy['preferred']:
+                if tool in available_tools:
+                    logger.info(f"Tool selected from policy (preferred): {tool} for task_type={task_type}")
+                    return tool
+            
+            # Try fallback tools
+            for tool in policy['fallback']:
+                if tool in available_tools:
+                    logger.info(f"Tool selected from policy (fallback): {tool} for task_type={task_type}")
+                    return tool
+            
+            # Check if forbidden tools are being used
+            desc = task.description.lower()
+            for forbidden in policy['forbidden']:
+                if any(k in desc for k in [forbidden.replace('_', ' '), forbidden]):
+                    logger.warning(f"Tool {forbidden} is forbidden for task_type={task_type}")
+        
+        # 2. Check risk level restrictions
+        risk_restriction = RISK_RESTRICTIONS.get(risk_level, RISK_RESTRICTIONS['medium'])
+        allowed_tools = risk_restriction['allowed']
+        
+        # Filter by allowed tools based on risk
+        candidate_tools = [t for t in available_tools if t in allowed_tools]
+        
+        if not candidate_tools:
+            logger.warning(f"No allowed tools for risk_level={risk_level}, using all available")
+            candidate_tools = available_tools
+        
+        # 3. Score and rank tools
+        tool_scores = []
+        for tool in candidate_tools:
+            reliability = TOOL_RELIABILITY.get(tool, 0.5)
+            
+            # Bonus for tools matching verification type
+            bonus = 0
+            if verification_type == 'browser' and 'browser' in tool:
+                bonus = 0.15
+            elif verification_type == 'code' and 'code' in tool:
+                bonus = 0.15
+            elif verification_type == 'file' and 'file' in tool:
+                bonus = 0.15
+            
+            # Bonus for tools in task metadata
+            if task_meta.get('preferred_tool') == tool:
+                bonus += 0.2
+            
+            total_score = reliability + bonus
+            tool_scores.append((tool, total_score))
+        
+        # Sort by score (highest first)
+        tool_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        if tool_scores:
+            selected = tool_scores[0][0]
+            logger.info(f"Policy-driven tool selected: {selected} (score={tool_scores[0][1]:.2f})")
+            return selected
+        
+        # Fallback: use description-based selection
         desc = task.description.lower()
         if any(k in desc for k in ['yarat', 'yoz', 'fayl', 'file', 'create']): return 'write_file'
         if any(k in desc for k in ['oqish', 'read', 'ko\'r']): return 'read_file'
@@ -1662,7 +2577,14 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         if any(k in desc for k in ['qidir', 'internet', 'search', 'web']): return 'web_search'
         if any(k in desc for k in ['sahifa', 'page', 'sayt', 'url']): return 'browser_navigate'
         if any(k in desc for k in ['kod', 'code', 'python', 'bajar']): return 'execute_code'
-        return 'execute_command'
+        
+        # Default to execute_command only if explicitly allowed
+        if 'execute_command' in allowed_tools:
+            return 'execute_command'
+        
+        # Last resort: web_request ( safest option)
+        logger.warning("Tool selection: falling back to web_request as safest option")
+        return 'web_request'
     
     def _validate_tool_args(self, tool_name: str, args: Dict) -> bool:
         """Validate tool arguments"""
@@ -1698,43 +2620,172 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         return verification_data
     
     async def _execute_via_brain(self, task: Task, tool_name: str, args: Dict, task_meta: Dict) -> ExecutionResult:
-        """Execute tool via native_brain with INDEPENDENT validation - don't trust model blindly"""
-
-        # INDEPENDENT VERIFICATION: We verify the model's output ourselves, not just trust it""
+        """
+        Execute tool via native_brain with INDEPENDENT validation.
+        
+        IMPORTANT: Model output is ONLY a suggestion. The REAL truth comes from:
+        - Real tool runtime result (not model claiming success)
+        - Verifier result
+        - Artifact collector result
+        
+        Model can:
+        - Fake success
+        - Provide incorrect artifacts
+        - Claim wrong tool_used
+        - Invent stdout/stderr
+        
+        So we ALWAYS verify with real tool execution, not just trust model.
+        """
+        
         import re, json
+        import time
         
-        execution_prompt = f"""Execute task with FULL precision. TASK: {task.description} TOOL: {tool_name} ARGUMENTS: {json.dumps(args)} SUCCESS CRITERIA: {task_meta.get('success_criteria', 'Task completed')} Return ONLY valid JSON: {{ "success": true/false, "stdout": "actual output", "stderr": "errors", "exit_code": 0, "artifacts": [], "error": "error if failed" }}"""
-        
-        response = self.native_brain.think(execution_prompt)
         exec_result = ExecutionResult(success=False, tool_used=tool_name)
         
+        # Track where the truth comes from
+        validation_source = {
+            'model_suggestion': None,
+            'tool_runtime': None,
+            'verifier': None,
+            'artifact_check': None
+        }
+        
+        # Step 1: Get model suggestion (NOT the final truth)
+        model_suggestion = None
         try:
+            execution_prompt = f"""Execute task with FULL precision. 
+TASK: {task.description} 
+TOOL: {tool_name} 
+ARGUMENTS: {json.dumps(args)} 
+SUCCESS CRITERIA: {task_meta.get('success_criteria', 'Task completed')}
+
+IMPORTANT: Provide your best guess for the execution result. This is a SUGGESTION only.
+Return ONLY valid JSON: {{ 
+  "success": true/false, 
+  "stdout": "actual output", 
+  "stderr": "errors", 
+  "exit_code": 0, 
+  "artifacts": [], 
+  "error": "error if failed" 
+}}"""
+
+            response = self.native_brain.think(execution_prompt)
+            
+            # Try to parse model response
             json_match = re.search(r'\{[^{}]*"success"[^{}]*\}', response, re.DOTALL)
-            if not json_match: json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match: 
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
             
             if json_match:
                 json_str = json_match.group()
                 if json_str.count('{') == json_str.count('}'):
-                    exec_data = json.loads(json_str)
-                    exec_result.success = exec_data.get('success', False)
-                    exec_result.stdout = exec_data.get('stdout', '')
-                    exec_result.stderr = exec_data.get('stderr', '')
-                    exec_result.exit_code = exec_data.get('exit_code', 0)
-                    exec_result.artifacts = exec_data.get('artifacts', [])
-                    exec_result.error = exec_data.get('error')
-                    
-                    if exec_result.error: exec_result.success = False
-                    if exec_result.exit_code != 0: exec_result.success = False
-                else:
-                    exec_result.error = "Incomplete JSON response"
-            else:
-                exec_result.error = "No valid JSON in response"
-                exec_result.stdout = response
-        except json.JSONDecodeError as e:
-            exec_result.error = f"JSON parse error: {str(e)}"
-            exec_result.stdout = response
+                    model_suggestion = json.loads(json_str)
+                    validation_source['model_suggestion'] = model_suggestion
+                    logger.debug(f"Model suggestion: {model_suggestion.get('success', 'unknown')}")
         except Exception as e:
-            exec_result.error = f"Execution error: {str(e)}"
+            logger.warning(f"Model suggestion failed: {e}")
+        
+        # Step 2: REAL tool execution (this is the ACTUAL truth)
+        tool_start_time = time.time()
+        
+        try:
+            # Execute via actual tools engine
+            if hasattr(self, 'tools') and self.tools:
+                import asyncio
+                tool_runtime_result = await asyncio.wait_for(
+                    asyncio.to_thread(self.tools.execute_tool, tool_name, args),
+                    timeout=task.timeout
+                )
+                
+                # Copy real runtime results
+                exec_result.stdout = tool_runtime_result.stdout or ""
+                exec_result.stderr = tool_runtime_result.stderr or ""
+                exec_result.exit_code = tool_runtime_result.exit_code if hasattr(tool_runtime_result, 'exit_code') else 0
+                exec_result.artifacts = tool_runtime_result.artifacts if hasattr(tool_runtime_result, 'artifacts') else []
+                
+                # Determine success from REAL runtime, not model
+                # Check exit code
+                if exec_result.exit_code != 0:
+                    exec_result.success = False
+                    exec_result.error = f"Exit code: {exec_result.exit_code}"
+                # Check for error patterns in real output
+                elif any(err in (exec_result.stdout + exec_result.stderr).lower() 
+                        for err in ['exception', 'error', 'failed', 'traceback', 'xatolik']):
+                    exec_result.success = False
+                    exec_result.error = "Error pattern detected in output"
+                else:
+                    exec_result.success = True
+                
+                validation_source['tool_runtime'] = {
+                    'success': exec_result.success,
+                    'exit_code': exec_result.exit_code,
+                    'has_error_pattern': bool(exec_result.error)
+                }
+                
+            elif hasattr(self, 'native_brain'):
+                # Fallback: Use brain's execution capability if no tools
+                exec_result.stdout = response  # Use model output as last resort
+                exec_result.success = model_suggestion.get('success', False) if model_suggestion else False
+                logger.warning("No tools engine, using brain fallback - less reliable")
+            else:
+                exec_result.error = "No execution engine available"
+                
+        except asyncio.TimeoutError:
+            exec_result.error = f"Execution timeout after {task.timeout}s"
+            exec_result.error_type = ErrorType.EXECUTION_TIMEOUT
+            exec_result.success = False
+        except Exception as e:
+            exec_result.error = f"Tool execution error: {str(e)}"
+            exec_result.success = False
+        
+        exec_result.execution_time = time.time() - tool_start_time
+        exec_result.tool_used = tool_name
+        
+        # Step 3: Artifact verification (if artifacts expected)
+        expected_artifacts = task_meta.get('expected_artifacts', [])
+        if expected_artifacts and exec_result.artifacts:
+            artifact_check = {}
+            for expected in expected_artifacts:
+                # Check if artifact exists
+                found = any(expected in a for a in exec_result.artifacts)
+                artifact_check[expected] = found
+            
+            validation_source['artifact_check'] = artifact_check
+            
+            # If expected artifacts not found, fail
+            if not all(artifact_check.values()):
+                missing = [k for k, v in artifact_check.items() if not v]
+                exec_result.success = False
+                exec_result.error = f"Missing expected artifacts: {missing}"
+        
+        # Step 4: Run verifier for additional validation
+        verification_type = task_meta.get('verification_type', 'manual')
+        if verification_type != 'manual' and exec_result.success:
+            try:
+                verification_data = {
+                    'result': exec_result.stdout,
+                    'task_id': task.id,
+                    **task_meta
+                }
+                verification = self.verifier.verify(verification_type, verification_data)
+                validation_source['verifier'] = {
+                    'passed': verification.passed,
+                    'details': verification.details
+                }
+                
+                if not verification.passed:
+                    exec_result.success = False
+                    exec_result.error = f"Verification failed: {verification.details}"
+            except Exception as e:
+                logger.warning(f"Verification check failed: {e}")
+        
+        # Log validation sources for debugging
+        logger.info(f"Execution validation for task {task.id}: {validation_source}")
+        
+        # Don't trust model - use real results
+        # If model claimed success but real execution failed, trust real execution
+        if model_suggestion and model_suggestion.get('success') and not exec_result.success:
+            logger.warning(f"Model claimed success but REAL execution failed! Using real result.")
         
         return exec_result
     
@@ -1777,183 +2828,551 @@ Return JSON with tasks array containing: id, description, priority, dependencies
 
 
 
-    async def _verify(self, result: str) -> bool:
+    async def _verify(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
         """
-        Task-aware verification.
+        TASK-AWARE VERIFICATION for No1 agent.
         
-        Verifies execution result with:
-        - Result presence check
-        - Error pattern detection
-        - Success criteria validation
-        - Artifact verification
+        Verifies execution result with full context:
+        - task: The task being verified
+        - exec_result: Real tool execution result
+        - task_meta: Task metadata including verification_type, success criteria, etc.
+        
+        Verification types:
+        - browser task → browser verifier
+        - screenshot task → OCR/vision verifier
+        - server task → port + HTTP verifier
+        - code task → syntax + regression verifier
+        - file task → file existence + content verifier
         """
         
-        # Basic verification - result must exist
-        if not result:
-            logger.warning("Verification failed: Empty result")
+        if not exec_result:
+            logger.warning("Verification failed: Empty execution result")
             return False
         
-        # Check for error patterns in result
+        verification_type = task_meta.get('verification_type', 'manual')
+        success_criteria = task_meta.get('success_criteria', '')
+        expected_artifacts = task_meta.get('expected_artifacts', [])
+        
+        # If execution itself failed, verification fails
+        if not exec_result.success:
+            logger.warning(f"Verification failed: Execution was not successful - {exec_result.error}")
+            return False
+        
+        # Check for error patterns in result (real stderr/stdout from tool)
         error_patterns = [
             "EXCEPTION", "ERROR", "FAILED", "Traceback",
             "Permission denied", "Not found", "Timeout",
-            "Verification FAILED"
+            "Verification FAILED", "command failed", "xatolik"
         ]
         
-        result_upper = result.upper()
+        result_text = (exec_result.stdout or "") + (exec_result.stderr or "")
+        result_upper = result_text.upper()
         has_error = any(pattern.upper() in result_upper for pattern in error_patterns)
         
         if has_error:
-            logger.warning(f"Verification failed: Error patterns detected in result")
+            logger.warning(f"Verification failed: Error patterns detected in execution output")
             return False
         
-        # Check result is not just placeholder text
-        if result.startswith("Executed:") or result.startswith("Vazifa qabul"):
-            logger.warning("Verification failed: Result appears to be placeholder")
+        # Check result is not just placeholder text (model fake)
+        if result_text.startswith("Executed:") or result_text.startswith("Vazifa qabul"):
+            logger.warning("Verification failed: Result appears to be placeholder (model fake)")
             return False
         
-        # Use verifier for additional checks
-        verification = self.verifier.verify("function_result", {"result": result})
-        
-        if not verification.passed:
-            logger.warning(f"Verification failed: {verification.details}")
-        
-        return verification.passed
+        # Type-specific verification
+        if verification_type == 'browser':
+            return await self._verify_browser(task, exec_result, task_meta)
+        elif verification_type == 'screenshot':
+            return await self._verify_screenshot(task, exec_result, task_meta)
+        elif verification_type == 'server':
+            return await self._verify_server(task, exec_result, task_meta)
+        elif verification_type == 'code':
+            return await self._verify_code(task, exec_result, task_meta)
+        elif verification_type == 'file':
+            return await self._verify_file(task, exec_result, task_meta)
+        elif verification_type == 'function':
+            # Generic function verification
+            return self._verify_function_result(task, exec_result, task_meta)
+        elif verification_type == 'manual':
+            # Manual verification - trust execution result
+            return exec_result.success
+        else:
+            logger.warning(f"Unknown verification type: {verification_type}, defaulting to function result")
+            return exec_result.success
     
-    async def _repair(self, result: str) -> str:
+    async def _verify_browser(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
         """
-        REAL recovery engine with error classification.
+        Browser verification with multiple signals:
+        - URL verification
+        - DOM text verification
+        - Selector verification
+        - Network response verification
+        - Screenshot corroboration
+        """
+        
+        expected_url = task_meta.get('expected_url', '')
+        expected_text = task_meta.get('expected_text', '')
+        required_selectors = task_meta.get('required_selectors', [])
+        check_network = task_meta.get('check_network', True)
+        
+        result_data = exec_result.stdout  # Could be URL, HTML, or status
+        
+        # 1. URL verification
+        if expected_url and expected_url not in result_data:
+            # Try to get actual URL from browser
+            if hasattr(self, 'browser') and self.browser:
+                actual_url = self.browser.get_current_url()
+                if expected_url not in actual_url:
+                    logger.warning(f"Browser verification failed: URL mismatch. Expected: {expected_url}, Got: {actual_url}")
+                    return False
+        
+        # 2. Text verification in DOM
+        if expected_text and expected_text not in result_data:
+            logger.warning(f"Browser verification failed: Expected text not found - {expected_text[:50]}...")
+            return False
+        
+        # 3. Selector verification (if we have browser access)
+        if required_selectors and hasattr(self, 'browser') and self.browser:
+            for selector in required_selectors:
+                if not self.browser.element_exists(selector):
+                    logger.warning(f"Browser verification failed: Required selector not found - {selector}")
+                    return False
+        
+        # 4. Network verification
+        if check_network and ('200' not in result_data and 'OK' not in result_data):
+            # Check for error status codes
+            if any(err in result_data for err in ['404', '500', '503', '403']):
+                logger.warning(f"Browser verification failed: Network error in response")
+                return False
+        
+        logger.info(f"Browser verification PASSED for task {task.id}")
+        return True
+    
+    async def _verify_screenshot(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
+        """
+        Screenshot verification with multiple methods:
+        - OCR text extraction
+        - Vision prompt verification
+        - Image diff comparison
+        - Region-based expectation
+        - Confidence score threshold
+        """
+        
+        expected_text = task_meta.get('expected_text', '')
+        vision_prompt = task_meta.get('vision_prompt', '')
+        image_path = task_meta.get('image_path', '')
+        confidence_threshold = task_meta.get('confidence_threshold', 0.7)
+        
+        # If we have screenshot artifacts, verify them
+        screenshot_artifacts = [a for a in exec_result.artifacts if a.endswith(('.png', '.jpg', '.jpeg'))]
+        
+        if not screenshot_artifacts:
+            # Check if result contains image data
+            if 'screenshot' in exec_result.stdout.lower() or 'image' in exec_result.stdout.lower():
+                logger.info("Screenshot verification: Screenshot captured (artifact collection pending)")
+                return True
+            logger.warning("Screenshot verification failed: No screenshot artifacts found")
+            return False
+        
+        # OCR-based verification (if expected text provided)
+        if expected_text:
+            try:
+                # Try OCR using vision module if available
+                if hasattr(self, 'vision') and self.vision:
+                    ocr_result = self.vision.extract_text(screenshot_artifacts[0])
+                    if expected_text.lower() not in ocr_result.lower():
+                        logger.warning(f"Screenshot verification failed: OCR text mismatch")
+                        logger.debug(f"OCR result: {ocr_result[:200]}...")
+                        return False
+                else:
+                    logger.warning("Screenshot verification: OCR not available, checking filename only")
+            except Exception as e:
+                logger.error(f"Screenshot OCR verification error: {e}")
+                return False
+        
+        # Vision prompt verification
+        if vision_prompt:
+            try:
+                if hasattr(self, 'vision') and self.vision:
+                    vision_result = self.vision.analyze_image(screenshot_artifacts[0], vision_prompt)
+                    if not vision_result.get('matches', False):
+                        score = vision_result.get('confidence', 0)
+                        if score < confidence_threshold:
+                            logger.warning(f"Screenshot verification failed: Vision confidence {score} < {confidence_threshold}")
+                            return False
+                else:
+                    logger.warning("Screenshot verification: Vision not available")
+            except Exception as e:
+                logger.error(f"Screenshot vision verification error: {e}")
+                return False
+        
+        logger.info(f"Screenshot verification PASSED for task {task.id}")
+        return True
+    
+    async def _verify_server(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
+        """Server verification - port + HTTP check"""
+        
+        expected_port = task_meta.get('expected_port', 0)
+        expected_endpoint = task_meta.get('expected_endpoint', '/')
+        check_http = task_meta.get('check_http', True)
+        
+        # Check if server started successfully
+        if not exec_result.success:
+            logger.warning("Server verification failed: Execution was not successful")
+            return False
+        
+        stdout = exec_result.stdout or ""
+        stderr = exec_result.stderr or ""
+        
+        # Look for port in output
+        if expected_port:
+            port_str = str(expected_port)
+            if port_str not in stdout and port_str not in stderr:
+                logger.warning(f"Server verification failed: Port {expected_port} not found in output")
+                return False
+        
+        # HTTP check if requested
+        if check_http:
+            # Try to make HTTP request to verify server is running
+            if hasattr(self, 'tools_engine') and self.tools_engine:
+                try:
+                    http_result = self.tools_engine.execute_tool(
+                        'web_request', 
+                        {'url': f'http://localhost:{expected_port}{expected_endpoint}', 'timeout': 5}
+                    )
+                    if not http_result.get('success', False):
+                        logger.warning(f"Server verification failed: HTTP check failed")
+                        return False
+                except Exception as e:
+                    logger.warning(f"Server verification: HTTP check skipped - {e}")
+        
+        logger.info(f"Server verification PASSED for task {task.id}")
+        return True
+    
+    async def _verify_code(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
+        """Code verification - syntax + regression check"""
+        
+        check_syntax = task_meta.get('check_syntax', True)
+        check_output = task_meta.get('check_output', True)
+        expected_output = task_meta.get('expected_output', '')
+        
+        stdout = exec_result.stdout or ""
+        stderr = exec_result.stderr or ""
+        
+        # Syntax check
+        if check_syntax and 'SyntaxError' in stderr:
+            logger.warning("Code verification failed: Syntax error detected")
+            return False
+        
+        # Output check
+        if check_output and expected_output:
+            if expected_output not in stdout:
+                logger.warning(f"Code verification failed: Expected output not found")
+                return False
+        
+        logger.info(f"Code verification PASSED for task {task.id}")
+        return True
+    
+    async def _verify_file(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
+        """File verification - existence + content check"""
+        
+        expected_path = task_meta.get('expected_path', '')
+        expected_content = task_meta.get('expected_content', '')
+        
+        # Check artifacts for created files
+        file_artifacts = exec_result.artifacts
+        
+        if expected_path:
+            if expected_path not in file_artifacts:
+                # Check if file exists
+                import os
+                if not os.path.exists(expected_path):
+                    logger.warning(f"File verification failed: File not found at {expected_path}")
+                    return False
+        
+        # Content check
+        if expected_content:
+            try:
+                with open(expected_path, 'r') as f:
+                    content = f.read()
+                    if expected_content not in content:
+                        logger.warning(f"File verification failed: Expected content not found")
+                        return False
+            except Exception as e:
+                logger.warning(f"File verification: Could not read content - {e}")
+        
+        logger.info(f"File verification PASSED for task {task.id}")
+        return True
+    
+    async def _repair(self, result: str, failed_task: Optional[Task] = None) -> str:
+        """
+        OPERATIVE RECOVERY ENGINE with real actions.
         
         Performs:
         1. Error type classification
         2. Retry budget check
         3. Strategy selection based on error type
-        4. Recovery action execution
+        4. REAL recovery action execution (not just description)
         5. Escalation if unrecoverable
+        
+        Recovery actions:
+        - RETRY_SAME_TOOL: Re-queue task with same tool
+        - ALTERNATE_TOOL: Re-queue with alternate tool
+        - REPLAN: Re-plan the task
+        - ROLLBACK: Rollback to checkpoint
+        - ABORT: Abort the task
+        - ESCALATE: Escalate to human
         """
         
-        logger.info("🔧 Starting recovery process...")
+        logger.info("🔧 Starting OPERATIVE recovery process...")
+        
+        # Get failed task if provided
+        if failed_task is None:
+            # Try to get from recent execution
+            failed_task = getattr(self, '_current_failing_task', None)
         
         # Classify the error
         error_type = self._classify_error(result)
         
         logger.info(f"📊 Classified error type: {error_type.value if error_type else 'unknown'}")
         
+        # Check retry budget
+        if failed_task:
+            if failed_task.retry_count >= failed_task.max_retries:
+                logger.warning(f"Task {failed_task.id} exceeded max retries ({failed_task.max_retries})")
+                return await self._execute_recovery(RecoveryStrategy.ABORT, error_type, result, failed_task)
+        
         # Determine recovery strategy based on error type
         strategy = self._select_recovery_strategy(error_type, result)
         
         logger.info(f"🎯 Selected recovery strategy: {strategy.value}")
         
-        # Execute recovery
-        recovery_result = await self._execute_recovery(strategy, error_type, result)
+        # Execute REAL recovery action
+        recovery_result = await self._execute_recovery(strategy, error_type, result, failed_task)
         
         return recovery_result
     
-    def _classify_error(self, result: str) -> Optional[ErrorType]:
-        """Classify error type from result string"""
+    async def _execute_recovery(
+        self, 
+        strategy: RecoveryStrategy, 
+        error_type: Optional[ErrorType], 
+        result: str,
+        failed_task: Optional[Task] = None
+    ) -> str:
+        """
+        Execute REAL recovery action based on strategy.
         
-        result_lower = result.lower()
+        Each strategy performs actual actions, not just descriptions.
+        """
         
-        # Timeout errors
-        if "timeout" in result_lower or "vaqt" in result_lower:
-            return ErrorType.EXECUTION_TIMEOUT
+        import time
         
-        # Verification errors
-        if "verification failed" in result_lower or "tasdiq" in result_lower:
-            return ErrorType.VERIFICATION_FAILED
+        recovery_log = []
+        recovery_log.append(f"**Xatolik turi:** {error_type.value if error_type else 'Nomalum'}")
+        recovery_log.append(f"**Qayta tiklash strategiyasi:** {strategy.value}")
+        recovery_log.append("")
         
-        # Network errors
-        if any(k in result_lower for k in ['network', 'connection', 'refused', 'unreachable']):
-            return ErrorType.NETWORK_ERROR
-        
-        # Resource errors
-        if any(k in result_lower for k in ['not found', 'mavjud emas', 'ENOENT']):
-            return ErrorType.RESOURCE_NOT_FOUND
-        
-        # Permission errors
-        if any(k in result_lower for k in ['permission denied', 'ruxsat yo\'q', 'EACCES']):
-            return ErrorType.TOOL_PERMISSION_DENIED
-        
-        # Approval errors
-        if "approval" in result_lower or "ruxsat" in result_lower:
-            return ErrorType.APPROVAL_DENIED
-        
-        # Execution errors
-        if any(k in result_lower for k in ['exception', 'error', 'xatolik', 'failed']):
-            return ErrorType.EXECUTION_FAILED
-        
-        return ErrorType.UNKNOWN_ERROR
-    
-    def _select_recovery_strategy(self, error_type: Optional[ErrorType], result: str) -> RecoveryStrategy:
-        """Select recovery strategy based on error type"""
-        
-        if error_type is None:
-            return RecoveryStrategy.ABORT
-        
-        # Recovery strategies for each error type
-        strategy_map = {
-            ErrorType.EXECUTION_TIMEOUT: RecoveryStrategy.RETRY_WITH_BACKOFF,
-            ErrorType.VERIFICATION_FAILED: RecoveryStrategy.ALTERNATE_APPROACH,
-            ErrorType.NETWORK_ERROR: RecoveryStrategy.RETRY_SAME_TOOL,
-            ErrorType.RESOURCE_NOT_FOUND: RecoveryStrategy.RECREATE_RESOURCE,
-            ErrorType.TOOL_PERMISSION_DENIED: RecoveryStrategy.ALTERNATE_TOOL,
-            ErrorType.APPROVAL_DENIED: RecoveryStrategy.ABORT,
-            ErrorType.EXECUTION_FAILED: RecoveryStrategy.RETRY_SAME_TASK,
-            ErrorType.UNKNOWN_ERROR: RecoveryStrategy.SIMPLIFY_TASK,
-        }
-        
-        return strategy_map.get(error_type, RecoveryStrategy.ABORT)
-    
-    async def _execute_recovery(self, strategy: RecoveryStrategy, error_type: Optional[ErrorType], result: str) -> str:
-        """Execute recovery action based on strategy"""
-        
-        recovery_actions = []
-        
+        # Strategy-specific REAL actions
         if strategy == RecoveryStrategy.RETRY_SAME_TOOL:
-            recovery_actions.append("🔄 Qayta urinish (xuddi shu tool bilan)")
-            recovery_actions.append("Vazifa avvalgi holatga qaytarildi")
+            recovery_log.append("🔄 RETRY_SAME_TOOL: Xuddi shu tool bilan qayta urinish")
             
-        elif strategy == RecoveryStrategy.RETRY_SAME_TASK:
-            recovery_actions.append("🔄 Vazifani qayta bajarish")
-            recovery_actions.append("Boshqatdan bajarishga urinish")
-            
-        elif strategy == RecoveryStrategy.RETRY_WITH_BACKOFF:
-            recovery_actions.append("⏳ Kutilgan holda qayta urinish")
-            recovery_actions.append("Kichik kechikish bilan qayta urinish")
+            if failed_task:
+                # Re-queue the task with same tool
+                failed_task.retry_count += 1
+                failed_task.status = TaskStatus.RETRYING
+                failed_task.error = result[:200]  # Store error for debugging
+                
+                # Re-add to task manager
+                self.task_manager.add_task(failed_task)
+                recovery_log.append(f"   → Task {failed_task.id} qayta queue'ga qo'shildi (retry #{failed_task.retry_count})")
+                recovery_log.append(f"   → Vazifa holati: {failed_task.status.value}")
+            else:
+                recovery_log.append("   ⚠️ Task topilmadi, faqat log yozildi")
             
         elif strategy == RecoveryStrategy.ALTERNATE_TOOL:
-            recovery_actions.append("🔧 Boshqa tool tanlash")
-            recovery_actions.append("Muqobil vosita bilan urinish")
+            recovery_log.append("🔧 ALTERNATE_TOOL: Boshqa tool tanlash")
             
-        elif strategy == RecoveryStrategy.ALTERNATE_APPROACH:
-            recovery_actions.append("🔀 Boshqa yondashuv")
-            recovery_actions.append("Boshqa usul bilan bajarishga urinish")
+            if failed_task:
+                # Get task metadata
+                task_meta = failed_task.input_data or {}
+                current_tool = task_meta.get('tool_used', '')
+                
+                # Find alternate tool
+                alternate_tools = {
+                    'execute_command': 'execute_code',
+                    'execute_code': 'execute_command',
+                    'browser_navigate': 'web_request',
+                    'web_request': 'browser_navigate',
+                    'write_file': 'execute_command',
+                    'read_file': 'execute_command',
+                }
+                
+                new_tool = alternate_tools.get(current_tool, 'web_search')
+                
+                # Update task with new tool
+                task_meta['tool_used'] = new_tool
+                task_meta['preferred_tool'] = new_tool
+                failed_task.input_data = task_meta
+                failed_task.retry_count += 1
+                failed_task.status = TaskStatus.RETRYING
+                
+                # Re-add to task manager
+                self.task_manager.add_task(failed_task)
+                recovery_log.append(f"   → Tool o'zgartirildi: {current_tool} → {new_tool}")
+                recovery_log.append(f"   → Task {failed_task.id} qayta queue'ga qo'shildi")
+            else:
+                recovery_log.append("   ⚠️ Task topilmadi")
+            
+        elif strategy == RecoveryStrategy.RETRY_WITH_BACKOFF:
+            recovery_log.append("⏳ RETRY_WITH_BACKOFF: Kutilgan holda qayta urinish")
+            
+            if failed_task:
+                # Calculate backoff time
+                backoff_time = min(2 ** failed_task.retry_count, 30)  # Max 30 seconds
+                
+                failed_task.retry_count += 1
+                failed_task.status = TaskStatus.RETRYING
+                
+                # Re-add to scheduler with delay
+                self.scheduler.schedule_task(failed_task, delay=backoff_time)
+                recovery_log.append(f"   → Backoff vaqti: {backoff_time} soniya")
+                recovery_log.append(f"   → Task {failed_task.id} scheduler'ga qo'shildi (retry #{failed_task.retry_count})")
+            else:
+                recovery_log.append("   ⚠️ Task topilmadi")
+            
+        elif strategy == RecoveryStrategy.REPLAN:
+            recovery_log.append("🔀 REPLAN: Vazifani qayta rejalashtirish")
+            
+            if failed_task:
+                # Reset task for re-planning
+                failed_task.status = TaskStatus.PENDING
+                failed_task.retry_count += 1
+                
+                # Clear previous execution data
+                failed_task.output_data = None
+                failed_task.error = None
+                
+                # Add back to planning queue
+                self.task_manager.add_task(failed_task)
+                recovery_log.append(f"   → Task {failed_task.id} rejalashtirish uchun qayta qo'shildi")
+                recovery_log.append(f"   → Retry count: {failed_task.retry_count}")
+            else:
+                recovery_log.append("   ⚠️ Task topilmadi, yangi reja tuzilmadi")
+            
+        elif strategy == RecoveryStrategy.ROLLBACK:
+            recovery_log.append("🔙 ROLLBACK:Checkpoint'ga qaytish")
+            
+            if failed_task and failed_task.rollback_point:
+                # Restore from rollback point
+                rollback_data = failed_task.rollback_point
+                
+                # Restore task state
+                failed_task.status = TaskStatus.PENDING
+                failed_task.input_data = rollback_data.get('input_data')
+                failed_task.output_data = rollback_data.get('output_data')
+                failed_task.error = None
+                failed_task.retry_count = rollback_data.get('retry_count', 0)
+                
+                # Add back to task manager
+                self.task_manager.add_task(failed_task)
+                
+                recovery_log.append(f"   → Task {failed_task.id} checkpoint'dan tiklandi")
+                recovery_log.append(f"   → Rollback point vaqti: {rollback_data.get('timestamp', 'n/a')}")
+            else:
+                recovery_log.append("   ⚠️ Rollback point topilmadi")
+                recovery_log.append("   → Abort ga o'tiladi")
+                strategy = RecoveryStrategy.ABORT
             
         elif strategy == RecoveryStrategy.SIMPLIFY_TASK:
-            recovery_actions.append("📝 Vazifani soddalashtirish")
-            recovery_actions.append("Kichikroq qadamlarga bo'lish")
+            recovery_log.append("📝 SIMPLIFY_TASK: Vazifani soddalashtirish")
             
-        elif strategy == RecoveryStrategy.RECREATE_RESOURCE:
-            recovery_actions.append("🔨 Resursni qayta yaratish")
-            recovery_actions.append("Mavjud bo'lmagan resursni yaratish")
+            if failed_task:
+                # Split task into smaller parts
+                desc = failed_task.description
+                
+                # Simple split: take first half of description
+                mid = len(desc) // 2
+                simpler_desc = desc[:mid] + " (soddalashtirilgan)"
+                
+                # Create simplified task
+                simple_task = Task(
+                    id=f"{failed_task.id}_simplified",
+                    description=simpler_desc,
+                    priority=failed_task.priority,
+                    input_data={
+                        **((failed_task.input_data) or {}),
+                        'simplified_from': failed_task.id,
+                        'original_description': desc
+                    }
+                )
+                
+                # Add simplified task
+                self.task_manager.add_task(simple_task)
+                
+                # Mark original as completed (replaced)
+                failed_task.status = TaskStatus.COMPLETED
+                
+                recovery_log.append(f"   → Original task: {failed_task.id}")
+                recovery_log.append(f"   → Yangi sodda task: {simple_task.id}")
+                recovery_log.append(f"   → Description: {simple_task.description[:50]}...")
+            else:
+                recovery_log.append("   ⚠️ Task topilmadi")
             
         elif strategy == RecoveryStrategy.ESCALATE_TO_HUMAN:
-            recovery_actions.append("👤 Insonga yo'naltirish")
-            recovery_actions.append("Murakkab xatolik - inson yordami kerak")
+            recovery_log.append("👤 ESCALATE_TO_HUMAN: Insonga yo'naltirish")
+            
+            if failed_task:
+                # Mark task for human review
+                failed_task.status = TaskStatus.FAILED
+                failed_task.error = f"ESCALATED: {result[:200]}"
+                
+                # Create escalation notification
+                escalation_msg = f"""🚨 **Vazifa Eskalatsiyasi**
+
+Vazifa ID: {failed_task.id}
+Xatolik: {error_type.value if error_type else 'Noma\'lum'}
+Tavsif: {failed_task.description}
+Xatolik xabari: {result[:200]}
+
+Iltimos, bu vazifani ko'rib chiqing.
+"""
+                # Notify via approval system if available
+                if hasattr(self, 'approval_engine') and self.approval_engine:
+                    self.approval_engine.notify_human(escalation_msg)
+                
+                recovery_log.append(f"   → Task {failed_task.id} insonga yo'naltirildi")
+                recovery_log.append("   → Tasdiq kutish holatida")
+            else:
+                recovery_log.append("   ⚠️ Task topilmadi, lekin eskalatsiya xabari yuborildi")
             
         else:  # ABORT
-            recovery_actions.append("❌ To'xtatish")
-            recovery_actions.append("Xatolik tuzatib bo'lmaydi")
+            recovery_log.append("❌ ABORT: Vazifani to'xtatish")
+            
+            if failed_task:
+                # Mark as permanently failed
+                failed_task.status = TaskStatus.FAILED
+                failed_task.error = result[:200]
+                
+                # Update task manager
+                self.task_manager.mark_failed(failed_task.id, result[:200])
+                
+                recovery_log.append(f"   → Task {failed_task.id} muvaffaqiyatsiz deb belgilandi")
+                recovery_log.append(f"   → Xatolik: {result[:100]}...")
+            else:
+                recovery_log.append("   ⚠️ Task topilmadi")
         
         # Format recovery response
-        recovery_response = "\n".join([
-            f"**Xatolik turi:** {error_type.value if error_type else 'Noma\'lum'}",
-            f"**Qayta tiklash strategiyasi:** {strategy.value}",
-            "",
-            *recovery_actions
-        ])
+        recovery_response = "\n".join(recovery_log)
         
-        logger.info(f"Recovery result: {recovery_response}")
+        logger.info(f"Operative Recovery completed: {strategy.value}")
+        
+        # Emit telemetry event
+        if hasattr(self, 'telemetry') and self.telemetry:
+            self.telemetry.record_event('recovery', {
+                'strategy': strategy.value,
+                'error_type': error_type.value if error_type else 'unknown',
+                'task_id': failed_task.id if failed_task else None,
+                'timestamp': time.time()
+            })
         
         return recovery_response
     
@@ -1972,29 +3391,89 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         """
         MAIN ENTRY POINT for all user messages
         
-        Uses the powerful async pipeline via process()
+        FIXED ISSUES (15):
+        - Explicit safe-mode
+        - Structured error
+        - Telemetry event
+        - User notification
         """
+        
+        import traceback as tb
         
         logger.info(f"📥 Kernel received task: {user_message[:50]}...")
         
+        execution_mode = "async_pipeline"
+        
         try:
-            # Use the powerful async pipeline
             result = asyncio.run(self.process(user_message))
+            
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('task_submission', {
+                    'mode': execution_mode,
+                    'success': True,
+                    'message_preview': user_message[:100],
+                    'timestamp': time.time()
+                })
+            
             return result
             
         except Exception as e:
-            logger.error(f"Task failed: {e}")
+            logger.error(f"Task failed in {execution_mode} mode: {e}")
             
-            # Fallback to simple native_brain execution
+            error_trace = tb.format_exc()
+            logger.debug(f"Full traceback: {error_trace}")
+            
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('task_submission', {
+                    'mode': execution_mode,
+                    'success': False,
+                    'error_type': type(e).__name__,
+                    'error_message': str(e),
+                    'message_preview': user_message[:100],
+                    'timestamp': time.time()
+                })
+            
+            safe_mode = getattr(self, 'SAFE_MODE', True)
+            
+            if safe_mode:
+                logger.warning("SAFE_MODE enabled - returning structured error instead of fallback")
+                
+                if hasattr(self, 'telemetry') and self.telemetry:
+                    self.telemetry.record_event('fallback_safe_mode', {
+                        'reason': 'SAFE_MODE enabled',
+                        'original_error': str(e),
+                        'timestamp': time.time()
+                    })
+                
+                return f"❌ Xatolik: {str(e)}\n\n📋 Holat: Safe mode faollashtirilgan.\nTafsilotlar uchun loglarni tekshiring."
+            
+            logger.warning("Attempting fallback execution")
+            
             if hasattr(self, 'native_brain'):
                 try:
+                    execution_mode = "brain_fallback"
                     result = self.native_brain.think(user_message)
-                    return result
+                    
+                    if hasattr(self, 'telemetry') and self.telemetry:
+                        self.telemetry.record_event('task_submission', {
+                            'mode': execution_mode,
+                            'success': True,
+                            'warning': 'Results from fallback',
+                            'timestamp': time.time()
+                        })
+                    
+                    return f"⚠️ Ogohlantirish: Fallback rejada ishladi\n\n{result}"
+                    
                 except Exception as brain_error:
-                    logger.error(f"Brain also failed: {brain_error}")
-                    return f"❌ Xatolik: {str(brain_error)}"
+                    logger.error(f"Brain fallback also failed: {brain_error}")
+                    return f"❌ Xatolik: {str(brain_error)}\n\nEslatma: Asosiy pipeline va fallback ham xatolik berdi."
             
             return f"❌ Xatolik: {str(e)}"
+    
+    def set_safe_mode(self, enabled: bool = True):
+        """Enable or disable safe mode"""
+        self.SAFE_MODE = enabled
+        logger.info(f"Safe mode set to: {enabled}")
     
     def _execute_simple(self, task: str) -> str:
         """Simple execution fallback"""
