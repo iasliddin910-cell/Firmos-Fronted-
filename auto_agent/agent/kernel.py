@@ -1551,7 +1551,9 @@ class TaskManager:
                         if task_id:
                             self.failed_tasks.add(task_id)
                             
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    # Log the failure but continue processing other entries
+                    logger.warning(f"Failed to parse journal line: {e}. Line preview: {line[:100]}")
                     continue
         
         logger.info(f"Journal replay restored {len(self.tasks)} tasks")
@@ -2289,12 +2291,14 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         for strategy in parsing_strategies:
             strategy_name = strategy['name']
             start_time = time.time()
+            parse_diagnostics["strategies_tried"].append(strategy_name)
             
             try:
                 json_match = strategy['try_extract']()
                 
                 if json_match:
                     json_str = json_match.group() if hasattr(json_match, 'group') else str(json_match)
+                    parse_diagnostics["has_json_markers"] = True
                     
                     # Validate JSON structure
                     try:
@@ -2317,6 +2321,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                                         'time_ms': (time.time() - start_time) * 1000
                                     })
                                     logger.info(f"Plan parsing SUCCESS with strategy: {strategy_name}, tasks: {len(tasks)}")
+                                    
+                                    # Emit success telemetry
+                                    self._emit_plan_parsing_telemetry(True, parsing_attempts, response, parse_diagnostics, strategy_name)
                                     return tasks
                         else:
                             logger.warning(f"Schema validation failed for {strategy_name}: {validation_result['errors']}")
@@ -2325,7 +2332,13 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                                 'success': False,
                                 'reason': 'schema_validation_failed',
                                 'errors': validation_result['errors'],
+                                'snippet': json_str[:200],
                                 'time_ms': (time.time() - start_time) * 1000
+                            })
+                            parse_diagnostics["failures"].append({
+                                'strategy': strategy_name,
+                                'reason': 'schema_validation_failed',
+                                'errors': validation_result['errors']
                             })
                             
                     except json.JSONDecodeError as e:
@@ -2337,6 +2350,11 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                             'error': str(e),
                             'snippet': response[:200],
                             'time_ms': (time.time() - start_time) * 1000
+                        })
+                        parse_diagnostics["failures"].append({
+                            'strategy': strategy_name,
+                            'reason': 'json_decode_error',
+                            'error': str(e)
                         })
                 else:
                     parsing_attempts.append({
@@ -2353,25 +2371,74 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'success': False,
                     'reason': 'exception',
                     'error': str(e),
-                            'snippet': response[:200],
+                    'snippet': response[:200],
                     'time_ms': (time.time() - start_time) * 1000
+                })
+                parse_diagnostics["failures"].append({
+                    'strategy': strategy_name,
+                    'reason': 'exception',
+                    'error': str(e)
                 })
         
         # Log all failed attempts for debugging
         logger.error(f"Plan parsing FAILED. All attempts: {json.dumps(parsing_attempts, indent=2)}")
         
-        # Emit telemetry for plan quality
-        if hasattr(self, 'telemetry') and self.telemetry:
-            self.telemetry.record_event('plan_parsing', {
-                'success': False,
-                'attempts': parsing_attempts,
-                'response_preview': response[:200],
-                'diagnostics': parse_diagnostics,
-                'recovery_hint': _get_recovery_hint(parsing_attempts),
-                'timestamp': time.time()
-            })
+        # Emit telemetry for plan quality - ALWAYS emit, don't skip
+        self._emit_plan_parsing_telemetry(False, parsing_attempts, response, parse_diagnostics, None)
         
         return tasks
+    
+    def _emit_plan_parsing_telemetry(self, success: bool, parsing_attempts: List[Dict], response: str, parse_diagnostics: Dict, successful_strategy: str = None):
+        """
+        Emit telemetry for plan parsing with full diagnostics.
+        
+        This enables:
+        - Debugging which parsing strategy failed
+        - Self-improvement signals for prompt engineering
+        - Quality metrics for planner
+        """
+        import time
+        
+        # Determine recovery hint
+        recovery_hint = _get_recovery_hint(parsing_attempts) if not success else "Success"
+        
+        telemetry_data = {
+            'success': success,
+            'successful_strategy': successful_strategy,
+            'attempts': parsing_attempts,
+            'response_preview': response[:500],  # More context
+            'diagnostics': parse_diagnostics,
+            'recovery_hint': recovery_hint,
+            'timestamp': time.time(),
+            'strategies_tried_count': len(parse_diagnostics.get("strategies_tried", [])),
+            'failures_count': len(parse_diagnostics.get("failures", []))
+        }
+        
+        # Log prominently for debugging
+        if success:
+            logger.info(f"✅ Plan parsing SUCCESS with strategy: {successful_strategy}")
+        else:
+            logger.error(f"❌ Plan parsing FAILED. Recovery hint: {recovery_hint}")
+            logger.error(f"   Strategies tried: {parse_diagnostics.get('strategies_tried', [])}")
+            logger.error(f"   Failures: {parse_diagnostics.get('failures', [])}")
+        
+        # Emit to telemetry if available
+        if hasattr(self, 'telemetry') and self.telemetry:
+            try:
+                self.telemetry.record_event('plan_parsing', telemetry_data)
+            except Exception as e:
+                logger.error(f"Failed to emit telemetry: {e}")
+        
+        # Emit self-improvement signal if available
+        if hasattr(self, 'emit_improvement_signal') and not success:
+            try:
+                self.emit_improvement_signal('plan_parsing_failure', {
+                    'recovery_hint': recovery_hint,
+                    'strategies_failed': [a.get('strategy') for a in parsing_attempts if not a.get('success', False)],
+                    'response_preview': response[:200]
+                })
+            except Exception as e:
+                logger.error(f"Failed to emit improvement signal: {e}")
     
     def _extract_balanced_brackets(self, text: str) -> Optional[re.Match]:
         """Extract balanced JSON from text"""

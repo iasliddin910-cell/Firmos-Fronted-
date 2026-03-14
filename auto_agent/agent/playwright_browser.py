@@ -655,7 +655,9 @@ class BrowserManager:
                         
                         return f"✅ Auth restored for: {site_url}"
                 
-                except:
+                except Exception as e:
+                    # Log the failure but continue checking other entries
+                    logger.warning(f"Failed to restore auth for {site_url}: {e}")
                     continue
             
             return "❌ Auth state not found"

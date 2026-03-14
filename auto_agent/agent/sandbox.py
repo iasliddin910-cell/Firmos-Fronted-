@@ -195,9 +195,12 @@ class WorkspaceSandbox:
                 try:
                     resolved.relative_to(allowed)
                     return True
-                except ValueError:
+                except ValueError as e:
+                    # Path is not relative to this allowed path, try next
+                    logger.debug(f"Path {path} is not within {allowed}: {e}")
                     continue
             
+            logger.warning(f"Path {path} is not within any allowed path: {self.allowed_paths}")
             return False
         
         except Exception:
