@@ -599,7 +599,7 @@ ID lar: {', '.join(str(u) for u in self.authorized_users) or 'Yo\'q'}"""
             new_user_id = int(context.args[0])
             self.authorized_users.add(new_user_id)
             await update.message.reply_text(f"✅ Foydalanuvchi qo'shildi: {new_user_id}")
-        except:
+        except Exception as e:
             await update.message.reply_text("❌ Noto'g'ri ID")
     
     async def execute_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -770,3 +770,172 @@ def start_telegram_bot(token: str, agent, config: Dict = None) -> str:
 def stop_telegram_bot() -> str:
     """Stop Telegram bot"""
     return telegram_manager.stop_bot()
+
+
+# ==================== MISSION CONTROL ====================
+
+class MissionControl:
+    """
+    Enhanced Telegram mission control with:
+    - Approval restore
+    - Live step stream
+    - Deep /approve, /deny, /logs, /artifacts, /resume
+    - Restart recovery
+    """
+    
+    def __init__(self, bot, kernel):
+        self.bot = bot
+        self.kernel = kernel
+        self.pending_approvals = {}  # request_id -> approval_request
+        self.active_sessions = {}  # user_id -> session_info
+        self.command_history = []  # All commands executed
+        
+    async def handle_approval_request(self, request_id: str, decision: str, admin_id: int) -> Dict:
+        """Handle /approve or /deny command"""
+        
+        if request_id not in self.pending_approvals:
+            return {"success": False, "error": "Request not found"}
+            
+        request = self.pending_approvals[request_id]
+        
+        # Record decision
+        self.command_history.append({
+            "command": decision,
+            "request_id": request_id,
+            "admin_id": admin_id,
+            "timestamp": time.time()
+        })
+        
+        if decision == "approve":
+            # Restore approval
+            if hasattr(self.kernel, 'approval_engine'):
+                self.kernel.approval_engine.approve(request_id, "telegram_admin")
+                
+            result = {
+                "success": True,
+                "action": "approved",
+                "request_id": request_id,
+                "tool": request.get("tool_name"),
+                "args": request.get("arguments")
+            }
+        else:
+            # Deny
+            reason = request.get("deny_reason", "Admin denied")
+            if hasattr(self.kernel, 'approval_engine'):
+                self.kernel.approval_engine.deny(request_id, reason, "telegram_admin")
+                
+            result = {
+                "success": True,
+                "action": "denied",
+                "request_id": request_id,
+                "reason": reason
+            }
+            
+        # Remove from pending
+        del self.pending_approvals[request_id]
+        
+        return result
+        
+    async def get_live_stream(self, session_id: str) -> Dict:
+        """Get live step stream for session"""
+        
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return {"active": False, "error": "Session not found"}
+            
+        return {
+            "active": True,
+            "session_id": session_id,
+            "current_step": session.get("current_step"),
+            "completed_steps": session.get("completed_steps", []),
+            "status": session.get("status"),
+            "progress": session.get("progress", 0)
+        }
+        
+    async def get_logs(self, session_id: str, lines: int = 50) -> str:
+        """Get logs for session"""
+        
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return "Session not found"
+            
+        logs = session.get("logs", [])
+        return "\n".join(logs[-lines:])
+        
+    async def get_artifacts(self, session_id: str) -> List[Dict]:
+        """Get artifacts for session"""
+        
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return []
+            
+        return session.get("artifacts", [])
+        
+    async def resume_session(self, session_id: str) -> Dict:
+        """Resume paused session"""
+        
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return {"success": False, "error": "Session not found"}
+            
+        # Resume in kernel
+        if hasattr(self.kernel, 'resume_task'):
+            result = await self.kernel.resume_task(session_id)
+            
+            session["status"] = "running"
+            session["resumed_at"] = time.time()
+            
+            return {"success": True, "session_id": session_id}
+            
+        return {"success": False, "error": "Resume not supported"}
+        
+    async def restart_recovery(self, session_id: str) -> Dict:
+        """Restart session from checkpoint"""
+        
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return {"success": False, "error": "Session not found"}
+            
+        checkpoint = session.get("checkpoint")
+        if not checkpoint:
+            return {"success": False, "error": "No checkpoint"}
+            
+        # Clear current state
+        session["status"] = "restarting"
+        session["logs"].append(f"Restarting from checkpoint {checkpoint['timestamp']}")
+        
+        # Restart from checkpoint
+        if hasattr(self.kernel, 'restore_from_checkpoint'):
+            result = await self.kernel.restore_from_checkpoint(checkpoint)
+            session["status"] = "running"
+            session["restarted_at"] = time.time()
+            
+            return {"success": True, "session_id": session_id}
+            
+        return {"success": False, "error": "Restart not supported"}
+        
+    def register_session(self, user_id: int, session_id: str):
+        """Register new session"""
+        self.active_sessions[session_id] = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "status": "starting",
+            "current_step": None,
+            "completed_steps": [],
+            "logs": [],
+            "artifacts": [],
+            "progress": 0,
+            "created_at": time.time()
+        }
+        
+    def get_session_status(self, session_id: str) -> Dict:
+        """Get session status"""
+        session = self.active_sessions.get(session_id, {})
+        return {
+            "session_id": session_id,
+            "status": session.get("status"),
+            "progress": session.get("progress"),
+            "steps_completed": len(session.get("completed_steps", []))
+        }
+
+
