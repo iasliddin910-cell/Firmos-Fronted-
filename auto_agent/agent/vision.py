@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 try:
     from PIL import Image
     PIL_AVAILABLE = True
-except:
+except ImportError:
     PIL_AVAILABLE = False
     logger.warning("PIL not available - some features disabled")
 
@@ -40,7 +40,7 @@ except:
 try:
     import pytesseract
     OCR_AVAILABLE = True
-except:
+except ImportError:
     OCR_AVAILABLE = False
     logger.warning("pytesseract not available - OCR fallback disabled")
 
@@ -52,11 +52,27 @@ class ScreenState:
         self.last_analysis: Optional[str] = None
         self.elements: List[Dict] = []
         self.text_content: List[str] = []
+        # Enhanced: Track visual states
+        self.color_palette: Dict[str, Any] = {}
+        self.layout_structure: Dict[str, Any] = {}
+        self.component_states: Dict[str, str] = {}
+        self.history: List[Dict] = []  # Track state changes
     
     def update(self, screenshot_path: str, analysis: str, elements: List[Dict]):
         self.last_screenshot = screenshot_path
         self.last_analysis = analysis
         self.elements = elements
+    
+    def add_to_history(self, state_type: str, data: Dict):
+        """Add state to history for tracking changes"""
+        self.history.append({
+            "type": state_type,
+            "data": data,
+            "timestamp": __import__('datetime').datetime.now().isoformat()
+        })
+        # Keep only last 10 states
+        if len(self.history) > 10:
+            self.history = self.history[-10:]
 
 
 class VisionSystem:
@@ -336,6 +352,229 @@ If not found, return: {{"found": false}}"""
         except Exception as e: logger.warning(f"Exception: {e}")
         
         return {"confidence": 0, "reasoning": analysis}
+    
+    # ==================== ENHANCED: SEMANTIC UI VERIFICATION ====================
+    
+    def verify_visual_state(self, expected_state: Dict[str, Any], 
+                           strict: bool = False) -> Dict[str, Any]:
+        """
+        Verify visual UI state - works with textless/visual-only UIs
+        
+        Args:
+            expected_state: Dict with expected visual properties
+            strict: If True, all properties must match exactly
+        
+        Returns:
+            Dict with verification results including confidence score
+        """
+        try:
+            # Get current screenshot
+            if not self.screen_state.last_screenshot:
+                # Take new screenshot
+                from agent.tools import ToolsEngine
+                tools = ToolsEngine()
+                tools.take_screenshot()
+            
+            # Analyze visual elements
+            analysis = self.analyze_screenshot(
+                prompt=f"""Analyze this UI screen for visual state verification. Check for:
+                1. Color scheme and dominant colors
+                2. Layout structure (header, sidebar, content, footer)
+                3. Visual indicators (enabled/disabled states, active/inactive)
+                4. Icon states and visual feedback
+                5. Loading states or animations
+                6. Error/success visual indicators
+                
+                Return a JSON object with these properties found on screen."""
+            )
+            
+            # Compare with expected
+            matches = {}
+            overall_confidence = 0.0
+            
+            for key, expected_value in expected_state.items():
+                if key.lower() in analysis.lower():
+                    matches[key] = True
+                    overall_confidence += 1
+                else:
+                    matches[key] = False
+            
+            if expected_state:
+                overall_confidence = (overall_confidence / len(expected_state)) * 100
+            
+            return {
+                "verified": overall_confidence >= 70,
+                "confidence": overall_confidence,
+                "matches": matches,
+                "analysis": analysis,
+                "expected": expected_state
+            }
+        
+        except Exception as e:
+            return {
+                "verified": False,
+                "confidence": 0,
+                "error": str(e)
+            }
+    
+    def detect_ui_component_states(self) -> Dict[str, Any]:
+        """
+        Detect all UI component states (buttons, inputs, toggles, etc.)
+        Works without text - uses visual indicators
+        """
+        try:
+            analysis = self.analyze_screenshot(
+                prompt="""Analyze and identify ALL UI components with their visual states:
+                - Buttons: enabled, disabled, hovered, pressed
+                - Inputs: empty, filled, focused, error, disabled
+                - Toggles/Checkboxes: on, off, indeterminate
+                - Dropdowns: open, closed, with selected item
+                - Progress indicators: loading, complete, error
+                - Navigation: active tab, inactive, hover
+                - Modals: visible, hidden, overlay
+                
+                Return detailed state information for each component found."""
+            )
+            
+            # Update component states
+            self.screen_state.component_states = {"raw_analysis": analysis}
+            
+            return {
+                "states": analysis,
+                "component_count": analysis.count("\n") + 1
+            }
+        
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def verify_interaction_result(self, action: str, 
+                                 expected_visual_change: str) -> Dict[str, Any]:
+        """
+        Verify that an interaction produced the expected visual result
+        
+        This is crucial for textless UIs where we can't check text content
+        """
+        try:
+            # Take screenshot before (if available)
+            before_screenshot = self.screen_state.last_screenshot
+            
+            # Get analysis after action
+            after_analysis = self.analyze_screenshot(
+                prompt=f"""After performing '{action}', analyze the visual changes:
+                1. Did the expected change occur?
+                2. What visual indicators show success/failure?
+                3. Are there any new elements or changes in layout?
+                4. Any visual feedback (animations, color changes)?
+                
+                Compare with: {expected_visual_change}"""
+            )
+            
+            # Check if expected change is mentioned
+            success = expected_visual_change.lower() in after_analysis.lower()
+            
+            result = {
+                "action": action,
+                "expected": expected_visual_change,
+                "actual_visual": after_analysis,
+                "verified": success,
+                "confidence": 90 if success else 30
+            }
+            
+            # Add to history
+            self.screen_state.add_to_history("interaction", result)
+            
+            return result
+        
+        except Exception as e:
+            return {
+                "action": action,
+                "verified": False,
+                "error": str(e)
+            }
+    
+    def detect_accessibility_tree(self) -> Dict[str, Any]:
+        """
+        Extract accessibility tree structure for better element identification
+        """
+        try:
+            analysis = self.analyze_screenshot(
+                prompt="""Create an accessibility tree representation of this UI:
+                - List all interactive elements (buttons, links, inputs)
+                - Group elements by containers (forms, lists, menus)
+                - Identify focus order and tab navigation
+                - Note any accessibility labels or ARIA attributes visible
+                
+                Format as a hierarchical tree structure."""
+            )
+            
+            return {
+                "accessibility_tree": analysis,
+                "timestamp": __import__('datetime').datetime.now().isoformat()
+            }
+        
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def analyze_layout_structure(self) -> Dict[str, Any]:
+        """
+        Analyze page layout structure visually
+        """
+        try:
+            analysis = self.analyze_screenshot(
+                prompt="""Analyze the layout structure of this screen:
+                1. Identify main containers (header, sidebar, main content, footer)
+                2. Determine grid/flex layout patterns
+                3. Note responsive behavior indicators
+                4. Identify content sections and their relationships
+                
+                Return structured layout information."""
+            )
+            
+            # Update layout structure
+            self.screen_state.layout_structure = {"raw": analysis}
+            
+            return {
+                "layout": analysis,
+                "structure": self.screen_state.layout_structure
+            }
+        
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def compare_visual_states(self, state1_label: str, state2_label: str) -> Dict[str, Any]:
+        """
+        Compare two saved visual states
+        
+        Args:
+            state1_label: Label for first state
+            state2_label: Label for second state
+        """
+        try:
+            # Get states from history
+            state1_data = None
+            state2_data = None
+            
+            for item in self.screen_state.history:
+                if item["type"] == "interaction" and item["data"].get("action") == state1_label:
+                    state1_data = item["data"]
+                if item["type"] == "interaction" and item["data"].get("action") == state2_label:
+                    state2_data = item["data"]
+            
+            if not state1_data or not state2_data:
+                return {"error": "States not found in history"}
+            
+            # Compare
+            return {
+                "state1": state1_data,
+                "state2": state2_data,
+                "differences": {
+                    "verified_changed": state1_data.get("verified") != state2_data.get("verified"),
+                    "confidence_diff": abs(state1_data.get("confidence", 0) - state2_data.get("confidence", 0))
+                }
+            }
+        
+        except Exception as e:
+            return {"error": str(e)}
 
 
 # Global instance
