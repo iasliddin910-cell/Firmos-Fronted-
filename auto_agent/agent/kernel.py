@@ -52,6 +52,9 @@ from pathlib import Path
 import uuid
 import traceback
 
+# Import new Multi-Agent Coordinator
+from agent.multi_agent_coordinator import MultiAgentCoordinator as NewMultiAgentCoordinator
+
 logger = logging.getLogger(__name__)
 
 
@@ -2485,7 +2488,11 @@ class CentralKernel:
         self.scheduler = Scheduler()
         self.verifier = VerificationEngine(tools_engine)
         self.critic = CriticEngine(api_key)
-        self.coordinator = MultiAgentCoordinator(api_key, tools_engine)
+        
+        # Use NEW Multi-Agent Coordinator with 6 full workers
+        logger.info("🤖 Initializing NEW Multi-Agent Coordinator with 6 workers...")
+        self.coordinator = NewMultiAgentCoordinator(api_key, tools_engine)
+        
         self.artifacts = ArtifactCollector()
         self.telemetry = Telemetry()
         
@@ -2571,8 +2578,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         
         # Enhanced fallback planner
         return self._heuristic_planner(message)
-    
-        def _parse_llm_plan(self, response: str) -> List[Task]:
+    def _parse_llm_plan(self, response: str) -> List[Task]:
         """
         STRICT JSON PARSING - No1-grade governed.
         
@@ -3037,7 +3043,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             logger.error(f"❌ Task validation FAILED: {len(invalid_tasks)}/{total_tasks} tasks invalid")
             logger.error(f"   Validation counters: {task_validation_counters}")
             for inv in invalid_tasks:
-                logger.error(f"   Task {inv['index']}: fields={inv['failed_fields]}, reason={inv['parse_reason']}, errors={inv['errors']}")
+                logger.error("   Task {}: fields={}, reason={}, errors={}".format(inv["index"], inv["failed_fields"], inv["parse_reason"], inv["errors"]))
         
         # Calculate planner quality metrics
         success_rate = (len(tasks) / total_tasks * 100) if total_tasks > 0 else 0
@@ -3717,8 +3723,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         except Exception:
             return {}
     
-        def _select_tool_strict(
-        self,
+            return {}
+    def _select_tool_strict(
         task: Task,
         required_tools: List[str],
         task_meta: Dict,
@@ -3983,7 +3989,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         if s == 'denied': return await self._handle_approval_denied(task, approval_result)
         if s == 'expired': return await self._handle_approval_expired(task, approval_result)
         return {'action': 'abort', 'task_id': task.id, 'error': 'unknown'}
-def _setup_sandbox(self, tool_name: str, sandbox_mode: str) -> bool:
+    def _setup_sandbox(self, tool_name: str, sandbox_mode: str) -> bool:
         """
         STRICT Sandbox Setup.
         
@@ -4004,12 +4010,12 @@ def _setup_sandbox(self, tool_name: str, sandbox_mode: str) -> bool:
             elif sandbox_mode == 'advanced':
                 # Minimal restrictions (for trusted operations)
                 pass
-            
+
             return True
         except Exception as e:
             logger.error(f"Sandbox setup failed: {e}")
             return False
-    
+
     async def _execute_tool_strict(
         self, 
         task: Task, 
