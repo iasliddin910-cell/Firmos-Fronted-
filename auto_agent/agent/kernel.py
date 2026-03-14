@@ -3986,7 +3986,35 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         finally:
             self.state = KernelState.ACTING
     
-    def _setup_sandbox(self, tool_name: str, sandbox_mode: str) -> bool:
+    
+    # ==================== APPROVAL RECOVERY STRATEGIES ====================
+    
+    async def _handle_approval_granted(self, task: Task, approval_result: Dict) -> Dict:
+        logger.info(f"Approval GRANTED for task {task.id}, resuming")
+        return {'action': 'resume', 'task_id': task.id, 'can_retry': True, 'rollback_required': False}
+    
+    async def _handle_approval_denied(self, task: Task, approval_result: Dict) -> Dict:
+        logger.warning(f"Approval DENIED for task {task.id}")
+        alt = (task.input_data or {}).get('alternate_tool')
+        if alt:
+            return {'action': 'alternate_tool', 'task_id': task.id, 'alternate_tool': alt, 'can_retry': False}
+        return {'action': 'abort', 'task_id': task.id, 'error': 'approval_denied', 'can_retry': False}
+    
+    async def _handle_approval_expired(self, task: Task, approval_result: Dict) -> Dict:
+        logger.warning(f"Approval EXPIRED for task {task.id}")
+        retry = (task.retry_count or 0) + 1
+        maxr = task.max_retries or 3
+        if retry <= maxr:
+            return {'action': 'retry_approval', 'task_id': task.id, 'retry_count': retry, 'can_retry': True}
+        return {'action': 'safe_abort', 'task_id': task.id, 'error': 'approval_expired', 'rollback_required': True}
+    
+    async def _execute_approval_recovery(self, task: Task, approval_result: Dict) -> Dict:
+        s = approval_result.get('status', 'unknown')
+        if s == 'approved': return await self._handle_approval_granted(task, approval_result)
+        if s == 'denied': return await self._handle_approval_denied(task, approval_result)
+        if s == 'expired': return await self._handle_approval_expired(task, approval_result)
+        return {'action': 'abort', 'task_id': task.id, 'error': 'unknown'}
+def _setup_sandbox(self, tool_name: str, sandbox_mode: str) -> bool:
         """
         STRICT Sandbox Setup.
         
