@@ -1506,6 +1506,36 @@ class MultiAgentCoordinator:
             self.event_log = self.event_log[-1000:]
 
 
+
+    # ==================== STRICT RUNTIME ====================
+
+    def _is_truth(self, result): return True
+
+    async def _strict_execute(self, task):
+        """STRICT: Tool + Verifier + Artifact = Truth. NO model fallback."""
+        logger.info(f"🔒 STRICT: {task.id}")
+
+        # 1. TOOL = Truth
+        exec_result = await self._execute_tool_strict(task, task.input_data.get('tool_used',''), {})
+        if not exec_result.success:
+            return {'success': False, 'truth': 'tool_failed'}
+
+        # 2. VERIFIER = Truth (MANDATORY GATE)
+        passed = await self._verify(task, exec_result, task.input_data or {})
+        if not passed:
+            return {'success': False, 'truth': 'verifier_failed', 'gate': 'FAILED'}
+
+        # 3. ARTIFACT = Truth
+        for art in task.input_data.get('expected_artifacts', []):
+            import os
+            if not os.path.exists(str(art)):
+                return {'success': False, 'truth': 'artifact_missing', 'artifact': art}
+
+        return {'success': True, 'truth': 'tool+verifier+artifact', 'gate': 'PASSED'}
+
+    def _allow_fallback(self): return self.execution_mode != ExecutionMode.STRICT
+
+
 # ==================== TASK MANAGER ====================
 
 class TaskManager:
