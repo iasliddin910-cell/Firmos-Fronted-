@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 try:
     from sentence_transformers import SentenceTransformer
     EMBEDDINGS_AVAILABLE = True
-except:
+except Exception as e:
     EMBEDDINGS_AVAILABLE = False
     logger.warning("sentence-transformers not available - using simple search")
 
@@ -315,7 +315,7 @@ class VectorMemory:
                 if f.exists()
             )
             size_mb = total_size / (1024 * 1024)
-        except:
+        except Exception as e:
             size_mb = 0
         
         return f"""💾 **Xotira Statistikasi:**
@@ -648,3 +648,187 @@ def get_agent_state_memory(data_dir: Path = None):
     if _state_memory is None:
         _state_memory = AgentStateMemory(data_dir)
     return _state_memory
+
+# ==================== ENHANCED PROCEDURAL MEMORY ====================
+
+class ProceduralMemory:
+    """
+    Enhanced procedural memory with 4-layer architecture:
+    - Working: current task context
+    - Episodic: failed/success experiences
+    - - Semantic: general knowledge
+    - Procedural: learned procedures
+    """
+    
+    def __init__(self, storage_dir: str = "data/memory"):
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 4 Layers
+        self.working = WorkingMemory()
+        self.episodic = EpisodicMemory()
+        self.semantic = SemanticMemory()
+        self.procedural = ProceduralStore()
+        
+    def store_task_context(self, task_id: str, context: Dict):
+        """Store working memory for current task"""
+        self.working.store(task_id, context)
+        
+    def record_episode(self, episode: Dict):
+        """Record an episodic memory (success/failure)"""
+        self.episodic.store(episode)
+        
+    def store_knowledge(self, key: str, value: Any):
+        """Store semantic knowledge"""
+        self.semantic.store(key, value)
+        
+    def store_procedure(self, name: str, steps: List[Dict]):
+        """Store a procedure"""
+        self.procedural.store(name, steps)
+        
+    def get_relevant(self, query: str) -> List[Dict]:
+        """Get relevant memories from all layers"""
+        results = []
+        results.extend(self.working.search(query))
+        results.extend(self.episodic.search(query))
+        results.extend(self.semantic.search(query))
+        results.extend(self.procedural.search(query))
+        return results
+
+
+class WorkingMemory:
+    """Layer 1: Current task context"""
+    
+    def __init__(self):
+        self.contexts = {}
+        
+    def store(self, task_id: str, context: Dict):
+        self.contexts[task_id] = {
+            "context": context,
+            "timestamp": time.time()
+        }
+        
+    def get(self, task_id: str) -> Optional[Dict]:
+        return self.contexts.get(task_id)
+        
+    def search(self, query: str) -> List[Dict]:
+        # Search in current working contexts
+        results = []
+        for task_id, data in self.contexts.items():
+            if query.lower() in str(data["context"]).lower():
+                results.append({"type": "working", "task_id": task_id, "data": data})
+        return results
+
+
+class EpisodicMemory:
+    """Layer 2: Failed/success experiences"""
+    
+    def __init__(self):
+        self.episodes = []
+        self.failed_patches = []
+        self.tool_reliability = defaultdict(lambda: {"success": 0, "failure": 0})
+        self.recovery_history = []
+        
+    def store(self, episode: Dict):
+        self.episodes.append(episode)
+        # Keep last 1000
+        if len(self.episodes) > 1000:
+            self.episodes = self.episodes[-1000:]
+            
+    def record_failed_patch(self, patch_info: Dict):
+        """Record a failed patch for learning"""
+        self.failed_patches.append({
+            **patch_info,
+            "timestamp": time.time()
+        })
+        
+    def record_tool_use(self, tool_name: str, success: bool):
+        """Record tool reliability"""
+        if success:
+            self.tool_reliability[tool_name]["success"] += 1
+        else:
+            self.tool_reliability[tool_name]["failure"] += 1
+            
+    def get_tool_reliability(self, tool_name: str) -> float:
+        """Get tool reliability score"""
+        stats = self.tool_reliability[tool_name]
+        total = stats["success"] + stats["failure"]
+        return stats["success"] / total if total > 0 else 0.5
+        
+    def search(self, query: str) -> List[Dict]:
+        results = []
+        for ep in self.episodes[-100:]:
+            if query.lower() in str(ep).lower():
+                results.append({"type": "episodic", "data": ep})
+        return results
+
+
+class SemanticMemory:
+    """Layer 3: General knowledge"""
+    
+    def __init__(self):
+        self.knowledge = {}
+        
+    def store(self, key: str, value: Any):
+        self.knowledge[key] = {
+            "value": value,
+            "timestamp": time.time()
+        }
+        
+    def get(self, key: str) -> Optional[Any]:
+        return self.knowledge.get(key, {}).get("value")
+        
+    def search(self, query: str) -> List[Dict]:
+        results = []
+        for key, data in self.knowledge.items():
+            if query.lower() in key.lower() or query.lower() in str(data["value"]).lower():
+                results.append({"type": "semantic", "key": key, "data": data})
+        return results
+
+
+class ProceduralStore:
+    """Layer 4: Learned procedures"""
+    
+    def __init__(self):
+        self.procedures = {}
+        self.benchmark_history = []
+        self.approval_history = []
+        
+    def store(self, name: str, steps: List[Dict]):
+        self.procedures[name] = {
+            "steps": steps,
+            "timestamp": time.time(),
+            "usage_count": 0
+        }
+        
+    def get(self, name: str) -> Optional[Dict]:
+        if name in self.procedures:
+            self.procedures[name]["usage_count"] += 1
+        return self.procedures.get(name)
+        
+    def record_benchmark(self, benchmark_info: Dict):
+        """Record benchmark result"""
+        self.benchmark_history.append({
+            **benchmark_info,
+            "timestamp": time.time()
+        })
+        
+    def record_approval(self, approval_info: Dict):
+        """Record approval decision"""
+        self.approval_history.append({
+            **approval_info,
+            "timestamp": time.time()
+        })
+        
+    def search(self, query: str) -> List[Dict]:
+        results = []
+        for name, data in self.procedures.items():
+            if query.lower() in name.lower():
+                results.append({"type": "procedural", "name": name, "data": data})
+        return results
+
+
+# Add imports
+import time
+from collections import defaultdict
+
