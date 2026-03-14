@@ -2335,6 +2335,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                             'success': False,
                             'reason': 'json_decode_error',
                             'error': str(e),
+                            'snippet': response[:200],
                             'time_ms': (time.time() - start_time) * 1000
                         })
                 else:
@@ -2346,12 +2347,13 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     })
                     
             except Exception as e:
-                logger.warning(f"Strategy {strategy_name} failed with exception: {e}")
+                logger.warning(f"Strategy {strategy_name} failed with exception: {e}. Response snippet: {response[:200]}")
                 parsing_attempts.append({
                     'strategy': strategy_name,
                     'success': False,
                     'reason': 'exception',
                     'error': str(e),
+                            'snippet': response[:200],
                     'time_ms': (time.time() - start_time) * 1000
                 })
         
