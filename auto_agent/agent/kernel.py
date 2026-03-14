@@ -2625,11 +2625,17 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             parse_diagnostics["has_prose"] = True
             logger.warning("⚠️ LLM response contains prose, not JSON - HIGH RISK")
 
-        # STRICT parsing strategies
+        # STRICT parsing strategies (8 strategies for robustness)
+        # Added: markdown_code_block, line_by_line, nested_json, fix_common_errors, prose_fallback
         parsing_strategies = [
             {'name': 'tasks_key_object', 'pattern': r'\{[^{}]*"tasks"\s*:\s*\[', 'try_extract': lambda: re.search(r'\{[^{}]*"tasks"\s*:\s*\[.*\]', response, re.DOTALL)},
             {'name': 'array_with_description', 'pattern': r'\[.*"description".*\]', 'try_extract': lambda: re.search(r'\[.*"description".*\]', response)},
             {'name': 'brackets_balanced', 'pattern': 'any', 'try_extract': lambda: self._extract_balanced_brackets(response)},
+            {'name': 'markdown_code_block', 'pattern': r'```json.*?```', 'try_extract': lambda: re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)},
+            {'name': 'line_by_line', 'pattern': 'any', 'try_extract': lambda: self._extract_tasks_line_by_line(response)},
+            {'name': 'nested_json', 'pattern': r'\{.*\{.*\}.*\}', 'try_extract': lambda: self._extract_nested_json(response)},
+            {'name': 'fix_common_errors', 'pattern': 'any', 'try_extract': lambda: self._fix_and_extract_json(response)},
+            {'name': 'prose_fallback', 'pattern': 'any', 'try_extract': lambda: self._extract_from_prose(response)},
         ]
 
         for strategy in parsing_strategies:
@@ -2841,6 +2847,119 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         
         return None
     
+
+    def _extract_tasks_line_by_line(self, text: str) -> Optional[re.Match]:
+        """Extract tasks from text line by line - handles mixed prose + JSON"""
+        import re
+        
+        lines = text.split('\n')
+        tasks = []
+        current_task = {}
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Look for task-like patterns
+            # Pattern 1: "1. task description" or "- task description"
+            task_match = re.match(r'^\d+[\.\)]\s+(.+)$', line) or re.match(r'^-\s+(.+)$', line)
+            if task_match:
+                if current_task and 'description' in current_task:
+                    tasks.append(current_task)
+                current_task = {'description': task_match.group(1)}
+                
+            # Pattern 2: JSON-like fields
+            json_match = re.match(r'^"(\w+)":\s*"(.+)"', line)
+            if json_match and current_task:
+                key, value = json_match.groups()
+                current_task[key] = value
+        
+        # Add last task
+        if current_task and 'description' in current_task:
+            tasks.append(current_task)
+        
+        if tasks:
+            return re.match(r'\[[\s\S]*\]', json.dumps({'tasks': tasks}))
+        
+        return None
+
+    def _extract_nested_json(self, text: str) -> Optional[re.Match]:
+        """Extract nested JSON structures"""
+        import re
+        
+        # Find the outermost braces
+        start = text.find('{')
+        if start == -1:
+            return None
+        
+        # Try to find balanced JSON with nested objects
+        depth = 0
+        for i, char in enumerate(text[start:], start):
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i+1]
+                    # Try to parse
+                    try:
+                        parsed = json.loads(candidate)
+                        # Check if it has tasks or looks like a plan
+                        if 'tasks' in parsed or isinstance(parsed, list):
+                            return re.match(r'\{[\s\S]*\}', candidate)
+                    except:
+                        pass
+        
+        return None
+
+    def _fix_and_extract_json(self, text: str) -> Optional[re.Match]:
+        """Fix common JSON errors and extract"""
+        import re
+        
+        # Fix common errors:
+        # 1. Trailing commas: ,} or ,]
+        text = re.sub(r',(\s*[\]}])', r'\1', text)
+        # 2. Single quotes to double quotes
+        text = re.sub(r"'([\w\s]+)'", r'"\1"', text)
+        # 3. Missing quotes around keys
+        text = re.sub(r'(\w+):', r'"\1":', text)
+        # 4. JavaScript comments
+        text = re.sub(r'//.*$', '', text, flags=re.MULTILINE)
+        
+        # Try to find JSON
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            try:
+                json.loads(json_match.group())
+                return json_match
+            except:
+                pass
+        
+        return None
+
+    def _extract_from_prose(self, text: str) -> Optional[re.Match]:
+        """Extract tasks from prose descriptions - last resort"""
+        import re
+        
+        # This is a last-resort fallback
+        # Look for numbered lists or bullet points in prose
+        tasks = []
+        
+        # Pattern: "Step 1:", "1)", "-", "*"
+        step_pattern = re.compile(r'(?:Step\s*\d+|\d+\))\s*(.+?)(?=(?:Step\s*\d+|\d+\)|\n\s*\n|$))', re.IGNORECASE)
+        
+        for match in step_pattern.finditer(text):
+            desc = match.group(1).strip()
+            if len(desc) > 10:  # Reasonable task length
+                tasks.append({'description': desc[:200]})  # Truncate long descriptions
+        
+        if tasks:
+            return re.match(r'\[[\s\S]*\]', json.dumps({'tasks': tasks}))
+        
+        return None
+
+
     def _validate_plan_schema(self, data: Any) -> Dict:
         """
         Validate plan data against expected schema.
