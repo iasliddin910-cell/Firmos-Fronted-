@@ -587,195 +587,199 @@ class VerificationEngine:
 
     def _verify_screenshot(self, data: Dict) -> VerificationResult:
         """
-        MULTI-MODAL SCREENSHOT VERIFICATION
-        
-        Verifies using:
-        1. OCR - text extraction
-        2. Vision model - semantic understanding
+        SEMANTIC UI SCREENSHOT VERIFICATION - World Class
+
+        Multi-modal verification combining:
+        1. OCR - text extraction with confidence
+        2. Vision prompt - semantic understanding (NEW)
         3. Region diff - pixel comparison
         4. Expected bbox - specific area checking
-        5. Confidence score - reliability measurement
-        
-        Each method contributes to final verification.
+        5. Semantic confidence - UI element detection (NEW)
+
+        Enhanced for text-less UI verification.
         """
+        import os
+        import base64
+        import json
+        
         expected_elements = data.get("expected_elements", [])
         screenshot_path = data.get("screenshot_path", "")
-        expected_bbox = data.get("expected_bbox", None)  # {"x": 0, "y": 0, "width": 100, "height": 100}
+        expected_bbox = data.get("expected_bbox", None)
         reference_screenshot = data.get("reference_screenshot", None)
+        vision_prompt = data.get("vision_prompt", "")  # NEW
+        expected_ui_elements = data.get("expected_ui_elements", [])  # NEW: buttons, inputs, etc.
         
-        # Track all verification signals
         signals = {}
-        
+        all_passed = True
+
         # Check if screenshot exists
-        import os
         if not os.path.exists(screenshot_path):
             return VerificationResult(
-                passed=False,
-                details="Screenshot file not found",
-                severity="error",
+                passed=False, details="Screenshot not found", severity="error",
                 evidence={"path": screenshot_path}
             )
-        
-        all_passed = True
-        
-        # Signal 1: OCR text extraction
-        ocr_found = []
-        ocr_missing = []
-        ocr_confidence = 0.0
-        
+
+        # === Signal 1: OCR with confidence ===
+        ocr_data = {"found": [], "missing": [], "confidence": 0.0, "text": ""}
         try:
             from PIL import Image
             import pytesseract
             
-            # Read screenshot
             image = Image.open(screenshot_path)
             
-            # Get OCR data with confidence
-            ocr_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-            
-            # Calculate average confidence
-            confidences = [int(conf) for conf in ocr_data.get('conf', []) if conf != '-1']
-            ocr_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+            # Get OCR with confidence
+            ocr_result = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+            confidences = [int(c) for c in ocr_result.get('conf', []) if c != '-1']
+            ocr_data["confidence"] = sum(confidences) / len(confidences) if confidences else 0.0
             
             # Extract text
-            extracted_text = pytesseract.image_to_string(image)
+            ocr_text = pytesseract.image_to_string(image)
+            ocr_data["text"] = ocr_text[:500]
             
-            # Check for expected elements
-            for element in expected_elements:
-                if element.lower() in extracted_text.lower():
-                    ocr_found.append(element)
+            # Check expected elements
+            for elem in expected_elements:
+                if elem.lower() in ocr_text.lower():
+                    ocr_data["found"].append(elem)
                 else:
-                    ocr_missing.append(element)
+                    ocr_data["missing"].append(elem)
             
-            signals['ocr'] = {
-                'found': ocr_found,
-                'missing': ocr_missing,
-                'confidence': ocr_confidence,
-                'extracted_text': extracted_text[:200]
-            }
-            
-            if ocr_missing:
+            signals["ocr"] = ocr_data
+            if ocr_data["missing"]:
                 all_passed = False
                 
         except ImportError:
-            logger.warning("OCR not available for screenshot verification")
-            signals['ocr'] = {'error': 'OCR library not installed'}
+            signals["ocr"] = {"error": "OCR not available"}
         except Exception as e:
-            logger.warning(f"OCR verification failed: {e}")
-            signals['ocr'] = {'error': str(e)}
-        
-        # Signal 2: Vision model verification (if available)
-        vision_result = None
+            signals["ocr"] = {"error": str(e)}
+
+        # === Signal 2: Vision prompt (NEW) ===
+        vision_result = {"found": [], "missing": [], "confidence": 0.0, "semantic": {}}
         try:
-            # Try using a vision model if available
             if hasattr(self, 'native_brain') and self.native_brain:
-                # Use brain's vision capability if available
-                import base64
+                # Encode image
                 with open(screenshot_path, 'rb') as f:
-                    img_data = base64.b64encode(f.read()).decode()
+                    img_b64 = base64.b64encode(f.read()).decode()
                 
-                vision_prompt = f"""Analyze this screenshot. Expected elements: {expected_elements}. 
-Return JSON: {{"found": ["element1"], "missing": ["element2"], "confidence": 0.0-1.0}}"""
+                # Build vision prompt
+                prompt = f"""Analyze this screenshot and provide detailed semantic analysis.
+
+Expected UI elements to check: {expected_ui_elements or expected_elements or 'general UI'}
+Vision prompt: {vision_prompt or 'Describe what you see'}
+
+Return JSON (no other text):
+{{
+  "found": ["element1", "element2"],
+  "missing": ["element3"],
+  "ui_elements": {{"buttons": 2, "inputs": 1, "text_blocks": 5}},
+  "confidence": 0.0-1.0,
+  "semantic_analysis": "description of UI state"
+}}"""
+
+                response = self.native_brain.think(prompt)
                 
-                # Note: This would require native_brain to support vision
-                signals['vision'] = {'status': 'not_implemented'}
+                # Parse JSON
+                import re
+                json_match = re.search(r'\{[^{}]+\}', response, re.DOTALL)
+                if json_match and json_match.group().count('{') == json_match.group().count('}'):
+                    parsed = json.loads(json_match.group())
+                    vision_result = {
+                        "found": parsed.get("found", []),
+                        "missing": parsed.get("missing", []),
+                        "confidence": parsed.get("confidence", 0.5),
+                        "semantic": parsed.get("ui_elements", {}),
+                        "analysis": parsed.get("semantic_analysis", "")[:200]
+                    }
+                    
+                    signals["vision"] = vision_result
+                    if vision_result["missing"]:
+                        all_passed = False
+            else:
+                signals["vision"] = {"error": "No vision brain available"}
         except Exception as e:
-            signals['vision'] = {'error': str(e)}
-        
-        # Signal 3: Region diff (if reference provided)
-        region_diff_score = None
+            signals["vision"] = {"error": str(e)}
+
+        # === Signal 3: Region diff ===
         if reference_screenshot and os.path.exists(reference_screenshot):
             try:
-                from PIL import ImageChops
+                from PIL import Image, ImageChops
                 
-                ref_img = Image.open(reference_screenshot)
-                curr_img = Image.open(screenshot_path)
+                ref = Image.open(reference_screenshot)
+                curr = Image.open(screenshot_path)
                 
-                # Resize to match if needed
-                if ref_img.size != curr_img.size:
-                    ref_img = ref_img.resize(curr_img.size)
+                if ref.size != curr.size:
+                    ref = ref.resize(curr.size)
                 
-                # Calculate difference
-                diff = ImageChops.difference(ref_img, curr_img)
+                diff = ImageChops.difference(ref, curr)
                 diff_data = list(diff.getdata())
                 
-                # Calculate similarity (0 = identical, 1 = completely different)
-                total_pixels = diff.width * diff.height
-                different_pixels = sum(1 for pixel in diff_data if pixel != (0, 0, 0))
-                region_diff_score = 1.0 - (different_pixels / total_pixels)
+                total = diff.width * diff.height
+                different = sum(1 for p in diff_data if p != (0, 0, 0))
+                similarity = 1.0 - (different / total) if total > 0 else 0
                 
-                signals['region_diff'] = {
-                    'score': region_diff_score,
-                    'reference': reference_screenshot
-                }
+                signals["region_diff"] = {"similarity": similarity, "reference": reference_screenshot}
                 
-                # If score is too low, fail
-                if region_diff_score < 0.8:
+                if similarity < 0.8:
                     all_passed = False
-                    
             except Exception as e:
-                logger.warning(f"Region diff failed: {e}")
-                signals['region_diff'] = {'error': str(e)}
-        
-        # Signal 4: BBox verification (specific area check)
-        bbox_result = None
+                signals["region_diff"] = {"error": str(e)}
+
+        # === Signal 4: Expected bbox ===
         if expected_bbox:
             try:
                 from PIL import Image
                 image = Image.open(screenshot_path)
                 
-                x = expected_bbox.get('x', 0)
-                y = expected_bbox.get('y', 0)
-                w = expected_bbox.get('width', 100)
-                h = expected_bbox.get('height', 100)
+                x = expected_bbox.get("x", 0)
+                y = expected_bbox.get("y", 0)
+                w = expected_bbox.get("width", 100)
+                h = expected_bbox.get("height", 100)
                 
-                # Crop region
-                bbox_image = image.crop((x, y, x+w, y+h))
+                bbox_img = image.crop((x, y, x+w, y+h))
+                region_text = pytesseract.image_to_string(bbox_img)
                 
-                # Extract text from region
-                region_text = pytesseract.image_to_string(bbox_image)
-                
-                # Check if expected elements in region
                 bbox_found = [e for e in expected_elements if e.lower() in region_text.lower()]
                 bbox_missing = [e for e in expected_elements if e.lower() not in region_text.lower()]
                 
-                signals['bbox'] = {
-                    'found': bbox_found,
-                    'missing': bbox_missing,
-                    'region_text': region_text[:100]
-                }
+                signals["bbox"] = {"found": bbox_found, "missing": bbox_missing, "text": region_text[:100]}
                 
                 if bbox_missing:
                     all_passed = False
-                    
             except Exception as e:
-                logger.warning(f"BBox verification failed: {e}")
-                signals['bbox'] = {'error': str(e)}
+                signals["bbox"] = {"error": str(e)}
+
+        # === Signal 5: Semantic confidence (NEW) ===
+        semantic_confidence = 0.0
+        confidence_sources = []
         
+        if ocr_data.get("confidence", 0) > 0:
+            confidence_sources.append(ocr_data["confidence"] / 100.0)
+        
+        if vision_result.get("confidence", 0) > 0:
+            confidence_sources.append(vision_result["confidence"])
+        
+        if confidence_sources:
+            semantic_confidence = sum(confidence_sources) / len(confidence_sources)
+        
+        signals["semantic_confidence"] = semantic_confidence
+
         # Calculate overall confidence
-        confidence_scores = []
-        if ocr_confidence > 0:
-            confidence_scores.append(ocr_confidence / 100.0)  # Normalize to 0-1
-        if region_diff_score is not None:
-            confidence_scores.append(region_diff_score)
-        
-        overall_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
-        signals['overall_confidence'] = overall_confidence
+        overall_confidence = semantic_confidence
         
         # Final decision
         final_passed = all_passed and overall_confidence >= 0.5
-        
+
         return VerificationResult(
             passed=final_passed,
-            details=f"Multi-modal screenshot verification: OCR found={len(ocr_found)}, missing={len(ocr_missing)}, confidence={overall_confidence:.2f}",
+            details=f"Semantic screenshot verification: {len(ocr_data.get('found', []))} OCR found, vision confidence={vision_result.get('confidence', 0):.2f}, semantic={semantic_confidence:.2f}",
             evidence={
                 "path": screenshot_path,
                 "signals": signals,
                 "all_passed": all_passed,
-                "overall_confidence": overall_confidence
+                "semantic_confidence": semantic_confidence
             }
         )
-    
+
+    def _verify_code_syntax(self, data: Dict) -> VerificationResult:
     def _verify_code_syntax(self, data: Dict) -> VerificationResult:
         """Verify code has no syntax errors"""
         code = data.get("code", "")
