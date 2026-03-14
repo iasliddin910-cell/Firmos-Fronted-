@@ -6025,3 +6025,137 @@ def _get_recovery_hint(parsing_attempts: List[Dict]) -> str:
         return "No JSON found in response - model returned prose instead of JSON"
     else:
         return "Multiple parse failures - simplify response format"
+
+# ==================== COMPREHENSIVE RECOVERY ENGINE ====================
+
+class RecoveryStrategy(Enum):
+    """All recovery strategies - executed in priority order"""
+    REQUEUE = "requeue"           # Put back in queue
+    ALTERNATE_TOOL = "alternate_tool"  # Try different tool
+    ROLLBACK = "rollback"        # Revert changes
+    REPLAN = "replan"            # Re-generate plan
+    HUMAN_ESCALATION = "human"   # Call human
+    DEGRADED_MODE = "degraded"  # Reduced functionality
+    RETRY_EXHAUSTED = "exhausted"  # No more retries
+
+
+class RecoveryEngine:
+    """
+    COMPREHENSIVE RECOVERY ENGINE - No1-grade.
+    
+    Each failure triggers appropriate recovery strategy:
+    1. REQUEUE - transient failure
+    2. ALTERNATE_TOOL - tool-specific failure
+    3. ROLLBACK - state corruption
+    4. REPLAN - fundamental plan failure
+    5. DEGRADED_MODE - partial success possible
+    6. HUMAN_ESCALATION - critical failure
+    7. RETRY_EXHAUSTED - budget exhausted
+    """
+    
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.retry_budget = {}  # Per-task retry budget
+        self.max_retries = 3
+        self.rollback_stack = {}  # TaskID -> rollback actions
+    
+    async def execute_recovery(self, task: Task, failure_reason: str) -> Dict:
+        """Execute appropriate recovery strategy based on failure type"""
+        
+        # Check retry budget first
+        budget = self.retry_budget.get(task.id, 0)
+        
+        if budget >= self.max_retries:
+            return await self._retry_exhausted_recovery(task, failure_reason)
+        
+        # Map failure type to recovery strategy
+        if 'verification_failed' in failure_reason:
+            return await self._alternate_tool_recovery(task, failure_reason)
+        elif 'tool_error' in failure_reason:
+            return await self._alternate_tool_recovery(task, failure_reason)
+        elif 'timeout' in failure_reason:
+            return await self._requeue_recovery(task, failure_reason)
+        elif 'artifact_missing' in failure_reason:
+            return await self._rollback_recovery(task, failure_reason)
+        elif 'approval_denied' in failure_reason:
+            return await self._replan_recovery(task, failure_reason)
+        elif 'critical_error' in failure_reason:
+            return await self._human_escalation(task, failure_reason)
+        else:
+            return await self._degraded_mode_recovery(task, failure_reason)
+    
+    async def _requeue_recovery(self, task, reason) -> Dict:
+        """1. REQUEUE - transient failure, try again"""
+        self.retry_budget[task.id] = self.retry_budget.get(task.id, 0) + 1
+        logger.info(f"🔄 REQUEUE: {task.id} (attempt {self.retry_budget[task.id]})")
+        return {
+            'strategy': RecoveryStrategy.REQUEUE,
+            'action': 'requeue',
+            'can_continue': True,
+            'retry_count': self.retry_budget[task.id]
+        }
+    
+    async def _alternate_tool_recovery(self, task, reason) -> Dict:
+        """2. ALTERNATE_TOOL - try different tool"""
+        alt_tool = (task.input_data or {}).get('alternate_tool')
+        if alt_tool:
+            logger.info(f"🔄 ALT_TOOL: {task.id} -> {alt_tool}")
+            task.input_data['tool_used'] = alt_tool
+            return {'strategy': RecoveryStrategy.ALTERNATE_TOOL, 'action': 'alternate', 'tool': alt_tool}
+        
+        # Fallback to requeue
+        return await self._requeue_recovery(task, reason)
+    
+    async def _rollback_recovery(self, task, reason) -> Dict:
+        """3. ROLLBACK - revert changes"""
+        logger.warning(f"⏪ ROLLBACK: {task.id}")
+        # Execute rollback actions
+        rollback_actions = self.rollback_stack.get(task.id, [])
+        for action in reversed(rollback_actions):
+            try:
+                action['rollback_fn']()
+            except Exception as e:
+                logger.error(f"Rollback failed: {e}")
+        
+        return {'strategy': RecoveryStrategy.ROLLBACK, 'action': 'rolled_back', 'can_continue': False}
+    
+    async def _replan_recovery(self, task, reason) -> Dict:
+        """4. REPLAN - regenerate plan"""
+        logger.warning(f"🔄 REPLAN: {task.id}")
+        return {'strategy': RecoveryStrategy.REPLAN, 'action': 'replan', 'can_continue': True}
+    
+    async def _human_escalation(self, task, reason) -> Dict:
+        """5. HUMAN_ESCALATION - critical failure"""
+        logger.error(f"🚨 HUMAN_ESCALATION: {task.id} - {reason}")
+        return {
+            'strategy': RecoveryStrategy.HUMAN_ESCALATION,
+            'action': 'escalate',
+            'can_continue': False,
+            'reason': reason
+        }
+    
+    async def _degraded_mode_recovery(self, task, reason) -> Dict:
+        """6. DEGRADED_MODE - reduced functionality"""
+        logger.warning(f"📉 DEGRADED_MODE: {task.id}")
+        task.input_data['degraded'] = True
+        return {'strategy': RecoveryStrategy.DEGRADED_MODE, 'action': 'degraded', 'can_continue': True}
+    
+    async def _retry_exhausted_recovery(self, task, reason) -> Dict:
+        """7. RETRY_EXHAUSTED - no more budget"""
+        logger.error(f"❌ RETRY_EXHAUSTED: {task.id}")
+        return {
+            'strategy': RecoveryStrategy.RETRY_EXHAUSTED,
+            'action': 'abort',
+            'can_continue': False,
+            'budget_used': self.retry_budget.get(task.id, 0),
+            'max_retries': self.max_retries
+        }
+    
+    def record_rollback(self, task_id: str, rollback_fn):
+        """Record rollback action for later execution"""
+        if task_id not in self.rollback_stack:
+            self.rollback_stack[task_id] = []
+        self.rollback_stack[task_id].append({'rollback_fn': rollback_fn})
+
+
+
