@@ -4051,12 +4051,18 @@ Return ONLY valid JSON: {{
 
     async def _verify(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
         """
-        TASK-AWARE VERIFICATION for No1 agent.
+        TASK-AWARE VERIFICATION for No1 agent with ENHANCED diagnostics.
         
         Verifies execution result with full context:
         - task: The task being verified
         - exec_result: Real tool execution result
         - task_meta: Task metadata including verification_type, success criteria, etc.
+        
+        Enhanced features:
+        - Deep success criteria integration
+        - Strict artifact expectations matching
+        - Verifier confidence aggregation
+        - Fail reason taxonomy
         
         Verification types:
         - browser task → browser verifier
@@ -4066,18 +4072,52 @@ Return ONLY valid JSON: {{
         - file task → file existence + content verifier
         """
         
+        import time
+        import re
+        
+        verification_log = {
+            'task_id': task.id,
+            'verification_type': '',
+            'success_criteria': '',
+            'expected_artifacts': [],
+            'checks': [],
+            'confidence': 0.0,
+            'passed': False,
+            'fail_reason': None,
+            'timestamp': time.time()
+        }
+        
         if not exec_result:
-            logger.warning("Verification failed: Empty execution result")
+            verification_log['fail_reason'] = 'empty_execution_result'
+            logger.warning(f"Verification failed: Empty execution result for task {task.id}")
+            await self._emit_verification_telemetry(verification_log)
             return False
         
         verification_type = task_meta.get('verification_type', 'manual')
         success_criteria = task_meta.get('success_criteria', '')
         expected_artifacts = task_meta.get('expected_artifacts', [])
         
+        verification_log['verification_type'] = verification_type
+        verification_log['success_criteria'] = success_criteria
+        verification_log['expected_artifacts'] = expected_artifacts
+        
         # If execution itself failed, verification fails
         if not exec_result.success:
+            verification_log['fail_reason'] = 'execution_failed'
+            verification_log['checks'].append({
+                'check': 'execution_success',
+                'passed': False,
+                'detail': exec_result.error or 'Unknown error'
+            })
             logger.warning(f"Verification failed: Execution was not successful - {exec_result.error}")
+            await self._emit_verification_telemetry(verification_log)
             return False
+        
+        verification_log['checks'].append({
+            'check': 'execution_success',
+            'passed': True,
+            'detail': 'Execution completed successfully'
+        })
         
         # Check for error patterns in result (real stderr/stdout from tool)
         error_patterns = [
@@ -4091,34 +4131,319 @@ Return ONLY valid JSON: {{
         has_error = any(pattern.upper() in result_upper for pattern in error_patterns)
         
         if has_error:
+            verification_log['fail_reason'] = 'error_pattern_detected'
+            verification_log['checks'].append({
+                'check': 'error_patterns',
+                'passed': False,
+                'detail': 'Error patterns found in output'
+            })
             logger.warning(f"Verification failed: Error patterns detected in execution output")
+            await self._emit_verification_telemetry(verification_log)
             return False
+        
+        verification_log['checks'].append({
+            'check': 'error_patterns',
+            'passed': True,
+            'detail': 'No error patterns detected'
+        })
         
         # Check result is not just placeholder text (model fake)
         if result_text.startswith("Executed:") or result_text.startswith("Vazifa qabul"):
+            verification_log['fail_reason'] = 'placeholder_result'
+            verification_log['checks'].append({
+                'check': 'not_placeholder',
+                'passed': False,
+                'detail': 'Result appears to be placeholder'
+            })
             logger.warning("Verification failed: Result appears to be placeholder (model fake)")
+            await self._emit_verification_telemetry(verification_log)
             return False
         
-        # Type-specific verification
+        verification_log['checks'].append({
+            'check': 'not_placeholder',
+            'passed': True,
+            'detail': 'Result is real, not placeholder'
+        })
+        
+        # DEEP SUCCESS CRITERIA INTEGRATION
+        if success_criteria:
+            criteria_result = await self._verify_success_criteria(
+                success_criteria, exec_result, task_meta
+            )
+            verification_log['checks'].append({
+                'check': 'success_criteria',
+                'passed': criteria_result['passed'],
+                'detail': criteria_result.get('detail', ''),
+                'confidence': criteria_result.get('confidence', 0.0)
+            })
+            if not criteria_result['passed']:
+                verification_log['fail_reason'] = 'success_criteria_not_met'
+                verification_log['confidence'] = criteria_result.get('confidence', 0.0)
+                logger.warning(f"Verification failed: Success criteria not met - {criteria_result.get('detail', '')}")
+                await self._emit_verification_telemetry(verification_log)
+                return False
+        
+        # STRICT ARTIFACT EXPECTATIONS MATCHING
+        if expected_artifacts:
+            artifact_result = await self._verify_artifact_expectations(
+                expected_artifacts, exec_result, task_meta
+            )
+            verification_log['checks'].append({
+                'check': 'artifact_expectations',
+                'passed': artifact_result['passed'],
+                'detail': artifact_result.get('detail', ''),
+                'matched_artifacts': artifact_result.get('matched', []),
+                'missing_artifacts': artifact_result.get('missing', []),
+                'confidence': artifact_result.get('confidence', 0.0)
+            })
+            if not artifact_result['passed']:
+                verification_log['fail_reason'] = 'artifact_expectations_not_met'
+                verification_log['confidence'] = artifact_result.get('confidence', 0.0)
+                logger.warning(f"Verification failed: Artifact expectations not met - {artifact_result.get('detail', '')}")
+                await self._emit_verification_telemetry(verification_log)
+                return False
+        
+        # Type-specific verification with confidence aggregation
+        confidence_scores = []
+        
         if verification_type == 'browser':
-            return await self._verify_browser(task, exec_result, task_meta)
+            result = await self._verify_browser(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'browser_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
         elif verification_type == 'screenshot':
-            return await self._verify_screenshot(task, exec_result, task_meta)
+            result = await self._verify_screenshot(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'screenshot_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
         elif verification_type == 'server':
-            return await self._verify_server(task, exec_result, task_meta)
+            result = await self._verify_server(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'server_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
         elif verification_type == 'code':
-            return await self._verify_code(task, exec_result, task_meta)
+            result = await self._verify_code(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'code_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
         elif verification_type == 'file':
-            return await self._verify_file(task, exec_result, task_meta)
+            result = await self._verify_file(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'file_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
         elif verification_type == 'function':
-            # Generic function verification
-            return self._verify_function_result(task, exec_result, task_meta)
+            result = self._verify_function_result(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'function_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
         elif verification_type == 'manual':
-            # Manual verification - trust execution result
-            return exec_result.success
+            result = exec_result.success
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'manual_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
         else:
-            logger.warning(f"Unknown verification type: {verification_type}, defaulting to function result")
-            return exec_result.success
+            result = exec_result.success
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'unknown_verification_type'
+                await self._emit_verification_telemetry(verification_log)
+                return False
+        
+        # AGGREGATE VERIFIER CONFIDENCE
+        if confidence_scores:
+            avg_confidence = sum(confidence_scores) / len(confidence_scores)
+            verification_log['confidence'] = avg_confidence
+        
+        verification_log['passed'] = True
+        await self._emit_verification_telemetry(verification_log)
+        return True
+    
+    async def _verify_success_criteria(self, success_criteria: str, exec_result: ExecutionResult, task_meta: Dict) -> Dict:
+        """
+        Verify success criteria with deep integration.
+        
+        Returns:
+        - passed: bool
+        - detail: str
+        - confidence: float (0.0 - 1.0)
+        """
+        import re
+        
+        result_text = (exec_result.stdout or "") + (exec_result.stderr or "")
+        
+        # Parse success criteria
+        # Support patterns like:
+        # - "contains:Hello World"
+        # - "regex:\\d+ errors?"
+        # - "not_contains:Error"
+        # - "output_contains:success"
+        # - "exit_code:0"
+        
+        passed = True
+        details = []
+        confidence = 1.0
+        
+        # Check for "contains:X" pattern
+        contains_match = re.search(r'contains:([^\s]+)', success_criteria)
+        if contains_match:
+            required_text = contains_match.group(1)
+            if required_text.lower() in result_text.lower():
+                details.append(f"Found required text: {required_text}")
+            else:
+                passed = False
+                confidence = 0.0
+                details.append(f"Missing required text: {required_text}")
+        
+        # Check for "not_contains:X" pattern
+        not_contains_match = re.search(r'not_contains:([^\s]+)', success_criteria)
+        if not_contains_match:
+            forbidden_text = not_contains_match.group(1)
+            if forbidden_text.lower() in result_text.lower():
+                passed = False
+                confidence = 0.0
+                details.append(f"Found forbidden text: {forbidden_text}")
+            else:
+                details.append(f"Confirmed no forbidden text: {forbidden_text}")
+        
+        # Check for "regex:X" pattern
+        regex_match = re.search(r'regex:([^\s]+)', success_criteria)
+        if regex_match:
+            try:
+                pattern = regex_match.group(1)
+                if re.search(pattern, result_text):
+                    details.append(f"Regex pattern matched: {pattern}")
+                else:
+                    passed = False
+                    confidence = 0.0
+                    details.append(f"Regex pattern not found: {pattern}")
+            except re.error as e:
+                details.append(f"Regex error: {e}")
+        
+        # Check for "exit_code:X" pattern
+        exit_code_match = re.search(r'exit_code:(\d+)', success_criteria)
+        if exit_code_match:
+            expected_code = int(exit_code_match.group(1))
+            actual_code = exec_result.exit_code
+            if actual_code == expected_code:
+                details.append(f"Exit code matches: {actual_code}")
+            else:
+                passed = False
+                confidence = 0.0
+                details.append(f"Exit code mismatch: expected {expected_code}, got {actual_code}")
+        
+        return {
+            'passed': passed,
+            'detail': '; '.join(details) if details else 'Success criteria check completed',
+            'confidence': confidence
+        }
+    
+    async def _verify_artifact_expectations(self, expected_artifacts: List[str], exec_result: ExecutionResult, task_meta: Dict) -> Dict:
+        """
+        Strict artifact expectations matching.
+        
+        Returns:
+        - passed: bool
+        - detail: str
+        - matched: List[str]
+        - missing: List[str]
+        - confidence: float (0.0 - 1.0)
+        """
+        import os
+        
+        actual_artifacts = exec_result.artifacts or []
+        
+        matched = []
+        missing = []
+        confidence = 1.0
+        
+        for expected in expected_artifacts:
+            # Expected artifact can be:
+            # - Exact filename: "output.txt"
+            # - Extension: ".pdf", ".png"
+            # - Pattern: "*.js", "report_*"
+            
+            found = False
+            
+            # Check exact match
+            if expected in actual_artifacts:
+                matched.append(expected)
+                found = True
+            else:
+                # Check extension match
+                if expected.startswith('.'):
+                    for artifact in actual_artifacts:
+                        if artifact.endswith(expected):
+                            matched.append(f"{artifact} (matched {expected})")
+                            found = True
+                            break
+                else:
+                    # Check if expected is a substring of any artifact
+                    for artifact in actual_artifacts:
+                        if expected in artifact:
+                            matched.append(artifact)
+                            found = True
+                            break
+            
+            if not found:
+                missing.append(expected)
+        
+        # Calculate confidence based on match ratio
+        if expected_artifacts:
+            match_ratio = len(matched) / len(expected_artifacts)
+            confidence = match_ratio
+        
+        passed = len(missing) == 0
+        
+        detail = f"Matched: {len(matched)}/{len(expected_artifacts)}"
+        if missing:
+            detail += f", Missing: {missing}"
+        
+        return {
+            'passed': passed,
+            'detail': detail,
+            'matched': matched,
+            'missing': missing,
+            'confidence': confidence
+        }
+    
+    async def _emit_verification_telemetry(self, verification_log: Dict):
+        """Emit verification telemetry with full diagnostics."""
+        try:
+            # Log prominently
+            if verification_log['passed']:
+                logger.info(f"✅ Verification PASSED for task {verification_log['task_id']} (confidence: {verification_log['confidence']:.2f})")
+            else:
+                logger.error(f"❌ Verification FAILED for task {verification_log['task_id']}: {verification_log['fail_reason']}")
+                logger.error(f"   Checks: {[c['check'] for c in verification_log['checks'] if not c['passed']]}")
+            
+            # Emit to telemetry if available
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('task_verification', verification_log)
+            
+            # Emit self-improvement signal if failed
+            if not verification_log['passed'] and hasattr(self, 'emit_improvement_signal'):
+                self.emit_improvement_signal('verification_failure', {
+                    'task_id': verification_log['task_id'],
+                    'fail_reason': verification_log['fail_reason'],
+                    'verification_type': verification_log['verification_type'],
+                    'checks_failed': [c['check'] for c in verification_log['checks'] if not c['passed']]
+                })
+        except Exception as e:
+            logger.error(f"Failed to emit verification telemetry: {e}")
     
     async def _verify_browser(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
         """
