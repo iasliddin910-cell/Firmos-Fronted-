@@ -4728,30 +4728,56 @@ Return ONLY valid JSON: {{
     
     async def _verify_screenshot(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
         """
-        STRICT screenshot verification - real image required!
+        COMPREHENSIVE Screenshot verification with multiple signals:
         
         For screenshot task to be successful:
         1. REAL image artifact must exist (file on disk)
-        2. OCR/vision verification must pass
-        3. Confidence threshold must be met
+        2. OCR verification with confidence
+        3. Vision prompt verification with confidence
+        4. Region-based expectation verification
+        5. UI element matching
+        6. Before/after image diff (if baseline provided)
+        7. Bounding box confidence
+        8. Overall confidence threshold
         
         NO soft passes - if no real image, verification FAILS!
         """
+        
+        import os
+        import time
+        
+        # Verification log for diagnostics
+        verification_checks = []
         
         expected_text = task_meta.get('expected_text', '')
         vision_prompt = task_meta.get('vision_prompt', '')
         image_path = task_meta.get('image_path', '')
         confidence_threshold = task_meta.get('confidence_threshold', 0.7)
         
-        # CRITICAL: REAL image artifact must exist!
-        screenshot_artifacts = [a for a in exec_result.artifacts if a.endswith(('.png', '.jpg', '.jpeg'))]
+        # NEW: Region-based expectations
+        expected_regions = task_meta.get('expected_regions', [])  # List of {x, y, width, height, expected_text}
+        
+        # NEW: UI element matching
+        expected_ui_elements = task_meta.get('expected_ui_elements', [])  # List of {type, text, selector}
+        
+        # NEW: Before/after diff
+        baseline_image_path = task_meta.get('baseline_image_path', '')  # Compare with this image
+        diff_threshold = task_meta.get('diff_threshold', 0.1)  # Max allowed difference ratio
+        
+        # NEW: Bounding box expectations
+        expected_bboxes = task_meta.get('expected_bboxes', [])  # List of {label, min_confidence}
+        
+        # ============== 1. CRITICAL: REAL IMAGE ARTIFACT MUST EXIST ==============
+        check_artifact = {'name': 'artifact_exists', 'passed': True, 'detail': ''}
+        
+        screenshot_artifacts = [a for a in exec_result.artifacts if a.endswith(('.png', '.jpg', '.jpeg', '.webp'))]
         
         if not screenshot_artifacts:
-            # STRICT: No screenshot = FAIL (no soft pass!)
+            check_artifact['passed'] = False
+            check_artifact['detail'] = 'No real image artifact found'
             logger.error(f"Screenshot verification FAILED: No real image artifact found for task {task.id}")
-            logger.debug(f"Artifacts available: {exec_result.artifacts}")
+            verification_checks.append(check_artifact)
             
-            # Record failure for telemetry
             if hasattr(self, 'telemetry') and self.telemetry:
                 self.telemetry.record_event('screenshot_verification_failed', {
                     'task_id': task.id,
@@ -4762,11 +4788,17 @@ Return ONLY valid JSON: {{
             
             return False
         
-        # Verify the image file actually exists on disk
-        import os
+        verification_checks.append(check_artifact)
+        
+        # ============== 2. VERIFY IMAGE FILE ON DISK ==============
+        check_file = {'name': 'file_on_disk', 'passed': True, 'detail': ''}
+        
         real_image_path = screenshot_artifacts[0]
         if not os.path.exists(real_image_path):
-            logger.error(f"Screenshot verification FAILED: Image file not found on disk: {real_image_path}")
+            check_file['passed'] = False
+            check_file['detail'] = f'Image file not found on disk: {real_image_path}'
+            logger.error(f"Screenshot verification FAILED: {check_file['detail']}")
+            verification_checks.append(check_file)
             
             if hasattr(self, 'telemetry') and self.telemetry:
                 self.telemetry.record_event('screenshot_verification_failed', {
@@ -4778,10 +4810,17 @@ Return ONLY valid JSON: {{
             
             return False
         
-        # Check file size (real images have size > 0)
+        verification_checks.append(check_file)
+        
+        # ============== 3. CHECK FILE SIZE ==============
+        check_size = {'name': 'file_size', 'passed': True, 'detail': ''}
+        
         file_size = os.path.getsize(real_image_path)
-        if file_size < 100:  # Less than 100 bytes is suspicious
-            logger.error(f"Screenshot verification FAILED: Image file too small: {file_size} bytes")
+        if file_size < 100:
+            check_size['passed'] = False
+            check_size['detail'] = f'Image file too small: {file_size} bytes'
+            logger.error(f"Screenshot verification FAILED: {check_size['detail']}")
+            verification_checks.append(check_size)
             
             if hasattr(self, 'telemetry') and self.telemetry:
                 self.telemetry.record_event('screenshot_verification_failed', {
@@ -4793,41 +4832,271 @@ Return ONLY valid JSON: {{
             
             return False
         
-        logger.info(f"Screenshot verification: Found real image artifact: {real_image_path} ({file_size} bytes)")
+        check_size['detail'] = f'Image size OK: {file_size} bytes'
+        verification_checks.append(check_size)
         
-        # OCR-based verification (if expected text provided)
+        logger.info(f"Screenshot verification: Found real image: {real_image_path} ({file_size} bytes)")
+        
+        # ============== 4. OCR VERIFICATION ==============
+        ocr_check = {'name': 'ocr_verification', 'passed': True, 'detail': '', 'confidence': 1.0, 'text_found': ''}
+        
         if expected_text:
             try:
-                # Try OCR using vision module if available
                 if hasattr(self, 'vision') and self.vision:
                     ocr_result = self.vision.extract_text(screenshot_artifacts[0])
-                    if expected_text.lower() not in ocr_result.lower():
-                        logger.warning(f"Screenshot verification failed: OCR text mismatch")
-                        logger.debug(f"OCR result: {ocr_result[:200]}...")
+                    
+                    # Check if expected text found
+                    if expected_text.lower() in ocr_result.lower():
+                        ocr_check['passed'] = True
+                        ocr_check['detail'] = f'OCR text found: {expected_text[:30]}...'
+                        ocr_check['text_found'] = ocr_result[:200]
+                        # Calculate rough confidence based on text length match
+                        ocr_check['confidence'] = min(1.0, len(expected_text) / max(1, len(ocr_result)))
+                    else:
+                        ocr_check['passed'] = False
+                        ocr_check['detail'] = f'OCR text NOT found. Expected: {expected_text[:50]}...'
+                        ocr_check['text_found'] = ocr_result[:200]
+                        ocr_check['confidence'] = 0.0
+                        
+                        logger.warning(f"Screenshot verification failed: {ocr_check['detail']}")
+                        verification_checks.append(ocr_check)
                         return False
                 else:
-                    logger.warning("Screenshot verification: OCR not available, checking filename only")
+                    # Fallback: check in filename
+                    if expected_text.lower() in real_image_path.lower():
+                        ocr_check['detail'] = f'Text found in filename (OCR not available)'
+                    else:
+                        ocr_check['passed'] = False
+                        ocr_check['detail'] = 'OCR not available, text not in filename'
+                        verification_checks.append(ocr_check)
+                        return False
             except Exception as e:
+                ocr_check['passed'] = False
+                ocr_check['detail'] = f'OCR error: {e}'
                 logger.error(f"Screenshot OCR verification error: {e}")
+                verification_checks.append(ocr_check)
                 return False
         
-        # Vision prompt verification
+        verification_checks.append(ocr_check)
+        
+        # ============== 5. VISION PROMPT VERIFICATION ==============
+        vision_check = {'name': 'vision_verification', 'passed': True, 'detail': '', 'confidence': 0.0, 'matches': False}
+        
         if vision_prompt:
             try:
                 if hasattr(self, 'vision') and self.vision:
                     vision_result = self.vision.analyze_image(screenshot_artifacts[0], vision_prompt)
-                    if not vision_result.get('matches', False):
-                        score = vision_result.get('confidence', 0)
-                        if score < confidence_threshold:
-                            logger.warning(f"Screenshot verification failed: Vision confidence {score} < {confidence_threshold}")
-                            return False
+                    
+                    matches = vision_result.get('matches', False)
+                    score = vision_result.get('confidence', 0.0)
+                    
+                    vision_check['matches'] = matches
+                    vision_check['confidence'] = score
+                    
+                    if not matches or score < confidence_threshold:
+                        vision_check['passed'] = False
+                        vision_check['detail'] = f'Vision confidence {score} < {confidence_threshold}'
+                        logger.warning(f"Screenshot verification failed: {vision_check['detail']}")
+                        verification_checks.append(vision_check)
+                        return False
+                    
+                    vision_check['detail'] = f'Vision passed with confidence {score:.2f}'
                 else:
-                    logger.warning("Screenshot verification: Vision not available")
+                    vision_check['detail'] = 'Vision not available, skipping'
             except Exception as e:
+                vision_check['passed'] = False
+                vision_check['detail'] = f'Vision error: {e}'
                 logger.error(f"Screenshot vision verification error: {e}")
+                verification_checks.append(vision_check)
                 return False
         
-        logger.info(f"Screenshot verification PASSED for task {task.id}")
+        verification_checks.append(vision_check)
+        
+        # ============== 6. REGION-BASED VERIFICATION ==============
+        region_check = {'name': 'region_verification', 'passed': True, 'detail': '', 'regions_checked': 0, 'regions_found': 0}
+        
+        if expected_regions:
+            try:
+                if hasattr(self, 'vision') and self.vision:
+                    for region in expected_regions:
+                        region_text = region.get('expected_text', '')
+                        bbox = region.get('bbox', {})  # {x, y, width, height}
+                        
+                        region_check['regions_checked'] += 1
+                        
+                        # Extract text from region
+                        if bbox and hasattr(self.vision, 'extract_text_from_region'):
+                            region_ocr = self.vision.extract_text_from_region(
+                                screenshot_artifacts[0], 
+                                bbox
+                            )
+                            
+                            if region_text.lower() in region_ocr.lower():
+                                region_check['regions_found'] += 1
+                            else:
+                                region_check['passed'] = False
+                                region_check['detail'] = f'Region text not found: {region_text[:30]}...'
+                        else:
+                            # If no bbox support, check full image
+                            full_ocr = self.vision.extract_text(screenshot_artifacts[0])
+                            if region_text.lower() in full_ocr.lower():
+                                region_check['regions_found'] += 1
+                    
+                    if not region_check['passed']:
+                        logger.warning(f"Screenshot verification failed: {region_check['detail']}")
+                        verification_checks.append(region_check)
+                        return False
+                    
+                    region_check['detail'] = f'Regions: {region_check["regions_found"]}/{region_check["regions_checked"]} found'
+                else:
+                    region_check['detail'] = 'Vision not available for region check'
+            except Exception as e:
+                region_check['passed'] = False
+                region_check['detail'] = f'Region check error: {e}'
+                logger.warning(f"Screenshot region verification error: {e}")
+        
+        verification_checks.append(region_check)
+        
+        # ============== 7. UI ELEMENT MATCHING ==============
+        ui_check = {'name': 'ui_element_matching', 'passed': True, 'detail': '', 'elements_checked': 0, 'elements_found': 0}
+        
+        if expected_ui_elements:
+            try:
+                if hasattr(self, 'vision') and self.vision:
+                    for ui_elem in expected_ui_elements:
+                        elem_type = ui_elem.get('type', '')  # button, input, link, text, etc.
+                        elem_text = ui_elem.get('text', '')
+                        
+                        ui_check['elements_checked'] += 1
+                        
+                        # Use vision to detect UI elements
+                        if hasattr(self.vision, 'detect_ui_elements'):
+                            detected = self.vision.detect_ui_elements(screenshot_artifacts[0])
+                            
+                            # Check if our element is in detected ones
+                            found = any(
+                                det.get('type') == elem_type and 
+                                (elem_text.lower() in det.get('text', '').lower() or 
+                                 elem_text.lower() in det.get('label', '').lower())
+                                for det in detected
+                            )
+                            
+                            if found:
+                                ui_check['elements_found'] += 1
+                            else:
+                                ui_check['passed'] = False
+                                ui_check['detail'] = f'UI element not found: {elem_type} - {elem_text}'
+                        else:
+                            # Fallback: OCR check
+                            full_ocr = self.vision.extract_text(screenshot_artifacts[0])
+                            if elem_text.lower() in full_ocr.lower():
+                                ui_check['elements_found'] += 1
+                    
+                    if not ui_check['passed']:
+                        logger.warning(f"Screenshot verification failed: {ui_check['detail']}")
+                        verification_checks.append(ui_check)
+                        return False
+                    
+                    ui_check['detail'] = f'UI elements: {ui_check["elements_found"]}/{ui_check["elements_checked"]} found'
+                else:
+                    ui_check['detail'] = 'Vision not available for UI check'
+            except Exception as e:
+                ui_check['passed'] = False
+                ui_check['detail'] = f'UI element check error: {e}'
+                logger.warning(f"Screenshot UI verification error: {e}")
+        
+        verification_checks.append(ui_check)
+        
+        # ============== 8. BEFORE/AFTER IMAGE DIFF ==============
+        diff_check = {'name': 'image_diff', 'passed': True, 'detail': '', 'diff_ratio': 0.0}
+        
+        if baseline_image_path and os.path.exists(baseline_image_path):
+            try:
+                if hasattr(self, 'vision') and self.vision and hasattr(self.vision, 'compare_images'):
+                    diff_result = self.vision.compare_images(baseline_image_path, real_image_path)
+                    
+                    diff_ratio = diff_result.get('diff_ratio', 1.0)
+                    diff_check['diff_ratio'] = diff_ratio
+                    
+                    if diff_ratio > diff_threshold:
+                        diff_check['passed'] = False
+                        diff_check['detail'] = f'Image diff {diff_ratio:.2f} > threshold {diff_threshold}'
+                        logger.warning(f"Screenshot verification failed: {diff_check['detail']}")
+                        verification_checks.append(diff_check)
+                        return False
+                    
+                    diff_check['detail'] = f'Image diff OK: {diff_ratio:.4f} <= {diff_threshold}'
+                else:
+                    diff_check['detail'] = 'Image diff not available, skipping'
+            except Exception as e:
+                diff_check['passed'] = False
+                diff_check['detail'] = f'Image diff error: {e}'
+                logger.warning(f"Screenshot diff verification error: {e}")
+        elif baseline_image_path:
+            diff_check['detail'] = f'Baseline image not found: {baseline_image_path}, skipping'
+        
+        verification_checks.append(diff_check)
+        
+        # ============== 9. BOUNDING BOX CONFIDENCE ==============
+        bbox_check = {'name': 'bbox_confidence', 'passed': True, 'detail': '', 'bboxes_checked': 0, 'bboxes_passed': 0}
+        
+        if expected_bboxes:
+            try:
+                if hasattr(self, 'vision') and self.vision and hasattr(self.vision, 'detect_objects'):
+                    detected_objects = self.vision.detect_objects(screenshot_artifacts[0])
+                    
+                    for bbox_exp in expected_bboxes:
+                        label = bbox_exp.get('label', '')
+                        min_conf = bbox_exp.get('min_confidence', 0.5)
+                        
+                        bbox_check['bboxes_checked'] += 1
+                        
+                        # Find matching detected object
+                        matched = any(
+                            obj.get('label', '').lower() == label.lower() and 
+                            obj.get('confidence', 0) >= min_conf
+                            for obj in detected_objects
+                        )
+                        
+                        if matched:
+                            bbox_check['bboxes_passed'] += 1
+                        else:
+                            bbox_check['passed'] = False
+                            bbox_check['detail'] = f'Bbox not found: {label} with confidence >= {min_conf}'
+                    
+                    if not bbox_check['passed']:
+                        logger.warning(f"Screenshot verification failed: {bbox_check['detail']}")
+                        verification_checks.append(bbox_check)
+                        return False
+                    
+                    bbox_check['detail'] = f'Bboxes: {bbox_check["bboxes_passed"]}/{bbox_check["bboxes_checked"]} passed'
+                else:
+                    bbox_check['detail'] = 'Object detection not available, skipping'
+            except Exception as e:
+                bbox_check['passed'] = False
+                bbox_check['detail'] = f'Bbox check error: {e}'
+                logger.warning(f"Screenshot bbox verification error: {e}")
+        
+        verification_checks.append(bbox_check)
+        
+        # ============== 10. OVERALL CONFIDENCE AGGREGATION ==============
+        confidences = [c.get('confidence', 1.0) for c in verification_checks if 'confidence' in c]
+        overall_confidence = sum(confidences) / len(confidences) if confidences else 1.0
+        
+        # Log all checks
+        logger.info(f"🔍 Screenshot verification for task {task.id}: {len(verification_checks)} checks")
+        for check in verification_checks:
+            status = "✅" if check['passed'] else "❌"
+            detail = check.get('detail', '')
+            logger.info(f"   {status} {check['name']}: {detail}")
+        
+        logger.info(f"📊 Overall confidence: {overall_confidence:.2f}")
+        
+        if overall_confidence < confidence_threshold:
+            logger.warning(f"Screenshot verification failed: Overall confidence {overall_confidence:.2f} < {confidence_threshold}")
+            return False
+        
+        logger.info(f"✅ Screenshot verification PASSED for task {task.id}")
         return True
     
     async def _verify_server(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
