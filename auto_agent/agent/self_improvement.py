@@ -67,6 +67,66 @@ class Experiment:
     created_at: float = field(default_factory=time.time)
 
 
+# ==================== RELEASE PIPELINE DATA CLASSES ====================
+
+@dataclass
+class CandidatePatch:
+    """Candidate patch for release pipeline"""
+    patch_id: str
+    proposal_id: str
+    file_path: str
+    current_code: str
+    proposed_code: str
+    diff: str
+    reason: str
+    expected_improvement: str
+    created_at: float = field(default_factory=time.time)
+    status: str = "pending"  # pending, testing, benchmarked, approved, rejected, released
+    benchmark_score: Optional[float] = None
+    regression_passed: Optional[bool] = None
+    test_results: Dict = field(default_factory=dict)
+    lineage: List[str] = field(default_factory=list)  # parent patch IDs
+
+
+@dataclass
+class BenchmarkResult:
+    """Benchmark comparison result"""
+    benchmark_id: str
+    patch_id: str
+    metric_name: str
+    baseline_score: float
+    candidate_score: float
+    improvement_percent: float
+    status: str  # better, worse, same
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class RegressionResult:
+    """Regression test result"""
+    regression_id: str
+    patch_id: str
+    test_suite: str
+    passed: bool
+    failed_tests: List[str] = field(default_factory=list)
+    duration: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class ReleaseCandidate:
+    """Release candidate in pipeline"""
+    release_id: str
+    version: str
+    patch_ids: List[str]
+    status: str = "testing"  # testing, approved, released, rolled_back
+    created_at: float = field(default_factory=time.time)
+    approved_at: Optional[float] = None
+    released_at: Optional[float] = None
+    rolled_back_at: Optional[float] = None
+    rollback_reason: Optional[str] = None
+
+
 # ==================== FAILURE ANALYZER ====================
 
 class FailureAnalyzer:
@@ -574,6 +634,305 @@ class SelfImprovementEngine:
             "issues_found": len(issues),
             "issues": issues,
             "auto_fixed": len(issues) > 0
+        }
+
+
+# ==================== CLOSED-LOOP RELEASE PIPELINE ====================
+
+class ClosedLoopReleaseManager:
+    """
+    Closed-loop release system for self-improvement patches
+    
+    Features:
+    - Candidate patch management
+    - Benchmark comparison
+    - Regression testing gate
+    - Accept/reject workflow
+    - Promote/rollback
+    - Patch lineage tracking
+    """
+    
+    def __init__(self, storage_dir: str = "data/releases"):
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Pipeline components
+        self.candidate_patches: Dict[str, CandidatePatch] = {}
+        self.benchmarks: Dict[str, BenchmarkResult] = {}
+        self.regressions: Dict[str, RegressionResult] = {}
+        self.release_candidates: Dict[str, ReleaseCandidate] = {}
+        
+        # Configuration
+        self.regression_threshold = 0.95  # 95% tests must pass
+        self.benchmark_improvement_threshold = 0.05  # 5% improvement required
+        
+        logger.info("🔄 Closed-Loop Release Manager initialized")
+    
+    def create_candidate_patch(self, proposal_id: str, file_path: str,
+                             current_code: str, proposed_code: str,
+                             reason: str, expected_improvement: str,
+                             parent_patch_id: str = None) -> str:
+        """Create a candidate patch for the release pipeline"""
+        
+        patch_id = f"candidate_{hashlib.md5(f'{proposal_id}{time.time()}'.encode()).hexdigest()[:8]}"
+        
+        # Generate diff
+        diff = self._generate_diff(current_code, proposed_code)
+        
+        # Build lineage
+        lineage = [parent_patch_id] if parent_patch_id else []
+        
+        candidate = CandidatePatch(
+            patch_id=patch_id,
+            proposal_id=proposal_id,
+            file_path=file_path,
+            current_code=current_code,
+            proposed_code=proposed_code,
+            diff=diff,
+            reason=reason,
+            expected_improvement=expected_improvement,
+            status="pending",
+            lineage=lineage
+        )
+        
+        self.candidate_patches[patch_id] = candidate
+        
+        logger.info(f"📦 Created candidate patch: {patch_id}")
+        return patch_id
+    
+    def _generate_diff(self, old_code: str, new_code: str) -> str:
+        """Generate simple diff between two code versions"""
+        old_lines = old_code.split('\n')
+        new_lines = new_code.split('\n')
+        
+        diff_lines = []
+        for i, (old, new) in enumerate(zip(old_lines, new_lines), 1):
+            if old != new:
+                diff_lines.append(f"-{i}: {old}")
+                diff_lines.append(f"+{i}: {new}")
+        
+        if len(new_lines) > len(old_lines):
+            for i in range(len(old_lines), len(new_lines)):
+                diff_lines.append(f"+{i+1}: {new_lines[i]}")
+        
+        return '\n'.join(diff_lines)
+    
+    def run_benchmark(self, patch_id: str, metric_name: str,
+                     baseline_score: float, candidate_score: float) -> str:
+        """Run benchmark comparison between baseline and candidate"""
+        
+        if patch_id not in self.candidate_patches:
+            return "❌ Patch not found"
+        
+        benchmark_id = f"bench_{hashlib.md5(f'{patch_id}{time.time()}'.encode()).hexdigest()[:8]}"
+        
+        # Calculate improvement
+        if baseline_score > 0:
+            improvement = (candidate_score - baseline_score) / baseline_score
+        else:
+            improvement = 0
+        
+        # Determine status
+        if improvement > self.benchmark_improvement_threshold:
+            status = "better"
+        elif improvement < -self.benchmark_improvement_threshold:
+            status = "worse"
+        else:
+            status = "same"
+        
+        result = BenchmarkResult(
+            benchmark_id=benchmark_id,
+            patch_id=patch_id,
+            metric_name=metric_name,
+            baseline_score=baseline_score,
+            candidate_score=candidate_score,
+            improvement_percent=improvement * 100,
+            status=status
+        )
+        
+        self.benchmarks[benchmark_id] = result
+        
+        # Update candidate patch
+        self.candidate_patches[patch_id].benchmark_score = candidate_score
+        self.candidate_patches[patch_id].status = "benchmarked"
+        
+        logger.info(f"📊 Benchmark complete: {status} ({improvement*100:.1f}%)")
+        return benchmark_id
+    
+    def run_regression_tests(self, patch_id: str, test_suite: str,
+                           test_results: Dict[str, bool]) -> str:
+        """Run regression tests for a candidate patch"""
+        
+        if patch_id not in self.candidate_patches:
+            return "❌ Patch not found"
+        
+        regression_id = f"reg_{hashlib.md5(f'{patch_id}{time.time()}'.encode()).hexdigest()[:8]}"
+        
+        # Calculate pass rate
+        total_tests = len(test_results)
+        passed_tests = sum(1 for v in test_results.values() if v)
+        pass_rate = passed_tests / total_tests if total_tests > 0 else 0
+        
+        passed = pass_rate >= self.regression_threshold
+        
+        # Get failed test names
+        failed_test_names = [k for k, v in test_results.items() if not v]
+        
+        result = RegressionResult(
+            regression_id=regression_id,
+            patch_id=patch_id,
+            test_suite=test_suite,
+            passed=passed,
+            failed_tests=failed_test_names,
+            duration=0.0
+        )
+        
+        self.regressions[regression_id] = result
+        
+        # Update candidate patch
+        self.candidate_patches[patch_id].regression_passed = passed
+        self.candidate_patches[patch_id].test_results = test_results
+        self.candidate_patches[patch_id].status = "testing"
+        
+        logger.info(f"🧪 Regression: {'PASSED' if passed else 'FAILED'} ({passed_tests}/{total_tests})")
+        return regression_id
+    
+    def approve_patch(self, patch_id: str) -> bool:
+        """Approve a candidate patch for release"""
+        
+        if patch_id not in self.candidate_patches:
+            return False
+        
+        candidate = self.candidate_patches[patch_id]
+        
+        # Check all requirements
+        if candidate.benchmark_score is None:
+            logger.warning(f"⚠️ Patch {patch_id} has no benchmark")
+            return False
+        
+        if candidate.regression_passed is None:
+            logger.warning(f"⚠️ Patch {patch_id} has no regression tests")
+            return False
+        
+        if not candidate.regression_passed:
+            logger.warning(f"⚠️ Patch {patch_id} failed regression tests")
+            return False
+        
+        candidate.status = "approved"
+        logger.info(f"✅ Patch {patch_id} APPROVED for release")
+        return True
+    
+    def reject_patch(self, patch_id: str, reason: str) -> bool:
+        """Reject a candidate patch"""
+        
+        if patch_id not in self.candidate_patches:
+            return False
+        
+        self.candidate_patches[patch_id].status = "rejected"
+        logger.info(f"❌ Patch {patch_id} REJECTED: {reason}")
+        return True
+    
+    def create_release_candidate(self, patch_ids: List[str], version: str) -> str:
+        """Create a release candidate from approved patches"""
+        
+        for pid in patch_ids:
+            if pid not in self.candidate_patches:
+                return "❌ Patch not found"
+            if self.candidate_patches[pid].status != "approved":
+                return f"❌ Patch {pid} not approved"
+        
+        release_id = f"release_{hashlib.md5(f'{version}{time.time()}'.encode()).hexdigest()[:8]}"
+        
+        candidate = ReleaseCandidate(
+            release_id=release_id,
+            version=version,
+            patch_ids=patch_ids,
+            status="testing"
+        )
+        
+        self.release_candidates[release_id] = candidate
+        
+        logger.info(f"📦 Created release candidate: {release_id} (v{version})")
+        return release_id
+    
+    def promote_release(self, release_id: str) -> bool:
+        """Promote a release candidate to production"""
+        
+        if release_id not in self.release_candidates:
+            return False
+        
+        release = self.release_candidates[release_id]
+        
+        if release.status != "testing":
+            logger.warning(f"⚠️ Release {release_id} not in testing state")
+            return False
+        
+        release.status = "released"
+        release.released_at = time.time()
+        
+        for patch_id in release.patch_ids:
+            self.candidate_patches[patch_id].status = "released"
+        
+        logger.info(f"🚀 Release {release_id} PROMOTED to production!")
+        return True
+    
+    def rollback_release(self, release_id: str, reason: str) -> bool:
+        """Rollback a released version"""
+        
+        if release_id not in self.release_candidates:
+            return False
+        
+        release = self.release_candidates[release_id]
+        release.status = "rolled_back"
+        release.rolled_back_at = time.time()
+        release.rollback_reason = reason
+        
+        logger.warning(f"🔙 Release {release_id} ROLLED BACK: {reason}")
+        return True
+    
+    def get_patch_lineage(self, patch_id: str) -> List[Dict]:
+        """Get the full lineage of a patch"""
+        
+        if patch_id not in self.candidate_patches:
+            return []
+        
+        lineage = []
+        current_id = patch_id
+        
+        while current_id:
+            if current_id in self.candidate_patches:
+                patch = self.candidate_patches[current_id]
+                lineage.append({
+                    "patch_id": patch.patch_id,
+                    "status": patch.status,
+                    "created_at": patch.created_at
+                })
+                current_id = patch.lineage[0] if patch.lineage else None
+            else:
+                break
+        
+        return lineage
+    
+    def get_pipeline_status(self) -> Dict:
+        """Get overall pipeline status"""
+        
+        return {
+            "candidate_patches": {
+                "total": len(self.candidate_patches),
+                "pending": sum(1 for p in self.candidate_patches.values() if p.status == "pending"),
+                "testing": sum(1 for p in self.candidate_patches.values() if p.status == "testing"),
+                "approved": sum(1 for p in self.candidate_patches.values() if p.status == "approved"),
+                "rejected": sum(1 for p in self.candidate_patches.values() if p.status == "rejected"),
+                "released": sum(1 for p in self.candidate_patches.values() if p.status == "released"),
+            },
+            "release_candidates": {
+                "total": len(self.release_candidates),
+                "testing": sum(1 for r in self.release_candidates.values() if r.status == "testing"),
+                "released": sum(1 for r in self.release_candidates.values() if r.status == "released"),
+                "rolled_back": sum(1 for r in self.release_candidates.values() if r.status == "rolled_back"),
+            },
+            "benchmarks": len(self.benchmarks),
+            "regressions": len(self.regressions)
         }
 
 
