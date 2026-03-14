@@ -103,9 +103,9 @@ class Objective:
     priority: int  # 1-5
     deadline: Optional[float]
     status: str  # active, paused, completed, abandoned
-    subobjectives: List[str] = field(default_factory=list)
     created_at: float
     updated_at: float
+    subobjectives: List[str] = field(default_factory=list)
 
 
 @dataclass

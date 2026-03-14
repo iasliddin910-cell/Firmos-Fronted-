@@ -51,6 +51,7 @@ from queue import Queue, PriorityQueue, Empty
 from pathlib import Path
 import uuid
 import traceback
+import re
 
 # Import new Multi-Agent Coordinator
 from agent.multi_agent_coordinator import MultiAgentCoordinator as NewMultiAgentCoordinator

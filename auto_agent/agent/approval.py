@@ -46,7 +46,7 @@ class RecoveryMapper:
     RETRY = "retry"; SKIP = "skip"; ALT = "alternative"; ABORT = "abort"
     def __init__(self):
         self.map = {"execute_command": {"on_deny": self.ALT, "alt_tool": "safe_execute"}, "delete_file": {"on_deny": self.ABORT}, "browser_navigate": {"on_deny": self.SKIP, "on_expire": self.RETRY}}
-    self.default = {"on_deny": self.RETRY, "on_expire": self.RETRY, "max_retries": 3}
+        self.default = {"on_deny": self.RETRY, "on_expire": self.RETRY, "max_retries": 3}
     def get_action(self, tool: str, reason=None, expired=False) -> Dict:
         m = self.map.get(tool, self.default); key = "on_expire" if expired else "on_deny"
         return {"strategy": m.get(key, self.RETRY), "tool": tool, "max": m.get("max_retries", 3), "alt": m.get("alt_tool")}

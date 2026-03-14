@@ -196,4 +196,9 @@ def voice_system():
         _voice_system = VoiceSystem()
     return _voice_system
 
+# Alias for compatibility
+def get_voice_system():
+    """Get global voice system instance (alias)"""
+    return voice_system()
+
 _voice_system = None
