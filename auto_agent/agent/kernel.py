@@ -2656,7 +2656,13 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                                     self._emit_plan_parsing_telemetry(True, parsing_attempts, response, parse_diagnostics, strategy_name)
                                     return tasks
                         else:
-                            # Schema failed - log and continue
+                            # Schema failed - log detailed diagnostics
+                            parse_diagnostics['failures'].append({
+                                'strategy': strategy_name,
+                                'reason': 'schema_validation_failed',
+                                'errors': validation_result.get('errors', [])
+                            })
+                            logger.warning(f"⚠️ Schema validation failed for strategy '{strategy_name}': {validation_result.get('errors', [])}")
                             pass
                             
                     except json.JSONDecodeError as e:
