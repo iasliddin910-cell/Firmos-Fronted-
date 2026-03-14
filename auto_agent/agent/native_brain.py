@@ -381,3 +381,175 @@ Available tools:
 def create_native_brain(api_key: str, tools_engine, kernel=None, sandbox=None, approval_engine=None):
     """Create native function calling brain"""
     return NativeFunctionBrain(api_key, tools_engine, kernel=kernel, sandbox=sandbox, approval_engine=approval_engine)
+
+
+# ==================== TOOL-INTENT BRAIN ====================
+
+class ToolIntentBrain:
+    """
+    Brain as tool-intent layer only (not orchestrator).
+    
+    Model provides:
+    - suggestion (what to do)
+    - tool intent (which tool)
+    - candidate args (potential arguments)
+    
+    Truth comes from:
+    - actual runtime execution
+    - verifier
+    - artifacts
+    
+    This ensures No1-grade governance - model doesn't control execution.
+    """
+    
+    def __init__(self, api_key: str, tools_engine, kernel=None):
+        self.api_key = api_key
+        self.tools = tools_engine
+        self.kernel = kernel
+        
+        from openai import OpenAI
+        self.client = OpenAI(api_key=api_key)
+        
+        # Limited system prompt - just tool intent
+        self.system_prompt = """You are OmniAgent X's TOOL-INTENT LAYER.
+
+Your job is ONLY to suggest tools and arguments.
+DO NOT execute, verify, or complete tasks yourself.
+
+Output ONLY:
+- tool_name: Which tool to use
+- args: Candidate arguments (may need verification)
+- intent: What you're trying to achieve
+- confidence: How confident you are (0-1)
+
+DO NOT claim task is complete - let the verifier decide."""
+        
+    def suggest_tool(self, context: str, available_tools: List[str]) -> Dict:
+        """
+        Get tool suggestion from model - just intent, no execution.
+        
+        Returns:
+        {
+            "tool_name": "...",
+            "args": {...},
+            "intent": "...",
+            "confidence": 0.8
+        }
+        """
+        from config import settings
+        
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": f"""
+Context: {context}
+
+Available tools: {', '.join(available_tools)}
+
+Suggest ONE tool to use and its arguments.
+Be conservative - high confidence only.
+"""}
+        ]
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=messages,
+                temperature=0.3,  # Lower temperature for better focus
+                max_tokens=500
+            )
+            
+            content = response.choices[0].message.content
+            
+            # Parse response
+            suggestion = self._parse_suggestion(content)
+            suggestion["source"] = "model_suggestion"
+            
+            return suggestion
+            
+        except Exception as e:
+            logger.error(f"Tool suggestion failed: {e}")
+            return {
+                "tool_name": None,
+                "args": {},
+                "intent": "error",
+                "confidence": 0.0,
+                "error": str(e)
+            }
+    
+    def _parse_suggestion(self, content: str) -> Dict:
+        """Parse model response into structured suggestion"""
+        import re
+        
+        # Extract tool name
+        tool_match = re.search(r'tool[_\s]?name[:\s]+(\w+)', content, re.IGNORECASE)
+        tool_name = tool_match.group(1) if tool_match else None
+        
+        # Extract args (simple parsing)
+        args_match = re.search(r'args[:\s]+\{([^}]+)\}', content, re.DOTALL)
+        args = {}
+        if args_match:
+            # Simple key=value parsing
+            for line in args_match.group(1).split(','):
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    args[k.strip().strip('"\'')] = v.strip().strip('"\'')
+        
+        # Extract confidence
+        conf_match = re.search(r'confidence[:\s]+([0-9.]+)', content, re.IGNORECASE)
+        confidence = float(conf_match.group(1)) if conf_match else 0.5
+        
+        # Extract intent
+        intent_match = re.search(r'intent[:\s]+(.+?)(?:\n|$)', content, re.IGNORECASE)
+        intent = intent_match.group(1).strip() if intent_match else ""
+        
+        return {
+            "tool_name": tool_name,
+            "args": args,
+            "intent": intent,
+            "confidence": confidence
+        }
+    
+    def get_verified_execution(self, suggestion: Dict, context: str) -> Dict:
+        """
+        Execute suggested tool through kernel/verifier for truth.
+        
+        Model suggests, verifier confirms - separation of concerns.
+        """
+        if not suggestion.get("tool_name") or suggestion.get("confidence", 0) < 0.5:
+            return {
+                "success": False,
+                "error": "Low confidence or no tool suggested",
+                "truth_source": "rejected"
+            }
+        
+        tool_name = suggestion["tool_name"]
+        args = suggestion.get("args", {})
+        
+        # Execute through tools engine (not model)
+        try:
+            result = self.tools.execute_tool(tool_name, args)
+            
+            # Return actual result, not model prediction
+            return {
+                "success": result.status == "success",
+                "tool_name": tool_name,
+                "args": args,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "duration": result.duration,
+                "truth_source": "runtime_execution"
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "tool_name": tool_name,
+                "error": str(e),
+                "truth_source": "runtime_error"
+            }
+
+
+def create_tool_intent_brain(api_key: str, tools_engine, kernel=None):
+    """Factory function"""
+    return ToolIntentBrain(api_key, tools_engine, kernel)
+
