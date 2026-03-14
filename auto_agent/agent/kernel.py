@@ -2670,7 +2670,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                                 'errors': validation_result.get('errors', [])
                             })
                             logger.warning(f"⚠️ Schema validation failed for strategy '{strategy_name}': {validation_result.get('errors', [])}")
-                            pass
+                            logger.debug("Schema validation failed, continuing")
                             
                     except json.JSONDecodeError as e:
                         parsing_attempts.append({'strategy': strategy_name, 'success': False, 'reason': 'json_decode_error', 'error': str(e), 'time_ms': (time.time() - start_time) * 1000})
@@ -2837,7 +2837,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 return re.match(r'\[[\s\S]*\]', combined)
             except (json.JSONDecodeError, ValueError) as e:
                 logger.debug(f"JSON line combination failed: {e}")
-                pass
+                logger.debug("JSON validation continued")
         
         return None
     
@@ -4091,13 +4091,13 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             # Configure sandbox mode
             if sandbox_mode == 'safe':
                 # Most restrictive
-                pass
+                logger.debug("Safe mode placeholder")
             elif sandbox_mode == 'normal':
                 # Standard restrictions
-                pass
+                logger.debug("Normal mode placeholder")
             elif sandbox_mode == 'advanced':
                 # Minimal restrictions (for trusted operations)
-                pass
+                logger.debug("Advanced mode placeholder")
 
             return True
         except Exception as e:
@@ -5164,7 +5164,7 @@ Return ONLY valid JSON: {{
                 try:
                     page_for_semantic = browser.get_page_text()
                 except:
-                    pass
+                    logger.debug("Browser page text unavailable")
             
             missing_semantic = []
             for pattern in semantic_patterns:

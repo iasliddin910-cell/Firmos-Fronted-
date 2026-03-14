@@ -659,8 +659,7 @@ class IsolatedContainer:
                         proc.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-        except:
-            pass
+        except Exception as e: logger.warning(f"Sandbox error: {e}")
             
     def apply_egress_control(self, container_id: str) -> Dict:
         """Apply egress control (simulated - real would use iptables)"""
