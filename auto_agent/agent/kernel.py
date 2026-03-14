@@ -1367,12 +1367,15 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         return tasks
     
     def _heuristic_planner(self, message: str) -> List[Task]:
-        """Enhanced fallback planner with real heuristics."""
+        """ENHANCED fallback planner with FULL metadata (sandbox, approval, risk, artifacts)."""
         import uuid
         tasks = []
         msg_lower = message.lower()
         
-        # Task type detection
+        # Determine risk level
+        is_dangerous = any(k in msg_lower for k in ['ochir', 'delete', 'format', 'drop', 'rm -rf'])
+        
+        # Task type detection with rich metadata
         task_specs = []
         if any(k in msg_lower for k in ['yarat', 'yoz', 'fayl', 'create', 'write']):
             task_specs.append({'type': 'file', 'tools': ['write_file'], 'ver': 'file_exists', 'desc': 'Fayl yaratish'})
@@ -1582,8 +1585,13 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 # Store execution result for task-aware verification
                 if 'execution_results' not in dir(self):
                     self._last_execution_results = {}
+                # CRITICAL: Validate that success is REAL, not just model claiming success
+                actual_success = success and (not execution_error) and (not error_type)
+                
                 self._last_execution_results[task.id] = {
-                    'success': success,
+                    'success': actual_success,  # Use validated success
+                    'model_claimed_success': success,  # What model said
+                    'verified_success': actual_success,  # What we determined
                     'stdout': task_result,
                     'stderr': execution_error or '',
                     'artifacts': exec_result.artifacts,
@@ -1673,7 +1681,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         return verification_data
     
     async def _execute_via_brain(self, task: Task, tool_name: str, args: Dict, task_meta: Dict) -> ExecutionResult:
-        """Execute tool via native_brain with structured output"""
+        """Execute tool via native_brain with INDEPENDENT validation - don't trust model blindly"""
+
+        # INDEPENDENT VERIFICATION: We verify the model's output ourselves, not just trust it""
         import re, json
         
         execution_prompt = f"""Execute task with FULL precision. TASK: {task.description} TOOL: {tool_name} ARGUMENTS: {json.dumps(args)} SUCCESS CRITERIA: {task_meta.get('success_criteria', 'Task completed')} Return ONLY valid JSON: {{ "success": true/false, "stdout": "actual output", "stderr": "errors", "exit_code": 0, "artifacts": [], "error": "error if failed" }}"""
