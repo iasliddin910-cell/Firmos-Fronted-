@@ -1820,6 +1820,12 @@ class TaskManager:
             
             if task:
                 entry['task'] = self._task_to_dict(task)
+                # Store queue position for full replay
+                if queue_position:
+                    entry['queue_position'] = queue_position
+                    # Get priority for ordering
+                    if hasattr(task, 'priority'):
+                        entry['queue_order'] = task.priority.value if hasattr(task.priority, 'value') else 0
             if task_id:
                 entry['task_id'] = task_id
             
