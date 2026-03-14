@@ -1130,3 +1130,80 @@ def get_playwright_browser() -> BrowserManager:
     if _playwright_browser is None:
         _playwright_browser = BrowserManager()
     return _playwright_browser
+
+
+# ==================== ENHANCED SESSION MANAGEMENT ====================
+
+class EnhancedSessionManager:
+    """Enhanced session management for browser automation."""
+    
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.sessions = {}
+    
+    def create_session(self, site_url):
+        import uuid
+        session_id = f"session_{uuid.uuid4().hex[:8]}"
+        self.sessions[session_id] = {"site_url": site_url, "cookies": [], "auth_token": None}
+        return session_id
+    
+    def save_session(self, session_id, cookies, auth_token=None):
+        if session_id in self.sessions:
+            self.sessions[session_id]["cookies"] = cookies
+            self.sessions[session_id]["auth_token"] = auth_token
+            return True
+        return False
+    
+    def restore_session(self, site_url=None):
+        for session in self.sessions.values():
+            if site_url is None or session.get("site_url") == site_url:
+                return session
+        return None
+
+
+class BrowserError(Exception):
+    """Structured browser errors."""
+    
+    ERROR_TYPES = {
+        "NAVIGATION": "Navigation failed",
+        "AUTHENTICATION": "Authentication failed",
+        "TIMEOUT": "Operation timed out",
+        "VERIFICATION": "Element verification failed"
+    }
+    
+    def __init__(self, error_type, message, details=None):
+        self.error_type = error_type
+        self.message = message
+        self.details = details or {}
+        super().__init__(f"[{error_type}] {message}")
+    
+    def to_dict(self):
+        return {"error_type": self.error_type, "message": self.message, "details": self.details}
+
+
+class EnhancedVerification:
+    """Enhanced verification for browser actions."""
+    
+    def __init__(self, page):
+        self.page = page
+    
+    def verify_element(self, selector, timeout=5.0):
+        result = {"success": False, "selector": selector}
+        try:
+            element = self.page.wait_for_selector(selector, timeout=timeout*1000)
+            result["success"] = element is not None
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+    
+    def verify_text(self, selector, expected_text):
+        result = {"success": False, "selector": selector, "expected": expected_text}
+        try:
+            element = self.page.query_selector(selector)
+            if element:
+                actual = element.inner_text()
+                result["success"] = expected_text.lower() in actual.lower()
+                result["actual"] = actual
+        except Exception as e:
+            result["error"] = str(e)
+        return result
