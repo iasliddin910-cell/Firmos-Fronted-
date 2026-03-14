@@ -435,14 +435,14 @@ class ToolsEngine:
             import pyautogui
             self.pyautogui = pyautogui
             self.PYAUTOGUI_AVAILABLE = True
-        except:
+        except Exception as e:
             self.PYAUTOGUI_AVAILABLE = False
             logger.warning("PyAutoGUI not available")
         
         try:
             from selenium import webdriver
             self.SELENIUM_AVAILABLE = True
-        except:
+        except Exception as e:
             self.SELENIUM_AVAILABLE = False
         
         logger.info("🔧 Tools Engine initialized (REFACTORED)")
@@ -588,8 +588,8 @@ class ToolsEngine:
                     'error': error,
                     'timestamp': time.time()
                 })
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Telemetry error: {e}")
 
     def _dispatch(self, tool_name: str, args: Dict) -> ToolResult:
         """Dispatch to appropriate tool method"""
