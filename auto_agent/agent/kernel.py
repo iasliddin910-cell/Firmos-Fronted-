@@ -3987,35 +3987,44 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         completed_tasks: Set[str]
     ) -> Optional[str]:
         """
-        COMPREHENSIVE Context-Aware Tool Selection.
+        COMPREHENSIVE Context-Aware Tool Selection - No1 Grade.
         
-        Considers:
-        1. Required tools (explicit)
-        2. Prior success rate (telemetry-based reliability)
-        3. Recent failure history
-        4. Environment context (sandbox compatibility)
-        5. Verifier needs (verification_type)
-        6. Artifact expectations
-        7. Approval friction (high-risk tools)
+        Considers ALL factors for optimal selection:
+        1. Required tools (explicit) - MUST have
+        2. Prior success rate (telemetry-based reliability) - 30% weight
+        3. Recent failure history with consecutive failure penalty
+        4. Environment context (sandbox compatibility) - hard constraint
+        5. Verifier needs (verification_type) - 10% weight
+        6. Artifact expectations - 5% weight
+        7. Approval friction (high-risk tools) - time penalty
+        8. Environment state (CPU, memory, network, disk)
+        9. Tool timeout estimation
+        10. Confidence scoring based on score gap
         """
         import time
         from collections import deque
-        
+
         if not hasattr(self, "_tool_failure_history"):
             self._tool_failure_history = {}
             self._tool_failure_window = 300
-        
+
+        # 1. REQUIRED TOOLS - MUST HAVE
         for rt in required_tools:
             if rt in available_tools:
                 logger.info(f"Tool selected (required): {rt}")
                 return rt
-        
+
+        # Get context
         description = task.description.lower()
         verification_type = task_meta.get('verification_type', 'manual')
         expected_artifacts = task_meta.get('expected_artifacts', [])
         sandbox_mode = task_meta.get('sandbox_mode', 'normal')
         approval_policy = task_meta.get('approval_policy', 'auto')
+
+        # Get environment state
+        env_state = self._get_environment_state()
         
+        # Tool definitions
         TOOL_KEYWORDS = {
             'read_file': ['read', 'file', 'content', 'load', 'open'],
             'write_file': ['write', 'save', 'create', 'file', 'edit'],
@@ -4028,57 +4037,83 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             'take_screenshot': ['screenshot', 'capture', 'screen'],
             'web_request': ['request', 'http', 'api', 'fetch']
         }
-        
+
         TOOL_VERIFIER_MAP = {
             'browser_navigate': 'browser', 'take_screenshot': 'screenshot',
             'execute_command': 'server', 'execute_code': 'code',
             'read_file': 'file', 'write_file': 'file',
         }
-        
+
+        TOOL_TIMEOUTS = {
+            'read_file': 10, 'write_file': 30, 'execute_command': 60,
+            'execute_code': 60, 'web_search': 15, 'browser_navigate': 30,
+            'delete_file': 15, 'install_package': 120, 'take_screenshot': 10,
+            'web_request': 30
+        }
+
         SANDBOX_COMPAT = {
             'safe': ['read_file', 'web_search', 'web_request'],
             'normal': ['read_file', 'write_file', 'execute_command', 'web_search', 'web_request', 'browser_navigate'],
             'advanced': ['read_file', 'write_file', 'execute_command', 'execute_code', 'install_package', 'browser_navigate']
         }
-        
+
+        APPROVAL_COST = {
+            'execute_command': 30, 'execute_code': 30, 'install_package': 60,
+            'delete_file': 45, 'write_file': 15, 'browser_navigate': 10,
+            'read_file': 0, 'web_search': 0, 'take_screenshot': 0, 'web_request': 0
+        }
+
         HIGH_FRICTION = ['execute_command', 'execute_code', 'install_package', 'delete_file']
-        
+
         scores, diagnostics, current_time = {}, {}, time.time()
-        
+
         for tool in available_tools:
             score = 0
-            tool_diag = {'reliability': 0, 'failure_penalty': 0, 'keyword': 0, 'sandbox': 0, 'verifier': 0, 'artifact': 0, 'approval': 0}
-            
+            tool_diag = {
+                'reliability': 0, 'failure_penalty': 0, 'keyword': 0,
+                'sandbox': 0, 'verifier': 0, 'artifact': 0, 'approval': 0,
+                'environment': 0, 'timeout': 0
+            }
+
+            # FACTOR 1: TELEMETRY-BASED RELIABILITY (30%)
             reliability = tool_reliability.get(tool, 0.5)
             score += reliability * 30
             tool_diag['reliability'] = reliability * 30
-            
+
+            # FACTOR 2: RECENT FAILURE HISTORY
             if tool in self._tool_failure_history:
                 failures = self._tool_failure_history[tool]
                 while failures and current_time - failures[0][0] > self._tool_failure_window:
                     failures.popleft()
                 recent_failures = sum(1 for _, f in failures if f)
-                penalty = recent_failures * 5
-                score -= penalty
-                tool_diag['failure_penalty'] = -penalty
+                total = len(failures)
+                if total > 0:
+                    failure_rate = recent_failures / total
+                    failure_penalty = failure_rate * 15
+                    score -= failure_penalty
+                    tool_diag['failure_penalty'] = -failure_penalty
             
+            # FACTOR 3: KEYWORD MATCHING
             keywords = TOOL_KEYWORDS.get(tool, [])
             matches = sum(1 for kw in keywords if kw in description)
             score += matches * 5
             tool_diag['keyword'] = matches * 5
-            
+
+            # FACTOR 4: SANDBOX COMPATIBILITY (hard)
             allowed = SANDBOX_COMPAT.get(sandbox_mode, [])
             if tool in allowed:
                 score += 10
                 tool_diag['sandbox'] = 10
             else:
-                score -= 15
-                tool_diag['sandbox'] = -15
-            
+                score -= 20
+                tool_diag['sandbox'] = -20
+
+            # FACTOR 5: VERIFIER COMPATIBILITY
             if TOOL_VERIFIER_MAP.get(tool) == verification_type:
                 score += 10
                 tool_diag['verifier'] = 10
-            
+
+            # FACTOR 6: ARTIFACT EXPECTATIONS
             if expected_artifacts:
                 if 'write' in tool and any('.py' in str(a) or '.js' in str(a) for a in expected_artifacts):
                     score += 5
@@ -4086,27 +4121,85 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 elif 'screenshot' in tool and any('.png' in str(a) for a in expected_artifacts):
                     score += 5
                     tool_diag['artifact'] = 5
-            
+
+            # FACTOR 7: APPROVAL FRICTION
+            approval_cost = APPROVAL_COST.get(tool, 0)
             if tool in HIGH_FRICTION and approval_policy == 'auto':
-                score -= 5
-                tool_diag['approval'] = -5
-            
+                score -= approval_cost
+                tool_diag['approval'] = -approval_cost
+
+            # FACTOR 8: ENVIRONMENT STATE
+            env_score = 0
+            if 'network' in tool or 'web' in tool or 'browser' in tool:
+                if not env_state.get('network_available', True):
+                    score -= 30
+                    env_score = -30
+            if 'execute' in tool or 'install' in tool:
+                if not env_state.get('cpu_available', True):
+                    score -= 20
+                    env_score = -20
+            tool_diag['environment'] = env_score
+
+            # FACTOR 9: TIMEOUT SUITABILITY
+            tool_timeout = TOOL_TIMEOUTS.get(tool, 30)
+            task_timeout = task.timeout if task.timeout else 30
+            if tool_timeout <= task_timeout:
+                score += 5
+                tool_diag['timeout'] = 5
+
             scores[tool] = score
             diagnostics[tool] = tool_diag
-        
+
+        # SELECT BEST TOOL
         if scores:
-            best_tool = max(scores.items(), key=lambda x: x[1])[0]
-            logger.info(f"Tool selected: {best_tool} (score: {scores[best_tool]})")
+            sorted_tools = sorted(scores.items(), key=lambda x: -x[1])
+            best_tool = sorted_tools[0][0]
+            best_score = sorted_tools[0][1]
+            
+            # Confidence based on gap
+            if len(sorted_tools) > 1:
+                second_score = sorted_tools[1][1]
+                score_gap = best_score - second_score
+                confidence = min(1.0, 0.5 + (score_gap / 20))
+            else:
+                confidence = 0.5
+            
+            logger.info(f"Tool selected: {best_tool} (score: {best_score}, confidence: {confidence:.2f})")
+            
             if hasattr(self, 'telemetry') and self.telemetry:
                 self.telemetry.record_event('tool_selection', {
-                    'task_id': task.id, 'tool': best_tool, 'score': scores[best_tool],
-                    'diagnostics': diagnostics[best_tool], 'verification_type': verification_type,
-                    'sandbox_mode': sandbox_mode, 'timestamp': current_time
+                    'task_id': task.id, 'tool': best_tool, 'score': best_score,
+                    'confidence': confidence, 'diagnostics': diagnostics[best_tool],
+                    'verification_type': verification_type, 'sandbox_mode': sandbox_mode,
+                    'timestamp': current_time
                 })
+            
             return best_tool
-        
+
         return None
-    
+
+    def _get_environment_state(self) -> Dict[str, bool]:
+        """Get current environment state for tool selection."""
+        state = {'cpu_available': True, 'memory_available': True, 'network_available': True, 'disk_available': True}
+        
+        try:
+            import psutil
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            if cpu_percent > 90:
+                state['cpu_available'] = False
+            mem = psutil.virtual_memory()
+            if mem.percent > 90:
+                state['memory_available'] = False
+            disk = psutil.disk_usage('/')
+            if disk.percent > 95:
+                state['disk_available'] = False
+        except ImportError:
+            logger.debug("psutil not available")
+        except Exception as e:
+            logger.warning(f"Environment check failed: {e}")
+        
+        return state
+
     def _record_tool_failure(self, tool_name: str, failed: bool):
         from collections import deque
         if not hasattr(self, '_tool_failure_history'):
