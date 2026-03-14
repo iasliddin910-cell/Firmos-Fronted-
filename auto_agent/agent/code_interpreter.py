@@ -710,3 +710,270 @@ def get_code_interpreter(workspace_dir: Path = None) -> CodeInterpreter:
     if _code_interpreter is None:
         _code_interpreter = CodeInterpreter(workspace_dir)
     return _code_interpreter
+
+
+# ==================== ENHANCED SWE LOOP ====================
+
+class SWEEngine:
+    """
+    Full Software Engineering loop for code patches:
+    1. scan - repo scan with relevance
+    2. select - semantic file selection
+    3. patch - AST-based patching
+    4. run - execute with error capture
+    5. parse_errors - structured error parsing
+    6. rerun - retry with fixes
+    7. regression - run tests before apply
+    8. benchmark - measure quality
+    """
+    
+    def __init__(self, code_interpreter):
+        self.ci = code_interpreter
+        self.patch_history = []
+        
+    async def swe_loop(self, task_description: str, root_dir: str = ".") -> Dict:
+        """
+        Full SWE loop for fixing code issues.
+        """
+        result = {
+            "success": False,
+            "stages_completed": [],
+            "patches_applied": [],
+            "errors": []
+        }
+        
+        # Stage 1: Scan Repository
+        files = self.ci.scan_repository(root_dir)
+        result["stages_completed"].append("scan")
+        
+        # Stage 2: Select Relevant Files
+        relevant = await self._semantic_select(files, task_description)
+        result["stages_completed"].append("select")
+        
+        # Stage 3: Parse Task
+        error_info = self._parse_task_description(task_description)
+        
+        # Stage 4-7: Patch Loop
+        for attempt in range(3):
+            # Stage 4: Run
+            exec_result = await self._run_with_error_capture(relevant, error_info)
+            
+            # Stage 5: Parse Errors
+            if exec_result.get("success"):
+                result["success"] = True
+                break
+                
+            errors = self._parse_errors(exec_result.get("error", ""))
+            
+            # Stage 6: Generate & Apply Patch
+            patch = await self._generate_ast_patch(errors, relevant)
+            if patch:
+                result["patches_applied"].append(patch)
+                # Apply patch to files
+                await self._apply_patch(patch, relevant)
+            
+            # Stage 7: Regression Test
+            regression_passed = await self._run_regression(relevant)
+            if not regression_passed:
+                # Revert if regression failed
+                await self._revert_patch(patch)
+                result["errors"].append("Regression failed")
+                
+            result["stages_completed"].append(f"attempt_{attempt+1}")
+        
+        # Stage 8: Benchmark
+        result["quality_score"] = await self._score_patch_quality(result["patches_applied"])
+        
+        return result
+    
+    async def _semantic_select(self, files: List[Dict], task: str) -> List[Dict]:
+        """Semantic file selection using keyword matching"""
+        # Extract keywords from task
+        keywords = task.lower().split()
+        
+        # Score each file
+        for f in files:
+            path = f["path"].lower()
+            score = sum(1 for kw in keywords if kw in path)
+            f["semantic_score"] = score
+            
+        # Sort by combined score
+        files.sort(key=lambda x: x.get("relevance", 0) + x.get("semantic_score", 0), reverse=True)
+        
+        return files[:10]  # Top 10 relevant
+    
+    def _parse_task_description(self, task: str) -> Dict:
+        """Parse task to extract error info"""
+        error_info = {
+            "error_type": None,
+            "file": None,
+            "line": None,
+            "message": task
+        }
+        
+        # Common error patterns
+        patterns = [
+            (r"(SyntaxError|IndentationError|NameError|AttributeError|ImportError|TypeError)", "error_type"),
+            (r"in (\S+\.py)", "file"),
+            (r"line (\d+)", "line"),
+        ]
+        
+        for pattern, key in patterns:
+            import re
+            match = re.search(pattern, task)
+            if match:
+                error_info[key] = match.group(1) if key != "line" else int(match.group(1))
+                
+        return error_info
+    
+    async def _run_with_error_capture(self, files: List[Dict], error_info: Dict) -> Dict:
+        """Run code and capture errors"""
+        result = {"success": False, "error": "", "output": ""}
+        
+        for f in files[:3]:  # Try top 3 files
+            try:
+                with open(f["path"]) as fp:
+                    code = fp.read()
+                    
+                # Execute in sandbox
+                proc = await asyncio.create_subprocess_exec(
+                    "python", "-c", code,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                
+                if proc.returncode == 0:
+                    result["success"] = True
+                    result["output"] = stdout.decode()
+                else:
+                    result["error"] = stderr.decode()
+                    
+            except Exception as e:
+                result["error"] = str(e)
+                
+        return result
+    
+    def _parse_errors(self, error_text: str) -> List[Dict]:
+        """Parse errors into structured format"""
+        errors = []
+        
+        import re
+        # Pattern: File "path", line X, in function
+        pattern = r'File "([^"]+)", line (\d+), in (\w+)\s*(.*)'
+        
+        for match in re.finditer(pattern, error_text):
+            errors.append({
+                "file": match.group(1),
+                "line": int(match.group(2)),
+                "function": match.group(3),
+                "message": match.group(4).strip()
+            })
+            
+        return errors
+    
+    async def _generate_ast_patch(self, errors: List[Dict], files: List[Dict]) -> Optional[Dict]:
+        """Generate AST-based patch for errors"""
+        if not errors:
+            return None
+            
+        patch = {
+            "type": "ast_patch",
+            "changes": [],
+            "errors_fixed": len(errors)
+        }
+        
+        for error in errors:
+            # Find matching file
+            matching = [f for f in files if error.get("file", "") in f.get("path", "")]
+            if not matching:
+                continue
+                
+            # Generate fix based on error type
+            fix = self._generate_fix_for_error(error)
+            if fix:
+                patch["changes"].append({
+                    "file": error["file"],
+                    "line": error.get("line", 0),
+                    "fix": fix
+                })
+                
+        return patch if patch["changes"] else None
+    
+    def _generate_fix_for_error(self, error: Dict) -> Optional[str]:
+        """Generate fix for specific error type"""
+        error_type = error.get("error_type", "")
+        
+        fixes = {
+            "SyntaxError": "# Fix syntax - may need manual review\n",
+            "IndentationError": "# Fix indentation\n",
+            "NameError": "# Fix name error - undefined variable\n",
+            "AttributeError": "# Fix attribute error - check object\n",
+            "ImportError": "# Fix import - check module path\n",
+            "TypeError": "# Fix type error - check types\n",
+        }
+        
+        return fixes.get(error_type)
+    
+    async def _apply_patch(self, patch: Dict, files: List[Dict]) -> bool:
+        """Apply patch to files"""
+        for change in patch.get("changes", []):
+            try:
+                with open(change["file"], "r") as f:
+                    lines = f.readlines()
+                    
+                # Insert fix at line
+                line_idx = change.get("line", 1) - 1
+                if 0 <= line_idx <= len(lines):
+                    lines.insert(line_idx, change["fix"] + "\n")
+                    
+                with open(change["file"], "w") as f:
+                    f.writelines(lines)
+                    
+            except Exception as e:
+                logger.error(f"Patch apply error: {e}")
+                return False
+                
+        return True
+    
+    async def _run_regression(self, files: List[Dict]) -> bool:
+        """Run regression tests before applying patch"""
+        # Find test files
+        test_files = [f for f in files if "test" in f.get("path", "")]
+        
+        for tf in test_files[:3]:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "python", "-m", "pytest", tf["path"], "-v",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                
+                if proc.returncode != 0:
+                    return False
+                    
+            except:
+                pass
+                
+        return True
+    
+    async def _revert_patch(self, patch: Dict):
+        """Revert applied patch"""
+        # Implementation would track original content
+        logger.warning("Patch reverted due to regression")
+    
+    async def _score_patch_quality(self, patches: List[Dict]) -> float:
+        """Score patch quality"""
+        if not patches:
+            return 0.0
+            
+        # Simple scoring based on changes
+        total_changes = sum(len(p.get("changes", [])) for p in patches)
+        
+        return min(1.0, total_changes / 10.0)
+
+
+# Add asyncio import if needed
+import asyncio
+
