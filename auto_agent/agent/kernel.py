@@ -3703,9 +3703,27 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 # =====================================================
                 step_duration = time.time() - step_start_time
                 
-                # SIMPLE Success Semantics
-                final_success = exec_result.success and verification_passed
+                # =====================================================
+                # RUNTIME TRUTH SUCCESS SEMANTICS - No1 Grade
+                # =====================================================
+                # SUCCESS IS DETERMINED BY:
+                # 1. exec_result.success - REAL tool runtime result (NOT model claim)
+                # 2. verification_passed - Verification check passed
+                # 3. NO MODEL CLAIM CAN OVERRIDE REAL RESULTS
+                # =====================================================
                 
+                # Log validation sources for audit
+                validation_sources = {
+                    'runtime_success': exec_result.success,
+                    'verification_passed': verification_passed,
+                    'exit_code': exec_result.exit_code,
+                    'has_error': bool(exec_result.error),
+                    'artifact_count': len(exec_result.artifacts)
+                }
+                
+                # FINAL SUCCESS: Only if runtime + verification both pass
+                final_success = exec_result.success and verification_passed
+
                 self._last_execution_results[task.id] = {
                     'success': final_success,
                     'execution_result': exec_result.to_dict(),
@@ -3713,7 +3731,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'verification_details': verification_details,
                     'tool_used': tool_name,
                     'duration': step_duration,
-                    'approval_status': approval_status
+                    'approval_status': approval_status,
+                    'validation_sources': validation_sources  # Audit trail
                 }
                 
                 if final_success:
@@ -4410,10 +4429,15 @@ Return ONLY valid JSON: {{
                 }
                 
             elif hasattr(self, 'native_brain'):
-                # Fallback: Use brain's execution capability if no tools
-                exec_result.stdout = response  # Use model output as last resort
-                exec_result.success = model_suggestion.get('success', False) if model_suggestion else False
-                logger.warning("No tools engine, using brain fallback - less reliable")
+                # CRITICAL: Brain fallback should NEVER claim success based on model output
+                # Only use model output as stdout, success must be based on actual execution
+                exec_result.stdout = response
+                
+                # STRICT: Brain fallback is UNRELIABLE for success determination
+                # Default to False unless we have actual execution evidence
+                exec_result.success = False
+                exec_result.error = "Brain fallback: No real tool execution - success cannot be verified"
+                logger.warning("⚠️ No tools engine - using brain fallback (UNRELIABLE for success)")
             else:
                 exec_result.error = "No execution engine available"
                 
@@ -4469,10 +4493,11 @@ Return ONLY valid JSON: {{
         # Log validation sources for debugging
         logger.info(f"Execution validation for task {task.id}: {validation_source}")
         
-        # Don't trust model - use real results
-        # If model claimed success but real execution failed, trust real execution
-        if model_suggestion and model_suggestion.get('success') and not exec_result.success:
-            logger.warning(f"Model claimed success but REAL execution failed! Using real result.")
+        # =====================================================
+        # CRITICAL: MODEL CANNOT OVERRIDE REAL EXECUTION RESULTS
+        # =====================================================
+        # If model claimed success but real execution failed, we trust REAL execution
+        # This is logged but we use the real result (already set above)
         
         return exec_result
     
