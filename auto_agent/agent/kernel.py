@@ -2661,13 +2661,21 @@ Return JSON with tasks array containing: id, description, priority, dependencies
 
                             if isinstance(tasks_data, list):
                                 # Create tasks with diagnostics
-                                tasks = self._create_tasks_from_plan({"tasks": tasks_data}, response_snippet=response)
+                                tasks = self._create_tasks_from_plan({"tasks": tasks_data}, response_snippet=response, parser_strategy=strategy_name)
                                 if tasks:
                                     parsing_attempts.append({
                                         'strategy': strategy_name, 'success': True, 'tasks_count': len(tasks), 'time_ms': (time.time() - start_time) * 1000
                                     })
                                     self._emit_plan_parsing_telemetry(True, parsing_attempts, response, parse_diagnostics, strategy_name)
                                     return tasks
+                                else:
+                                    # All tasks were invalid - log detailed diagnostics
+                                    logger.warning(f"⚠️ Strategy '{strategy_name}' created 0 valid tasks from {len(tasks_data)} parsed items")
+                                    parse_diagnostics['failures'].append({
+                                        'strategy': strategy_name,
+                                        'reason': 'all_tasks_invalid',
+                                        'parsed_count': len(tasks_data)
+                                    })
                         else:
                             # Schema failed - log detailed diagnostics
                             parse_diagnostics['failures'].append({
@@ -3025,7 +3033,13 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             'errors': errors
         }
     
-    def _create_tasks_from_plan(self, plan_data: Dict, response_snippet: str = "") -> List[Task]:
+    def _create_tasks_from_plan(self, plan_data: Dict, response_snippet: str = "", parser_strategy: str = "unknown") -> List[Task]:
+        """
+        Args:
+            plan_data: The parsed plan data
+            response_snippet: Original LLM response snippet for diagnostics
+            parser_strategy: The strategy that was used to parse this plan (for diagnostics)
+        """
         """
         Create tasks from plan data with ENHANCED validation and detailed diagnostics.
         
@@ -3089,7 +3103,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'failed_fields': failed_fields,
                     'errors': task_errors,
                     'snippet': snippet,
-                    'parse_reason': 'not_a_dictionary'
+                    'parse_reason': 'not_a_dictionary',
+                    'parser_strategy': parser_strategy,
+                    'timestamp': time.time()
                 })
                 continue
             
@@ -3169,7 +3185,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'failed_fields': failed_fields,
                     'errors': task_errors,
                     'snippet': snippet,
-                    'parse_reason': parse_reason or 'critical_validation_error'
+                    'parse_reason': parse_reason or 'critical_validation_error',
+                    'parser_strategy': parser_strategy,
+                    'timestamp': time.time()
                 })
                 continue
             
@@ -3227,7 +3245,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     'failed_fields': ['creation_exception'],
                     'errors': [str(e)],
                     'snippet': snippet,
-                    'parse_reason': 'task_creation_error'
+                    'parse_reason': 'task_creation_error',
+                    'parser_strategy': parser_strategy,
+                    'timestamp': time.time()
                 })
                 task_validation_counters['creation_error'] += 1
         
@@ -3236,8 +3256,16 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         if invalid_tasks:
             logger.error(f"❌ Task validation FAILED: {len(invalid_tasks)}/{total_tasks} tasks invalid")
             logger.error(f"   Validation counters: {task_validation_counters}")
+            
+            # Structured diagnostic output
             for inv in invalid_tasks:
-                logger.error("   Task {}: fields={}, reason={}, errors={}".format(inv["index"], inv["failed_fields"], inv["parse_reason"], inv["errors"]))
+                logger.error("   ===== FAILED TASK DIAGNOSTIC =====")
+                logger.error(f"   📋 Task Index: {inv['index']}")
+                logger.error(f"   🔍 Failed Fields: {inv['failed_fields']}")
+                logger.error(f"   ⚠️  Parse Reason: {inv['parse_reason']}")
+                logger.error(f"   💥 Errors: {inv['errors']}")
+                logger.error(f"   📝 Snippet: {inv.get('snippet', 'N/A')[:100]}...")
+                logger.error("   ====================================")
         
         # Calculate planner quality metrics
         success_rate = (len(tasks) / total_tasks * 100) if total_tasks > 0 else 0
