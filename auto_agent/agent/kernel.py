@@ -2312,7 +2312,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                                 tasks_data = tasks_data['tasks']
                             
                             if isinstance(tasks_data, list):
-                                tasks = self._create_tasks_from_plan({"tasks": tasks_data})
+                                tasks = self._create_tasks_from_plan({"tasks": tasks_data}, response_snippet=response)
                                 if tasks:
                                     parsing_attempts.append({
                                         'strategy': strategy_name,
@@ -2551,9 +2551,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             'errors': errors
         }
     
-    def _create_tasks_from_plan(self, plan_data: Dict) -> List[Task]:
+    def _create_tasks_from_plan(self, plan_data: Dict, response_snippet: str = "") -> List[Task]:
         """
-        Create tasks from plan data with ENHANCED validation.
+        Create tasks from plan data with ENHANCED validation and detailed diagnostics.
         
         Fixed issues:
         - Required fields validation
@@ -2562,13 +2562,27 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         - Allowed sandbox modes validation
         - Tool existence check
         - No more silent minimal task creation on parse errors
+        - Detailed invalid task tracking with full diagnostics
+        - Planner quality metrics
+        - Self-improvement feedback
         """
         
         import uuid
         import time
+        import json
         
         tasks = []
-        invalid_tasks = []  # Track invalid tasks
+        invalid_tasks = []  # Track invalid tasks with full diagnostics
+        task_validation_counters = {
+            'missing_description': 0,
+            'invalid_priority': 0,
+            'invalid_verification': 0,
+            'invalid_approval': 0,
+            'invalid_sandbox': 0,
+            'unknown_tools': 0,
+            'invalid_dependencies': 0,
+            'creation_error': 0,
+        }
         
         # Allowed values
         ALLOWED_PRIORITIES = ['CRITICAL', 'HIGH', 'NORMAL', 'LOW', '']
@@ -2583,38 +2597,61 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             'web_search', 'web_request', 'install_package', 'take_screenshot'
         ]
         
+        # Get snippet from response for diagnostics
+        snippet = response_snippet[:500] if response_snippet else ""
+        
         for i, t in enumerate(plan_data.get('tasks', [])):
             task_errors = []
+            failed_fields = []
             
             # Skip if not a dict
             if not isinstance(t, dict):
-                task_errors.append(f"Task {i} is not a dictionary")
-                invalid_tasks.append({'index': i, 'errors': task_errors, 'data': t})
+                error_msg = f"Task {i} is not a dictionary"
+                task_errors.append(error_msg)
+                failed_fields.append('type_check_failed')
+                task_validation_counters['creation_error'] += 1
+                invalid_tasks.append({
+                    'index': i,
+                    'failed_fields': failed_fields,
+                    'errors': task_errors,
+                    'snippet': snippet,
+                    'parse_reason': 'not_a_dictionary'
+                })
                 continue
             
             # Validate required fields
             if not t.get('description'):
                 task_errors.append(f"Task {i} missing 'description'")
+                failed_fields.append('description')
+                task_validation_counters['missing_description'] += 1
             
             # Validate priority
             priority = t.get('priority', '').upper()
             if priority and priority not in ALLOWED_PRIORITIES:
                 task_errors.append(f"Invalid priority: {priority}")
+                failed_fields.append('priority')
+                task_validation_counters['invalid_priority'] += 1
             
             # Validate verification_type
             verification = t.get('verification_type', '').lower()
             if verification and verification not in ALLOWED_VERIFICATION:
                 task_errors.append(f"Invalid verification_type: {verification}")
+                failed_fields.append('verification_type')
+                task_validation_counters['invalid_verification'] += 1
             
             # Validate approval_policy
             approval = t.get('approval_policy', '').lower()
             if approval and approval not in ALLOWED_APPROVAL:
                 task_errors.append(f"Invalid approval_policy: {approval}")
+                failed_fields.append('approval_policy')
+                task_validation_counters['invalid_approval'] += 1
             
             # Validate sandbox_mode
             sandbox = t.get('sandbox_mode', '').lower()
             if sandbox and sandbox not in ALLOWED_SANDBOX:
                 task_errors.append(f"Invalid sandbox_mode: {sandbox}")
+                failed_fields.append('sandbox_mode')
+                task_validation_counters['invalid_sandbox'] += 1
             
             # Validate required_tools if present
             required_tools = t.get('required_tools', [])
@@ -2623,21 +2660,43 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     unknown_tools = [tool for tool in required_tools if tool not in KNOWN_TOOLS]
                     if unknown_tools:
                         task_errors.append(f"Unknown tools: {unknown_tools}")
+                        failed_fields.append('required_tools')
+                        task_validation_counters['unknown_tools'] += 1
                 else:
                     task_errors.append("'required_tools' must be a list")
+                    failed_fields.append('required_tools')
             
             # Validate dependencies if present
             deps = t.get('dependencies', [])
             if deps:
                 if not isinstance(deps, list):
                     task_errors.append("'dependencies' must be a list")
+                    failed_fields.append('dependencies')
+                    task_validation_counters['invalid_dependencies'] += 1
+            
+            # Determine parse reason
+            if task_errors:
+                if any('description' in e for e in task_errors):
+                    parse_reason = 'missing_required_field'
+                elif any('Invalid priority' in e for e in task_errors):
+                    parse_reason = 'invalid_field_value'
+                else:
+                    parse_reason = 'validation_failed'
+            else:
+                parse_reason = None
             
             # If there are critical errors, skip this task
             critical_errors = [e for e in task_errors if 'description' in e or 'priority' in e or 'Invalid' in e]
             
             if critical_errors:
                 logger.warning(f"Task {i} skipped due to critical errors: {critical_errors}")
-                invalid_tasks.append({'index': i, 'errors': task_errors, 'data': t})
+                invalid_tasks.append({
+                    'index': i,
+                    'failed_fields': failed_fields,
+                    'errors': task_errors,
+                    'snippet': snippet,
+                    'parse_reason': parse_reason or 'critical_validation_error'
+                })
                 continue
             
             # If non-critical errors (like unknown tools), log but still create task
@@ -2689,22 +2748,67 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 
             except Exception as e:
                 logger.error(f"Failed to create task {i}: {e}")
-                invalid_tasks.append({'index': i, 'errors': [str(e)], 'data': t})
+                invalid_tasks.append({
+                    'index': i,
+                    'failed_fields': ['creation_exception'],
+                    'errors': [str(e)],
+                    'snippet': snippet,
+                    'parse_reason': 'task_creation_error'
+                })
+                task_validation_counters['creation_error'] += 1
         
-        # Log summary of invalid tasks
+        # Log summary of invalid tasks with detailed diagnostics
+        total_tasks = len(plan_data.get('tasks', []))
         if invalid_tasks:
-            logger.warning(f"Total invalid tasks skipped: {len(invalid_tasks)}/{len(plan_data.get('tasks', []))}")
+            logger.error(f"❌ Task validation FAILED: {len(invalid_tasks)}/{total_tasks} tasks invalid")
+            logger.error(f"   Validation counters: {task_validation_counters}")
             for inv in invalid_tasks:
-                logger.warning(f"  Task {inv['index']}: {inv['errors']}")
+                logger.error(f"   Task {inv['index']}: fields={inv['failed_fields]}, reason={inv['parse_reason']}, errors={inv['errors']}")
         
-        # Emit telemetry for task creation quality
+        # Calculate planner quality metrics
+        success_rate = (len(tasks) / total_tasks * 100) if total_tasks > 0 else 0
+        quality_grade = "EXCELLENT" if success_rate >= 90 else "GOOD" if success_rate >= 70 else "NEEDS_IMPROVEMENT" if success_rate >= 50 else "POOR"
+        
+        logger.info(f"📊 Planner quality: {quality_grade} ({len(tasks)}/{total_tasks} = {success_rate:.1f}%)")
+        
+        # Emit ALWAYS (not conditional) - comprehensive telemetry for task creation quality
+        telemetry_data = {
+            'total_tasks': total_tasks,
+            'valid_tasks': len(tasks),
+            'invalid_tasks': len(invalid_tasks),
+            'success_rate': success_rate,
+            'quality_grade': quality_grade,
+            'validation_counters': task_validation_counters,
+            'invalid_details': invalid_tasks,  # Full details with index, failed_fields, snippet, parse_reason
+            'timestamp': time.time()
+        }
+        
+        # Log telemetry prominently
+        logger.info(f"📈 Task creation telemetry: {json.dumps(telemetry_data, indent=2)}")
+        
+        # Emit to telemetry if available
         if hasattr(self, 'telemetry') and self.telemetry:
-            self.telemetry.record_event('task_creation', {
-                'total_tasks': len(plan_data.get('tasks', [])),
-                'valid_tasks': len(tasks),
-                'invalid_tasks': len(invalid_tasks),
-                'invalid_details': invalid_tasks
-            })
+            try:
+                self.telemetry.record_event('task_creation', telemetry_data)
+            except Exception as e:
+                logger.error(f"Failed to emit task_creation telemetry: {e}")
+        
+        # Emit self-improvement signal if there are invalid tasks
+        if hasattr(self, 'emit_improvement_signal') and invalid_tasks:
+            try:
+                self.emit_improvement_signal('task_creation_failure', {
+                    'quality_grade': quality_grade,
+                    'success_rate': success_rate,
+                    'validation_counters': task_validation_counters,
+                    'top_failure_reasons': [
+                        {'reason': k, 'count': v} 
+                        for k, v in sorted(task_validation_counters.items(), key=lambda x: -x[1]) 
+                        if v > 0
+                    ][:5],
+                    'failed_task_indices': [inv['index'] for inv in invalid_tasks]
+                })
+            except Exception as e:
+                logger.error(f"Failed to emit improvement signal: {e}")
         
         return tasks
     
