@@ -5892,6 +5892,256 @@ Return ONLY valid JSON (no other text):
         
         return recovery_result
     
+    # ==================== RECOVERY DECISION ENGINE ====================
+    
+    def _determine_recovery_strategy(
+        self, 
+        error_type: Optional[ErrorType], 
+        failed_task: Optional[Task],
+        retry_budget: Dict[str, int]
+    ) -> Tuple[RecoveryStrategy, float]:
+        """
+        Determine the best recovery strategy with confidence scoring.
+        
+        Returns:
+            Tuple of (strategy, confidence_score) where confidence is 0.0 to 1.0
+        """
+        
+        if not failed_task:
+            logger.warning("No failed task - defaulting to ABORT")
+            return RecoveryStrategy.ABORT, 0.0
+        
+        task_id = failed_task.id
+        task_meta = failed_task.input_data or {}
+        current_retry_count = failed_task.retry_count
+        
+        # Get retry budget for this task
+        max_retries = retry_budget.get(task_id, 3)
+        
+        # Check if retry budget exhausted
+        if current_retry_count >= max_retries:
+            logger.warning(f"Retry budget exhausted for {task_id} ({current_retry_count}/{max_retries})")
+            
+            # If we've tried multiple times, escalate to human
+            if current_retry_count >= max_retries * 2:
+                return RecoveryStrategy.ESCALATE_TO_HUMAN, 0.9
+            
+            # Otherwise abort
+            return RecoveryStrategy.ABORT, 0.95
+        
+        # Error-type specific recovery mapping
+        error_recovery_map = {
+            # Execution errors
+            ErrorType.EXECUTION_FAILED: {
+                'primary': RecoveryStrategy.RETRY_SAME_TOOL,
+                'confidence': 0.6,
+                'conditions': [lambda t: t.retry_count < 2]
+            },
+            ErrorType.EXECUTION_TIMEOUT: {
+                'primary': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'confidence': 0.7,
+                'conditions': [lambda t: t.retry_count < 3]
+            },
+            ErrorType.EXECUTION_CRASHED: {
+                'primary': RecoveryStrategy.ALTERNATE_TOOL,
+                'confidence': 0.5,
+                'conditions': [lambda t: True]
+            },
+            
+            # Verification errors
+            ErrorType.VERIFICATION_FAILED: {
+                'primary': RecoveryStrategy.REPLAN,
+                'confidence': 0.65,
+                'conditions': [lambda t: t.retry_count < 2]
+            },
+            ErrorType.VERIFICATION_MISSING: {
+                'primary': RecoveryStrategy.RETRY_SAME_TOOL,
+                'confidence': 0.4,
+                'conditions': [lambda t: True]
+            },
+            
+            # Tool errors
+            ErrorType.TOOL_NOT_FOUND: {
+                'primary': RecoveryStrategy.ALTERNATE_TOOL,
+                'confidence': 0.7,
+                'conditions': [lambda t: True]
+            },
+            ErrorType.TOOL_INVALID_ARGS: {
+                'primary': RecoveryStrategy.REPLAN,
+                'confidence': 0.6,
+                'conditions': [lambda t: True]
+            },
+            
+            # Resource errors
+            ErrorType.RESOURCE_NOT_FOUND: {
+                'primary': RecoveryStrategy.REPLAN,
+                'confidence': 0.5,
+                'conditions': [lambda t: True]
+            },
+            ErrorType.RESOURCE_BUSY: {
+                'primary': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'confidence': 0.6,
+                'conditions': [lambda t: t.retry_count < 2]
+            },
+            
+            # Network errors
+            ErrorType.NETWORK_ERROR: {
+                'primary': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'confidence': 0.7,
+                'conditions': [lambda t: t.retry_count < 3]
+            },
+            ErrorType.NETWORK_TIMEOUT: {
+                'primary': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'confidence': 0.75,
+                'conditions': [lambda t: t.retry_count < 3]
+            },
+            
+            # Approval errors - Special handling
+            ErrorType.APPROVAL_DENIED: {
+                'primary': RecoveryStrategy.ABORT,
+                'confidence': 0.9,
+                'conditions': [lambda t: True],
+                'alternative': RecoveryStrategy.ALTERNATE_TOOL
+            },
+            ErrorType.APPROVAL_TIMEOUT: {
+                'primary': RecoveryStrategy.RETRY_SAME_TOOL,
+                'confidence': 0.5,
+                'conditions': [lambda t: t.retry_count < 2],
+                'alternative': RecoveryStrategy.REPLAN
+            },
+            
+            # System errors
+            ErrorType.SYSTEM_ERROR: {
+                'primary': RecoveryStrategy.ESCALATE_TO_HUMAN,
+                'confidence': 0.85,
+                'conditions': [lambda t: True]
+            },
+            
+            ErrorType.UNKNOWN_ERROR: {
+                'primary': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'confidence': 0.3,
+                'conditions': [lambda t: t.retry_count < 2]
+            },
+        }
+        
+        # Get mapping for this error type
+        if error_type in error_recovery_map:
+            mapping = error_recovery_map[error_type]
+            primary_strategy = mapping['primary']
+            base_confidence = mapping['confidence']
+            
+            # Check conditions
+            conditions_met = all(condition(failed_task) for condition in mapping.get('conditions', []))
+            
+            if not conditions_met:
+                # Fall back to alternative or abort
+                alternative = mapping.get('alternative', RecoveryStrategy.ABORT)
+                logger.info(f"Conditions not met for {primary_strategy}, using {alternative}")
+                return alternative, 0.3
+            
+            # Adjust confidence based on retry count (decreasing)
+            retry_penalty = min(failed_task.retry_count * 0.15, 0.4)
+            adjusted_confidence = max(base_confidence - retry_penalty, 0.1)
+            
+            return primary_strategy, adjusted_confidence
+        
+        # Default: retry with backoff for unknown errors
+        return RecoveryStrategy.RETRY_WITH_BACKOFF, 0.3
+    
+    def _check_approval_recovery(
+        self, 
+        approval_status: str, 
+        task: Task
+    ) -> Optional[RecoveryStrategy]:
+        """
+        Handle approval-specific recovery.
+        
+        Args:
+            approval_status: 'denied', 'expired', 'pending', 'approved'
+            task: The task that needs approval
+            
+        Returns:
+            RecoveryStrategy or None if no recovery needed
+        """
+        
+        approval_mapping = {
+            'denied': {
+                'strategy': RecoveryStrategy.ABORT,
+                'message': 'Approval denied by user',
+                'log': '⚠️ Approval DENIED - task aborted'
+            },
+            'expired': {
+                'strategy': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'message': 'Approval request expired',
+                'log': '⏳ Approval EXPIRED - retrying with backoff'
+            },
+            'pending': {
+                'strategy': RecoveryStrategy.RETRY_SAME_TOOL,
+                'message': 'Approval still pending',
+                'log': '⏸️ Approval PENDING - will retry'
+            }
+        }
+        
+        if approval_status in approval_mapping:
+            mapping = approval_mapping[approval_status]
+            logger.info(f"Approval recovery: {mapping['log']}")
+            return mapping['strategy']
+        
+        return None
+    
+    def _enter_degraded_mode(self, reason: str):
+        """
+        Enter degraded mode when critical failures occur.
+        
+        In degraded mode:
+        - Only safe tools are allowed
+        - Approval is always required
+        - Verbose logging is enabled
+        """
+        
+        if not hasattr(self, '_degraded_mode'):
+            self._degraded_mode = False
+        
+        if not self._degraded_mode:
+            self._degraded_mode = True
+            logger.warning(f"⚠️ ENTERING DEGRADED MODE: {reason}")
+            
+            # Telemetry
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('degraded_mode_entered', {
+                    'reason': reason,
+                    'timestamp': time.time()
+                })
+    
+    def _get_recovery_budget(self, task_id: str) -> Dict[str, int]:
+        """Get retry budget for a task."""
+        
+        if not hasattr(self, '_retry_budgets'):
+            self._retry_budgets = {}
+        
+        if task_id not in self._retry_budgets:
+            # Default budget: 3 retries per task
+            self._retry_budgets[task_id] = 3
+        
+        return {
+            'task_id': task_id,
+            'max_retries': self._retry_budgets.get(task_id, 3),
+            'current_attempts': 0
+        }
+    
+    def _update_retry_budget(self, task_id: str, success: bool):
+        """Update retry budget after task attempt."""
+        
+        if not hasattr(self, '_retry_budgets'):
+            self._retry_budgets = {}
+        
+        if success:
+            # Reset budget on success
+            self._retry_budgets[task_id] = 0
+        else:
+            # Increment on failure
+            self._retry_budgets[task_id] = self._retry_budgets.get(task_id, 0) + 1
+
     async def _execute_recovery(
         self, 
         strategy: RecoveryStrategy, 
