@@ -4326,20 +4326,25 @@ Return ONLY valid JSON (no other text):
 
     async def _execute_via_brain(self, task: Task, tool_name: str, args: Dict, task_meta: Dict) -> ExecutionResult:
         """
-        Execute tool via native_brain with INDEPENDENT validation.
+        STRICT BRAIN EXECUTION - No1 Grade.
         
-        IMPORTANT: Model output is ONLY a suggestion. The REAL truth comes from:
-        - Real tool runtime result (not model claiming success)
-        - Verifier result
-        - Artifact collector result
+        MODEL OUTPUT (ONLY):
+        - intent: what model thinks should happen (intent analysis)
+        - suggestion: recommended approach
+        - candidate_args: suggested argument corrections
         
-        Model can:
-        - Fake success
-        - Provide incorrect artifacts
-        - Claim wrong tool_used
-        - Invent stdout/stderr
+        REAL TRUTH (ALWAYS):
+        - actual tool runtime result (from tools.execute_tool)
+        - verifier result
+        - artifact collector
         
-        So we ALWAYS verify with real tool execution, not just trust model.
+        MODEL CANNOT PROVIDE:
+        - success status (LIE)
+        - artifacts (FORGED)
+        - stdout/stderr (FABRICATED)
+        - tool_used (INCORRECT)
+        
+        SO WE NEVER ASK MODEL FOR EXECUTION RESULTS.
         """
         
         import re, json
@@ -4347,51 +4352,58 @@ Return ONLY valid JSON (no other text):
         
         exec_result = ExecutionResult(success=False, tool_used=tool_name)
         
-        # Track where the truth comes from
+        # Track truth sources - model provides INTENT ONLY
         validation_source = {
+            'model_intent': None,
             'model_suggestion': None,
+            'model_candidate_args': None,
             'tool_runtime': None,
             'verifier': None,
             'artifact_check': None
         }
         
-        # Step 1: Get model suggestion (NOT the final truth)
-        model_suggestion = None
+        # =====================================================
+        # STEP 1: MODEL OUTPUT - INTENT/SUGGESTION ONLY (NOT execution results)
+        # =====================================================
         try:
-            # MODEL OUTPUT: ONLY intent/suggestion - NEVER success/artifacts
-            intent_prompt = f"""Analyze task for planning (NOT execution results). 
-TASK: {task.description} 
-TOOL: {tool_name} 
-ARGUMENTS: {json.dumps(args)} 
-SUCCESS CRITERIA: {task_meta.get('success_criteria', 'Task completed')}
+            # MODEL: ONLY provide intent analysis, NOT execution results
+            intent_prompt = f"""Analyze this task. Provide ONLY intent and suggested corrections.
+DO NOT provide execution results - we will run the tool for real.
 
-IMPORTANT: Provide your best guess for the execution result. This is a SUGGESTION only.
-Return ONLY valid JSON: {{ 
-  "success": true/false, 
-  "stdout": "actual output", 
-  "stderr": "errors", 
-  "exit_code": 0, 
-  "artifacts": [], 
-  "error": "error if failed" 
+TASK: {task.description}
+TOOL: {tool_name}
+ARGUMENTS: {json.dumps(args)}
+
+Return ONLY valid JSON (no other text):
+{{
+  "intent": "What needs to happen (1-2 sentences)",
+  "suggestion": "Recommended approach or note",
+  "candidate_args": {{}}  // any corrections to args (empty if none)
 }}"""
 
             response = self.native_brain.think(intent_prompt)
             
-            # Try to parse model response
-            json_match = re.search(r'\{[^{}]*"success"[^{}]*\}', response, re.DOTALL)
-            if not json_match: 
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            
-            if json_match:
-                json_str = json_match.group()
-                if json_str.count('{') == json_str.count('}'):
-                    model_suggestion = json.loads(json_str)
-                    validation_source['model_suggestion'] = model_suggestion
-                    logger.debug(f"Model suggestion: {model_suggestion.get('success', 'unknown')}")
+            # Parse model response for INTENT ONLY
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match and json_match.group().count('{') == json_match.group().count('}'):
+                model_output = json.loads(json_match.group())
+                validation_source['model_intent'] = model_output.get('intent')
+                validation_source['model_suggestion'] = model_output.get('suggestion')
+                validation_source['model_candidate_args'] = model_output.get('candidate_args', {})
+                logger.info(f"Model intent: {validation_source['model_intent']}")
+                
+                # Apply candidate_args corrections if any
+                if validation_source['model_candidate_args']:
+                    for k, v in validation_source['model_candidate_args'].items():
+                        if k in args:
+                            args[k] = v
+                            
         except Exception as e:
-            logger.warning(f"Model suggestion failed: {e}")
+            logger.warning(f"Model intent analysis failed: {e}")
         
-        # Step 2: REAL tool execution (this is the ACTUAL truth)
+        # =====================================================
+        # STEP 2: REAL TOOL EXECUTION - THE ONLY SOURCE OF TRUTH
+        # =====================================================
         tool_start_time = time.time()
         
         try:
