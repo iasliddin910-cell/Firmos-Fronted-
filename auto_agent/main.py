@@ -21,6 +21,7 @@ import os
 import sys
 import asyncio
 import logging
+import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -205,6 +206,32 @@ class OmniAgent:
             from agent.telegram_bot import start_telegram_bot
             self.telegram_bot = start_telegram_bot(telegram_token, self)
         
+        # =============================================
+        # LAYER 10: HEALTH CHECK (CRITICAL)
+        # =============================================
+        
+        # Deep health check after all modules initialized
+        logger.info("🏥 Running deep health check...")
+        from agent.health_check import create_health_checker
+        self.health_checker = create_health_checker()
+        
+        # Run comprehensive health verification
+        health_result = self.health_checker.check_all(self)
+        
+        # Log health status
+        logger.info(f"🏥 Health Status: {health_result['status']}")
+        for result in health_result.get('results', []):
+            status_icon = "✅" if result['status'] == 'healthy' else "⚠️" if result['status'] == 'degraded' else "❌"
+            logger.info(f"  {status_icon} {result['module']}: {result['message']}")
+        
+        # Enable safe mode if critical failures detected
+        if health_result['status'] == 'unhealthy':
+            logger.error("❌ Critical failures detected - enabling safe mode")
+            self.health_checker.enable_safe_mode()
+            self.safe_mode = True
+        else:
+            self.safe_mode = False
+        
         logger.info("=" * 50)
         logger.info("✅ OmniAgent X Ready! (Complete Architecture)")
         logger.info("=" * 50)
@@ -237,6 +264,11 @@ class OmniAgent:
         # NOT brain.think()
         # =============================================
         
+        # Check if in safe mode (kernel failed)
+        if getattr(self, 'safe_mode', False):
+            logger.warning("⚠️ Running in SAFE MODE - using brain fallback")
+            return self._safe_mode_handle(user_message)
+        
         try:
             # Use kernel as central orchestrator
             result = self.kernel.submit_task(user_message)
@@ -259,12 +291,45 @@ class OmniAgent:
             
         except Exception as e:
             logger.error(f"Error in kernel: {e}")
+            
+            # Log kernel failure to telemetry
+            if hasattr(self, 'health_checker'):
+                from agent.health_check import HealthTelemetry
+                telemetry = HealthTelemetry()
+                telemetry.log_event("FAILURE", "kernel_runtime", {
+                    "error": str(e),
+                    "traceback": traceback.format_exc()
+                })
+            
             # Fallback to brain if kernel fails
+            logger.info("🔄 Falling back to brain...")
             result = self.brain.think(user_message)
+            
             # Secret redaction
             if hasattr(self, "secret_guard"):
                 result = self.secret_guard.redact(result)
             return result
+    
+    def _safe_mode_handle(self, user_message: str) -> str:
+        """
+        Handle messages in safe mode (kernel failed)
+        Uses brain fallback with limited functionality
+        """
+        logger.warning(f"🛡️ SAFE MODE: Processing '{user_message[:30]}...'")
+        
+        try:
+            # Use brain as fallback
+            result = self.brain.think(user_message)
+            
+            # Secret redaction
+            if hasattr(self, "secret_guard"):
+                result = self.secret_guard.redact(result)
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Safe mode error: {e}")
+            return f"⚠️ Safe Mode: Tizim cheklangan holatda. Xatolik: {str(e)}"
     
     def submit_task(self, task: str) -> str:
         """Public method for external callers (Telegram, etc.)"""
@@ -274,7 +339,7 @@ class OmniAgent:
         """Check if message is a direct system command"""
         commands = [
             "/system", "/time", "/files", "/clear", "/help", "/memory",
-            "/status", "/approve", "/deny", "/jobs",
+            "/status", "/health", "/approve", "/deny", "/jobs",
             "tizim haqida", "vaqt qancha", "fayllar ro'yxat"
         ]
         return any(cmd in message.lower() for cmd in commands)
@@ -284,7 +349,44 @@ class OmniAgent:
         
         # Status command - show kernel status
         if "/status" in message.lower():
-            return self.kernel.get_status()
+            status = self.kernel.get_status() if hasattr(self.kernel, 'get_status') else "N/A"
+            
+            # Add health check info
+            health_info = ""
+            if hasattr(self, 'health_checker'):
+                health = self.health_checker.check_all(self)
+                health_info = f"\n\n🏥 Health: {health['status']}"
+                health_info += f"\n- Healthy: {health['healthy']}"
+                health_info += f"\n- Degraded: {health['degraded']}"
+                health_info += f"\n- Failed: {health['failed']}"
+                
+                if hasattr(self, 'safe_mode') and self.safe_mode:
+                    health_info += "\n⚠️ SAFE MODE ACTIVE"
+            
+            return f"Status: {status}{health_info}"
+        
+        # Health command - show detailed health status
+        if "/health" in message.lower():
+            if hasattr(self, 'health_checker'):
+                health = self.health_checker.check_all(self)
+                result = f"🏥 **Health Status: {health['status']}**\n\n"
+                result += f"Total Checks: {health['total_checks']}\n"
+                result += f"✅ Healthy: {health['healthy']}\n"
+                result += f"⚠️ Degraded: {health['degraded']}\n"
+                result += f"❌ Failed: {health['failed']}\n\n"
+                result += "**Module Details:**\n"
+                for r in health.get('results', []):
+                    icon = "✅" if r['status'] == 'healthy' else "⚠️" if r['status'] == 'degraded' else "❌"
+                    result += f"{icon} {r['module']}: {r['message']}\n"
+                
+                if health.get('failed_modules'):
+                    result += f"\n⚠️ Failed Modules: {', '.join(health['failed_modules'])}"
+                
+                if hasattr(self, 'safe_mode') and self.safe_mode:
+                    result += "\n\n⚠️ **SAFE MODE ACTIVE**"
+                
+                return result
+            return "Health checker not available"
         
         # Approve command
         if "/approve" in message.lower():
