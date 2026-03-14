@@ -71,6 +71,11 @@ class AuthState:
     session_storage: Dict
     logged_in: bool
     timestamp: float
+    # Enhanced: Add auth persistence metadata
+    auth_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    expires_at: Optional[float] = None
+    headers: Optional[Dict] = None
 
 
 @dataclass
@@ -81,6 +86,34 @@ class ActionVerification:
     actual: str
     verified: bool
     screenshot: Optional[str]
+    # Enhanced: Add semantic verification
+    semantic_check: Optional[Dict] = None
+    dom_snapshot: Optional[Dict] = None
+    error_message: Optional[str] = None
+
+
+@dataclass
+class DownloadState:
+    """Download orchestration state"""
+    url: str
+    path: str
+    status: str  # pending, downloading, completed, failed
+    progress: float
+    started_at: float
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class UploadState:
+    """Upload orchestration state"""
+    file_path: str
+    target_url: str
+    status: str  # pending, uploading, completed, failed
+    progress: float
+    started_at: float
+    completed_at: Optional[float] = None
+    error: Optional[str] = None
 
 
 # ==================== BROWSER MANAGER ====================
@@ -174,7 +207,8 @@ class BrowserManager:
                 try:
                     storage_state = json.loads(self.session_file.read_text())
                     self.context = self.browser.new_context(storage_state=storage_state)
-                except:
+                except (json.JSONDecodeError, IOError, Exception) as e:
+                    logger.warning(f"Failed to restore session: {e}")
                     self.context = self.browser.new_context()
             else:
                 self.context = self.browser.new_context()
@@ -664,6 +698,381 @@ class BrowserManager:
         
         except Exception as e:
             return f"❌ Error: {str(e)}"
+    
+    # ==================== ENHANCED: MULTI-TAB REASONING ====================
+    
+    def get_all_tabs_info(self) -> Dict[str, Any]:
+        """Get comprehensive info about all tabs for multi-tab reasoning"""
+        tabs_info = {
+            "total_tabs": len(self.pages),
+            "active_tab": self.active_page_id,
+            "tabs": []
+        }
+        
+        for tab_id, page in self.pages.items():
+            try:
+                tabs_info["tabs"].append({
+                    "id": tab_id,
+                    "title": page.title(),
+                    "url": page.url,
+                    "is_active": tab_id == self.active_page_id,
+                    "load_state": page.evaluate("() => document.readyState")
+                })
+            except Exception as e:
+                logger.warning(f"Failed to get tab info: {e}")
+        
+        return tabs_info
+    
+    def switch_to_tab_by_url(self, url_pattern: str) -> str:
+        """Switch to tab matching URL pattern"""
+        for tab_id, page in self.pages.items():
+            try:
+                if url_pattern in page.url:
+                    self.active_page_id = tab_id
+                    return f"✅ Switched to tab: {tab_id} ({page.url})"
+            except Exception as e:
+                logger.warning(f"Error checking tab: {e}")
+        
+        return f"❌ No tab found matching: {url_pattern}"
+    
+    def wait_for_all_tabs_loaded(self, timeout: int = 30000) -> str:
+        """Wait for all tabs to finish loading"""
+        if not self.pages:
+            return "❌ No tabs open"
+        
+        try:
+            for tab_id, page in self.pages.items():
+                page.wait_for_load_state("load", timeout=timeout)
+            
+            return f"✅ All {len(self.pages)} tabs loaded"
+        
+        except Exception as e:
+            return f"❌ Load timeout: {str(e)}"
+    
+    # ==================== ENHANCED: DOWNLOAD ORCHESTRATION ====================
+    
+    def setup_download_handler(self, download_dir: Path = None) -> str:
+        """Setup download handler for the context"""
+        if not self.context:
+            return "❌ No browser context"
+        
+        if download_dir is None:
+            download_dir = self.data_dir / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            self.context.set_default_download_path(str(download_dir))
+            return f"✅ Download handler setup: {download_dir}"
+        
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def download_file(self, url: str, filename: str = None) -> DownloadState:
+        """Download file with progress tracking"""
+        if filename is None:
+            filename = url.split("/")[-1] or "download"
+        
+        download_dir = self.data_dir / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        file_path = download_dir / filename
+        
+        download_state = DownloadState(
+            url=url,
+            path=str(file_path),
+            status="pending",
+            progress=0.0,
+            started_at=datetime.now().timestamp()
+        )
+        
+        try:
+            download_state.status = "downloading"
+            page = self.get_active_page()
+            
+            # Start download
+            async_task = page.request.get(url)
+            
+            # Write to file with progress
+            response = async_task
+            if response.status == 200:
+                content = response.body()
+                file_path.write_bytes(content)
+                download_state.progress = 1.0
+                download_state.status = "completed"
+                download_state.completed_at = datetime.now().timestamp()
+            else:
+                download_state.status = "failed"
+                download_state.error = f"HTTP {response.status}"
+        
+        except Exception as e:
+            download_state.status = "failed"
+            download_state.error = str(e)
+        
+        return download_state
+    
+    # ==================== ENHANCED: UPLOAD ORCHESTRATION ====================
+    
+    def upload_file(self, selector: str, file_path: str) -> UploadState:
+        """Upload file with progress tracking"""
+        upload_state = UploadState(
+            file_path=file_path,
+            target_url=selector,
+            status="pending",
+            progress=0.0,
+            started_at=datetime.now().timestamp()
+        )
+        
+        try:
+            page = self.get_active_page()
+            if not page:
+                upload_state.status = "failed"
+                upload_state.error = "No active page"
+                return upload_state
+            
+            upload_state.status = "uploading"
+            
+            # Upload file using file chooser
+            page.set_input_files(selector, file_path)
+            
+            upload_state.progress = 1.0
+            upload_state.status = "completed"
+            upload_state.completed_at = datetime.now().timestamp()
+        
+        except Exception as e:
+            upload_state.status = "failed"
+            upload_state.error = str(e)
+        
+        return upload_state
+    
+    def upload_multiple_files(self, selector: str, file_paths: List[str]) -> str:
+        """Upload multiple files"""
+        try:
+            page = self.get_active_page()
+            page.set_input_files(selector, file_paths)
+            return f"✅ Uploaded {len(file_paths)} files"
+        except Exception as e:
+            return f"❌ Upload failed: {str(e)}"
+    
+    # ==================== ENHANCED: SEMANTIC VERIFICATION ====================
+    
+    def verify_page_semantics(self, expected_elements: Dict[str, Any]) -> ActionVerification:
+        """Verify page has expected semantic elements"""
+        page = self.get_active_page()
+        
+        if not page:
+            return ActionVerification(
+                action="semantic_verification",
+                expected=str(expected_elements),
+                actual="No active page",
+                verified=False,
+                screenshot=None,
+                error_message="No active page"
+            )
+        
+        try:
+            actual_elements = {}
+            
+            # Check for headings
+            headings = page.query_selector_all("h1, h2, h3, h4, h5, h6")
+            actual_elements["headings"] = [h.text_content() for h in headings[:5]]
+            
+            # Check for main content areas
+            main_content = page.query_selector("main, article, .content, #content")
+            actual_elements["has_main_content"] = main_content is not None
+            
+            # Check for navigation
+            nav = page.query_selector("nav, .nav, #nav")
+            actual_elements["has_navigation"] = nav is not None
+            
+            # Check for forms
+            forms = page.query_selector_all("form")
+            actual_elements["form_count"] = len(forms)
+            
+            # Check page title
+            actual_elements["title"] = page.title()
+            
+            # Check for error messages
+            errors = page.query_selector_all(".error, .alert, [role='alert']")
+            actual_elements["error_count"] = len(errors)
+            
+            # Compare with expected
+            verified = True
+            for key, expected_value in expected_elements.items():
+                actual_value = actual_elements.get(key)
+                if expected_value != actual_value:
+                    verified = False
+                    break
+            
+            screenshot = self._take_screenshot()
+            
+            return ActionVerification(
+                action="semantic_verification",
+                expected=str(expected_elements),
+                actual=str(actual_elements),
+                verified=verified,
+                screenshot=screenshot,
+                semantic_check={
+                    "expected": expected_elements,
+                    "actual": actual_elements
+                },
+                dom_snapshot=actual_elements
+            )
+        
+        except Exception as e:
+            return ActionVerification(
+                action="semantic_verification",
+                expected=str(expected_elements),
+                actual="error",
+                verified=False,
+                screenshot=None,
+                error_message=str(e)
+            )
+    
+    def verify_action_result(self, action: str, expected_result: str) -> ActionVerification:
+        """Verify action produced expected result"""
+        page = self.get_active_page()
+        
+        if not page:
+            return ActionVerification(
+                action=action,
+                expected=expected_result,
+                actual="No active page",
+                verified=False,
+                screenshot=None,
+                error_message="No active page"
+            )
+        
+        try:
+            actual_url = page.url
+            actual_title = page.title()
+            
+            # Determine actual result
+            actual = f"url={actual_url}, title={actual_title}"
+            
+            # Simple verification
+            verified = expected_result.lower() in actual.lower() or expected_result in actual_url
+            
+            screenshot = self._take_screenshot()
+            
+            return ActionVerification(
+                action=action,
+                expected=expected_result,
+                actual=actual,
+                verified=verified,
+                screenshot=screenshot,
+                error_message=None if verified else "Result does not match expected"
+            )
+        
+        except Exception as e:
+            return ActionVerification(
+                action=action,
+                expected=expected_result,
+                actual="error",
+                verified=False,
+                screenshot=None,
+                error_message=str(e)
+            )
+    
+    # ==================== ENHANCED: AUTH PERSISTENCE ====================
+    
+    def save_auth_state_extended(self, site_url: str, auth_token: str = None, 
+                                refresh_token: str = None, headers: Dict = None) -> str:
+        """Save authentication state with extended metadata"""
+        if not self.context:
+            return "❌ No browser context"
+        
+        try:
+            cookies = self.context.cookies()
+            
+            # Get local storage
+            local_storage = self.context.evaluate("""() => {
+                let items = {};
+                for (let i = 0; i < localStorage.length; i++) {
+                    let key = localStorage.key(i);
+                    items[key] = localStorage.getItem(key);
+                }
+                return items;
+            }""")
+            
+            # Get session storage
+            session_storage = self.context.evaluate("""() => {
+                let items = {};
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    let key = sessionStorage.key(i);
+                    items[key] = sessionStorage.getItem(key);
+                }
+                return items;
+            }""")
+            
+            # Calculate expiration (default 24 hours)
+            expires_at = datetime.now().timestamp() + (24 * 60 * 60)
+            
+            auth_state = AuthState(
+                site_url=site_url,
+                cookies=cookies,
+                local_storage=local_storage,
+                session_storage=session_storage,
+                logged_in=True,
+                timestamp=datetime.now().timestamp(),
+                auth_token=auth_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at,
+                headers=headers
+            )
+            
+            self.auth_states[site_url] = auth_state
+            
+            # Save to file with site-based naming
+            auth_file = self.data_dir / "auth" / f"{self._sanitize_filename(site_url)}.json"
+            auth_file.parent.mkdir(parents=True, exist_ok=True)
+            auth_file.write_text(json.dumps(auth_state.__dict__, default=str))
+            
+            return f"✅ Auth state saved for: {site_url}"
+        
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def restore_auth_state_extended(self, site_url: str) -> str:
+        """Restore authentication state with validation"""
+        if not self.context:
+            return "❌ No browser context"
+        
+        auth_file = self.data_dir / "auth" / f"{self._sanitize_filename(site_url)}.json"
+        
+        if not auth_file.exists():
+            return "❌ No saved auth state"
+        
+        try:
+            data = json.loads(auth_file.read_text())
+            
+            # Check expiration
+            if data.get("expires_at"):
+                expires_at = float(data["expires_at"])
+                if datetime.now().timestamp() > expires_at:
+                    return "❌ Auth state expired"
+            
+            # Restore cookies
+            self.context.add_cookies(data["cookies"])
+            
+            # Restore local storage
+            for key, value in data.get("local_storage", {}).items():
+                self.context.evaluate(f"""(key, value) => {{
+                    localStorage.setItem(key, value);
+                }}""", key, value)
+            
+            # Restore session storage
+            for key, value in data.get("session_storage", {}).items():
+                self.context.evaluate(f"""(key, value) => {{
+                    sessionStorage.setItem(key, value);
+                }}""", key, value)
+            
+            return f"✅ Auth restored for: {site_url}"
+        
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def _sanitize_filename(self, name: str) -> str:
+        """Sanitize filename for safe storage"""
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
     
     # ==================== SESSION PERSISTENCE ====================
     
