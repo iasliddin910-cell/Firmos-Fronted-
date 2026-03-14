@@ -1723,8 +1723,8 @@ class TaskManager:
                 self.pending_queue.put(task)
         
         # Restore approval waiting tasks - CRITICAL for recovery
-        approval_waiting_tasks = state.get('approval_waiting_tasks', [])
-        for task_data in approval_waiting_tasks:
+        self.approval_waiting_tasks = {}
+        for task_data in state.get('approval_waiting_tasks', []):
             task = self._task_from_dict(task_data)
             if task.status == TaskStatus.APPROVAL_WAITING:
                 # Check if approval has expired
@@ -1735,8 +1735,15 @@ class TaskManager:
                     task.status = TaskStatus.PENDING
                     self.pending_queue.put(task)
                 else:
-                    # Keep as approval waiting - will be restored by kernel
-                    self.pending_queue.put(task)
+                    # Keep as approval waiting
+                    self.approval_waiting_tasks[task.id] = task
+            else:
+                self.tasks[task.id] = task
+
+        # Restore background queue - CRITICAL for recovery
+        for task_data in state.get('background_queue_tasks', []):
+            task = self._task_from_dict(task_data)
+            self.background_queue.put(task)
         
         # Restore running tasks that might be stuck
         for task_id in state.get('running_tasks', []):
