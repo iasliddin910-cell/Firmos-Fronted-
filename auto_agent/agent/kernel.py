@@ -6144,7 +6144,33 @@ class RecoveryEngine:
         self.kernel = kernel
         self.retry_budget = {}  # Per-task retry budget
         self.max_retries = 3
+        self.max_replan_depth = 2  # Max replan attempts per task
+        self.replan_depth = {}  # Per-task replan depth
         self.rollback_stack = {}  # TaskID -> rollback actions
+        
+        # Approval mapping: tool -> strategy for denied/expired
+        self.approval_mapping = {
+            'denied': {
+                'execute_command': 'ALTERNATE_TOOL',
+                'delete_file': 'ABORT',
+                'browser_navigate': 'REQUEUE',
+                'write_file': 'REPLAN',
+                'default': 'REQUEUE'
+            },
+            'expired': {
+                'execute_command': 'REQUEUE',
+                'browser_navigate': 'REQUEUE',
+                'write_file': 'REPLAN',
+                'default': 'REQUEUE'
+            }
+        }
+        
+        # Escalation conditions
+        self.escalation_conditions = [
+            'critical_error',
+            'security_breach',
+            'data_loss'
+        ]
     
     async def execute_recovery(self, task: Task, failure_reason: str) -> Dict:
         """Execute appropriate recovery strategy based on failure type"""
@@ -6153,6 +6179,7 @@ class RecoveryEngine:
         budget = self.retry_budget.get(task.id, 0)
         
         if budget >= self.max_retries:
+            logger.warning(f"⚠️ Retry budget exhausted for {task.id}")
             return await self._retry_exhausted_recovery(task, failure_reason)
         
         # Map failure type to recovery strategy
@@ -6164,8 +6191,22 @@ class RecoveryEngine:
             return await self._requeue_recovery(task, failure_reason)
         elif 'artifact_missing' in failure_reason:
             return await self._rollback_recovery(task, failure_reason)
-        elif 'approval_denied' in failure_reason:
-            return await self._replan_recovery(task, failure_reason)
+        elif 'approval_denied' in failure_reason or 'approval_expired' in failure_reason:
+            # Use approval mapping
+            approval_type = 'denied' if 'denied' in failure_reason else 'expired'
+            tool_name = (task.input_data or {}).get('tool_used', 'default')
+            mapping = self.approval_mapping.get(approval_type, {})
+            strategy = mapping.get(tool_name, mapping.get('default', 'REQUEUE'))
+            logger.info(f"📋 Approval {approval_type} for {task.id}, tool={tool_name}, strategy={strategy}")
+            if strategy == 'ALTERNATE_TOOL':
+                return await self._alternate_tool_recovery(task, failure_reason)
+            elif strategy == 'REPLAN':
+                self.replan_depth[task.id] = self.replan_depth.get(task.id, 0) + 1
+                return await self._replan_recovery(task, failure_reason)
+            elif strategy == 'ABORT':
+                return await self._retry_exhausted_recovery(task, failure_reason)
+            else:
+                return await self._requeue_recovery(task, failure_reason)
         elif 'critical_error' in failure_reason:
             return await self._human_escalation(task, failure_reason)
         else:
