@@ -425,3 +425,178 @@ class ContinuousLearningPipeline:
 
 def create_learning_pipeline(api_key: str = None) -> ContinuousLearningPipeline:
     return ContinuousLearningPipeline(api_key=api_key)
+
+
+# ==================== KNOWLEDGE GOVERNANCE ====================
+
+class KnowledgeGovernance:
+    """
+    24/7 Knowledge Governance System:
+    - Source trust decay over time
+    - Bad-source quarantine
+    - Confidence recalibration
+    - Knowledge promotion/demotion
+    - Observed-world feedback loop
+    """
+    
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.quarantined_sources = set()
+        self.trust_decay_rate = 0.01  # Per day
+        self.promotion_threshold = 0.8
+        self.demotion_threshold = 0.3
+        self.feedback_weights = {
+            "success": 0.1,
+            "failure": -0.1,
+            "contradiction": -0.2,
+            "verification": 0.05
+        }
+        
+    def governance_loop(self):
+        """Main governance loop - run periodically"""
+        # 1. Apply trust decay
+        self._apply_trust_decay()
+        
+        # 2. Check for bad sources
+        self._check_bad_sources()
+        
+        # 3. Recalibrate confidence
+        self._recalibrate_confidence()
+        
+        # 4. Promote/demote knowledge
+        self._promote_demote()
+        
+        # 5. Process observed feedback
+        self._process_feedback()
+        
+    def _apply_trust_decay(self):
+        """Apply trust decay to sources over time"""
+        days_since_update = (time.time() - self.pipeline.last_learning) / 86400
+        
+        for source in self.pipeline.sources.values():
+            if source.trust_level == TrustLevel.HIGH:
+                # High trust decays slower
+                decay = self.trust_decay_rate * days_since_update * 0.5
+            else:
+                decay = self.trust_decay_rate * days_since_update
+                
+            new_level = max(0, source.trust_level.value - int(decay * 10))
+            source.trust_level = TrustLevel(new_level)
+                
+    def _check_bad_sources(self):
+        """Quarantine sources with low trust"""
+        for source in self.pipeline.sources.values():
+            if source.trust_level == TrustLevel.LOW:
+                self.quarantined_sources.add(source.url)
+                logger.warning(f"Quarantined source: {source.url}")
+                
+    def _recalibrate_confidence(self):
+        """Recalculate confidence based on usage and success"""
+        for entry in self.pipeline.knowledge.values():
+            # Adjust based on success rate
+            if entry.usage_count > 0:
+                success_rate = entry.success_count / entry.usage_count
+                # Blend with original confidence
+                entry.confidence = (entry.confidence * 0.7 + success_rate * 0.3)
+                
+    def _promote_demote(self):
+        """Promote high-confidence, demote low-confidence knowledge"""
+        promoted = 0
+        demoted = 0
+        
+        for entry in self.pipeline.knowledge.values():
+            if entry.confidence >= self.promotion_threshold:
+                entry.confidence = min(1.0, entry.confidence + 0.05)
+                promoted += 1
+            elif entry.confidence <= self.demotion_threshold:
+                entry.confidence = max(0.0, entry.confidence - 0.05)
+                demoted += 1
+                
+        if promoted or demoted:
+            logger.info(f"Governance: {promoted} promoted, {demoted} demoted")
+            
+    def _process_feedback(self):
+        """Process observed-world feedback"""
+        # This would integrate with actual task execution feedback
+        pass
+    
+    def record_feedback(self, entry_id: str, feedback_type: str):
+        """Record feedback on a knowledge entry"""
+        if entry_id not in self.pipeline.knowledge:
+            return
+            
+        entry = self.pipeline.knowledge[entry_id]
+        weight = self.feedback_weights.get(feedback_type, 0)
+        
+        entry.confidence = max(0, min(1, entry.confidence + weight))
+        logger.info(f"Feedback recorded: {entry_id} {feedback_type} -> {entry.confidence}")
+
+
+# ==================== UNIFIED LEARNING SYSTEM ====================
+
+class UnifiedLearning:
+    """
+    Unified learning system that combines:
+    - ContinuousLearningPipeline (main pipeline)
+    - KnowledgeGovernance (governance)
+    - SelfLearningEngine (helper)
+    """
+    
+    def __init__(self, api_key: str = None, data_dir: str = None):
+        self.api_key = api_key
+        
+        # Main pipeline
+        self.pipeline = ContinuousLearningPipeline(api_key)
+        
+        # Governance
+        self.governance = KnowledgeGovernance(self.pipeline)
+        
+        # Start governance loop
+        self._start_governance()
+        
+    def _start_governance(self):
+        """Start governance in background"""
+        def loop():
+            while True:
+                try:
+                    self.governance.governance_loop()
+                except Exception as e:
+                    logger.warning(f"Governance error: {e}")
+                time.sleep(3600)  # Hourly
+                
+        threading.Thread(target=loop, daemon=True).start()
+        
+    def learn(self, content: str, source_url: str, source_type: SourceType,
+              knowledge_type: KnowledgeType, tags: List[str] = None) -> str:
+        """Add knowledge to pipeline"""
+        return self.pipeline.add_knowledge(content, source_url, source_type, knowledge_type, tags)
+        
+    def query(self, query: str, min_confidence: float = 0.3) -> List[KnowledgeEntry]:
+        """Query knowledge"""
+        return self.pipeline.query(query, min_confidence)
+        
+    def record_success(self, entry_id: str):
+        """Record successful use of knowledge"""
+        if entry_id in self.pipeline.knowledge:
+            entry = self.pipeline.knowledge[entry_id]
+            entry.success_count += 1
+            self.governance.record_feedback(entry_id, "success")
+            
+    def record_failure(self, entry_id: str):
+        """Record failed use of knowledge"""
+        if entry_id in self.pipeline.knowledge:
+            entry = self.pipeline.knowledge[entry_id]
+            entry.usage_count += 1
+            self.governance.record_feedback(entry_id, "failure")
+            
+    def get_stats(self) -> Dict:
+        """Get unified stats"""
+        stats = self.pipeline.get_stats()
+        stats["quarantined_sources"] = len(self.governance.quarantined_sources)
+        return stats
+
+
+def create_unified_learning(api_key: str = None, data_dir: str = None):
+    """Factory function for unified learning"""
+    return UnifiedLearning(api_key, data_dir)
+
