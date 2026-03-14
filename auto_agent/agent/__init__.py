@@ -1,17 +1,17 @@
-"""Agent package - OmniAgent X ULTIMATE"""
+"""Agent package - OmniAgent X"""
 from .tools import ToolsEngine
 from .ui import AgentUI
 from .telegram_bot import TelegramBotManager, start_telegram_bot, stop_telegram_bot
 from .voice import VoiceSystem, get_voice_system
 from .vision import VisionSystem, get_vision_system
-from .autonomous import AutonomousEngine
+from .approval import create_approval_engine
 
 __all__ = [
-    "ToolsEngine", 
+    "ToolsEngine",
     "AgentUI",
     "VoiceSystem",
     "VisionSystem",
-    "AutonomousEngine",
+    "create_approval_engine",
     "TelegramBotManager",
     "start_telegram_bot",
     "stop_telegram_bot",
