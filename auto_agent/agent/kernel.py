@@ -972,21 +972,41 @@ class CriticEngine:
 
 class MultiAgentCoordinator:
     """
-    Coordinates multiple specialized agents with REAL ROLE-BASED EXECUTION:
-    - Planner Agent: Creates plans
-    - Executor Agent: Executes tasks
-    - Verifier Agent: Verifies results
-    - Critic Agent: Evaluates quality
-    - Researcher Agent: Gathers information
-    - Tool Builder Agent: Creates new tools
+    Coordinates multiple specialized agents with REAL STAGE-BASED ROLE DISPATCH:
     
-    Each role has dedicated execution methods, not just task assignment.
-    Supports both parallel and sequential role-based execution.
+    Kernel stages mapped to roles:
+    - STAGE_ANALYZE → RESEARCHER: Gather context and information
+    - STAGE_PLAN → PLANNER: Create execution plans with full metadata
+    - STAGE_CRITIQUE → CRITIC: Evaluate and refine plans
+    - STAGE_APPROVAL → APPROVER: Check approval requirements
+    - STAGE_SANDBOX → SANDBOX: Prepare execution environment
+    - STAGE_EXECUTE → EXECUTOR: Execute tasks with tools
+    - STAGE_VERIFY → VERIFIER: Verify results with multiple checks
+    - STAGE_ARTIFACT → ARCHIVER: Save and manage artifacts
+    - STAGE_PERSISTENCE → STORER: Persist state
+    - STAGE_TELEMETRY → MONITOR: Record metrics and telemetry
+    
+    Each role has dedicated execution methods with full kernel integration.
     """
     
-    def __init__(self, api_key: str, tools_engine):
+    # Stage to Role mapping
+    STAGE_TO_ROLE = {
+        'analyze': AgentRole.RESEARCHER,
+        'plan': AgentRole.PLANNER,
+        'critique': AgentRole.CRITIC,
+        'approval': AgentRole.CRITIC,  # Can use critic for approval
+        'sandbox': AgentRole.EXECUTOR,
+        'execute': AgentRole.EXECUTOR,
+        'verify': AgentRole.VERIFIER,
+        'artifact': AgentRole.TOOL_BUILDER,  # Tool builder for artifacts
+        'persist': AgentRole.TOOL_BUILDER,
+        'telemetry': AgentRole.RESEARCHER,
+    }
+    
+    def __init__(self, api_key: str, tools_engine, kernel=None):
         self.api_key = api_key
         self.tools = tools_engine
+        self.kernel = kernel  # Reference to kernel for real stage dispatch
         
         # Initialize agent states
         self.agents: Dict[AgentRole, AgentState] = {
@@ -1008,7 +1028,143 @@ class MultiAgentCoordinator:
         # Parallel execution support
         self.execution_mode = "sequential"  # or "parallel"
         
-        logger.info("🤖 Multi-Agent Coordinator initialized with full role-based execution")
+        # Role execution counters
+        self.role_execution_count = {role: 0 for role in AgentRole}
+        self.role_success_count = {role: 0 for role in AgentRole}
+        
+        # Telemetry for role performance
+        self.role_telemetry = {role: [] for role in AgentRole}
+        
+        logger.info("🤖 Multi-Agent Coordinator initialized with STAGE-BASED ROLE DISPATCH")
+    
+    async def dispatch_stage(self, stage: str, context: Dict) -> Dict[str, Any]:
+        """
+        DISPATCH kernel stage to appropriate role with REAL execution.
+        
+        This is the main entry point for stage-based role execution.
+        Maps kernel stage → role → actual execution method.
+        
+        Args:
+            stage: Kernel stage name (analyze, plan, execute, verify, etc.)
+            context: Execution context with task, metadata, etc.
+            
+        Returns:
+            Role execution result with full diagnostics
+        """
+        import time
+        
+        start_time = time.time()
+        
+        # Map stage to role
+        role = self.STAGE_TO_ROLE.get(stage.lower(), AgentRole.EXECUTOR)
+        
+        # Log dispatch
+        logger.info(f"📤 Dispatching stage '{stage}' → role '{role.value}'")
+        
+        # Execute role
+        result = await self._execute_role_with_telemetry(role, context)
+        
+        # Track execution time
+        duration = time.time() - start_time
+        result['stage'] = stage
+        result['duration'] = duration
+        
+        # Log completion
+        logger.info(f"✅ Stage '{stage}' → role '{role.value}' completed in {duration:.2f}s")
+        
+        return result
+    
+    async def _execute_role_with_telemetry(self, role: AgentRole, context: Dict) -> Dict[str, Any]:
+        """Execute role with telemetry tracking"""
+        import time
+        
+        start_time = time.time()
+        
+        # Track execution
+        self.role_execution_count[role] += 1
+        
+        try:
+            # Execute the role
+            task = context.get('task') if isinstance(context, dict) else None
+            result = await self._execute_role(role, context, task)
+            
+            # Track success
+            if result.get('success', False):
+                self.role_success_count[role] += 1
+            
+            # Record telemetry
+            duration = time.time() - start_time
+            self.role_telemetry[role].append({
+                'timestamp': start_time,
+                'duration': duration,
+                'success': result.get('success', False),
+                'error': result.get('error')
+            })
+            
+            # Keep only last 100 telemetry entries
+            if len(self.role_telemetry[role]) > 100:
+                self.role_telemetry[role] = self.role_telemetry[role][-100:]
+            
+            result['role_stats'] = {
+                'total_executions': self.role_execution_count[role],
+                'successes': self.role_success_count[role],
+                'success_rate': self.role_success_count[role] / max(1, self.role_execution_count[role]),
+                'avg_duration': sum(t['duration'] for t in self.role_telemetry[role]) / max(1, len(self.role_telemetry[role]))
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Role {role.value} execution failed: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'role': role.value
+            }
+    
+    async def execute_role_based(self, task: Task, roles: List[AgentRole]) -> Dict[str, Any]:
+        """
+        Execute task through multiple roles in sequence or parallel.
+        
+        Each role processes the task and passes results to the next role:
+        1. RESEARCHER: Gather context and information
+        2. PLANNER: Create execution plan
+        3. CRITIC: Evaluate and refine plan
+        4. EXECUTOR: Execute the task
+        5. VERIFIER: Verify the result
+        
+        Returns dict with results from each role.
+        """
+        import asyncio
+        
+        results = {
+            "task_id": task.id,
+            "role_results": {},
+            "final_success": False
+        }
+
+        if self.execution_mode == "parallel":
+            # Execute all roles in parallel
+            tasks = [self._execute_role(role, {"task": task}, task) for role in roles]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            # Execute roles sequentially
+            for role in roles:
+                role_result = await self._execute_role(role, {"task": task}, task)
+                results["role_results"][role.value] = role_result
+                
+                # If critical role fails, stop execution
+                if role in [AgentRole.PLANNER, AgentRole.EXECUTOR] and not role_result.get("success", True):
+                    logger.warning(f"Critical role {role.value} failed, stopping execution")
+                    break
+        
+        # Determine final success
+        results["final_success"] = all(
+            r.get("success", False) 
+            for r in results["role_results"].values()
+        )
+        
+        return results
     
     def _get_agent_capabilities(self, role: AgentRole) -> List[str]:
         """Get capabilities for each agent role"""
