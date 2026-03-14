@@ -1483,6 +1483,22 @@ class TaskManager:
             if task.status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
                 self.pending_queue.put(task)
         
+        # Restore approval waiting tasks - CRITICAL for recovery
+        approval_waiting_tasks = state.get('approval_waiting_tasks', [])
+        for task_data in approval_waiting_tasks:
+            task = self._task_from_dict(task_data)
+            if task.status == TaskStatus.APPROVAL_WAITING:
+                # Check if approval has expired
+                approval_expired = task.metadata.get('approval_expired', False)
+                if approval_expired:
+                    # Revert to pending
+                    logger.warning(f"Approval expired for task {task.id}, re-queuing")
+                    task.status = TaskStatus.PENDING
+                    self.pending_queue.put(task)
+                else:
+                    # Keep as approval waiting - will be restored by kernel
+                    self.pending_queue.put(task)
+        
         # Restore running tasks that might be stuck
         for task_id in state.get('running_tasks', []):
             if task_id in self.tasks:
@@ -1613,7 +1629,8 @@ class TaskManager:
         if 'status' in data:
             try:
                 task.status = TaskStatus(data['status'])
-            except:
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning(f"Failed to restore task status: {e}, defaulting to PENDING")
                 task.status = TaskStatus.PENDING
         
         return task
@@ -2391,7 +2408,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             try:
                 json.loads(combined)  # Validate
                 return re.match(r'\[[\s\S]*\]', combined)
-            except:
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug(f"JSON line combination failed: {e}")
                 pass
         
         return None
@@ -3017,10 +3035,39 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 self.telemetry.record_task(success=final_success, duration=step_duration, tool_name=tool_name)
                 
             except PermissionError as e:
-                task.status = TaskStatus.FAILED
-                task.error = str(e)
-                failed_tasks.add(task.id)
-                results.append(f"✗ [PERMISSION] {task.description}: {str(e)}")
+                error_msg = str(e)
+                
+                # Track approval denial/expire for recovery
+                is_approval_denial = "denied" in error_msg.lower() or "never" in error_msg.lower()
+                is_approval_expire = "timeout" in error_msg.lower()
+                
+                # Add metadata for recovery
+                task.metadata['approval_denied'] = is_approval_denial
+                task.metadata['approval_expired'] = is_approval_expire
+                task.metadata['approval_recovery_needed'] = True
+                
+                # Log for audit trail
+                logger.warning(f"Approval denied/expired for task {task.id}: {error_msg}")
+                
+                if hasattr(self, 'telemetry') and self.telemetry:
+                    self.telemetry.record_event('approval_denied_expired', {
+                        'task_id': task.id,
+                        'error': error_msg,
+                        'is_denial': is_approval_denial,
+                        'is_expire': is_approval_expire,
+                        'timestamp': time.time()
+                    })
+                
+                # If approval was denied/expired, link to recovery
+                if is_approval_denial or is_approval_expire:
+                    task.error_type = ErrorType.APPROVAL_DENIED if is_approval_denial else ErrorType.APPROVAL_TIMEOUT
+                    # Don't mark as failed yet - recovery should handle it
+                    task.status = TaskStatus.RECOVERING
+                    results.append(f"⚠️ [APPROVAL] {task.description}: {error_msg} - Recovery will handle")
+                else:
+                    task.status = TaskStatus.FAILED
+                    failed_tasks.add(task.id)
+                    results.append(f"✗ [PERMISSION] {task.description}: {error_msg}")
                 
             except ValueError as e:
                 task.status = TaskStatus.FAILED
@@ -3227,7 +3274,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             try:
                 metrics = self.telemetry.get_metrics()
                 return metrics.get('tool_stats', {})
-            except:
+            except (AttributeError, KeyError, TypeError) as e:
+                logger.warning(f"Failed to get tool success history: {e}")
                 pass
         return {}
     
@@ -3779,12 +3827,14 @@ Return ONLY valid JSON: {{
     
     async def _verify_screenshot(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
         """
-        Screenshot verification with multiple methods:
-        - OCR text extraction
-        - Vision prompt verification
-        - Image diff comparison
-        - Region-based expectation
-        - Confidence score threshold
+        STRICT screenshot verification - real image required!
+        
+        For screenshot task to be successful:
+        1. REAL image artifact must exist (file on disk)
+        2. OCR/vision verification must pass
+        3. Confidence threshold must be met
+        
+        NO soft passes - if no real image, verification FAILS!
         """
         
         expected_text = task_meta.get('expected_text', '')
@@ -3792,16 +3842,57 @@ Return ONLY valid JSON: {{
         image_path = task_meta.get('image_path', '')
         confidence_threshold = task_meta.get('confidence_threshold', 0.7)
         
-        # If we have screenshot artifacts, verify them
+        # CRITICAL: REAL image artifact must exist!
         screenshot_artifacts = [a for a in exec_result.artifacts if a.endswith(('.png', '.jpg', '.jpeg'))]
         
         if not screenshot_artifacts:
-            # Check if result contains image data
-            if 'screenshot' in exec_result.stdout.lower() or 'image' in exec_result.stdout.lower():
-                logger.info("Screenshot verification: Screenshot captured (artifact collection pending)")
-                return True
-            logger.warning("Screenshot verification failed: No screenshot artifacts found")
+            # STRICT: No screenshot = FAIL (no soft pass!)
+            logger.error(f"Screenshot verification FAILED: No real image artifact found for task {task.id}")
+            logger.debug(f"Artifacts available: {exec_result.artifacts}")
+            
+            # Record failure for telemetry
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('screenshot_verification_failed', {
+                    'task_id': task.id,
+                    'reason': 'no_artifact',
+                    'artifacts': exec_result.artifacts,
+                    'timestamp': time.time()
+                })
+            
             return False
+        
+        # Verify the image file actually exists on disk
+        import os
+        real_image_path = screenshot_artifacts[0]
+        if not os.path.exists(real_image_path):
+            logger.error(f"Screenshot verification FAILED: Image file not found on disk: {real_image_path}")
+            
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('screenshot_verification_failed', {
+                    'task_id': task.id,
+                    'reason': 'file_not_found',
+                    'path': real_image_path,
+                    'timestamp': time.time()
+                })
+            
+            return False
+        
+        # Check file size (real images have size > 0)
+        file_size = os.path.getsize(real_image_path)
+        if file_size < 100:  # Less than 100 bytes is suspicious
+            logger.error(f"Screenshot verification FAILED: Image file too small: {file_size} bytes")
+            
+            if hasattr(self, 'telemetry') and self.telemetry:
+                self.telemetry.record_event('screenshot_verification_failed', {
+                    'task_id': task.id,
+                    'reason': 'file_too_small',
+                    'size': file_size,
+                    'timestamp': time.time()
+                })
+            
+            return False
+        
+        logger.info(f"Screenshot verification: Found real image artifact: {real_image_path} ({file_size} bytes)")
         
         # OCR-based verification (if expected text provided)
         if expected_text:
