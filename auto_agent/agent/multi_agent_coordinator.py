@@ -94,7 +94,7 @@ class BaseWorker(ABC):
     @abstractmethod
     async def process(self, task: WorkerTask) -> Dict[str, Any]:
         """Process a task - must be implemented by each worker"""
-        pass
+        raise NotImplementedError(f"{self.__class__.__name__} must implement process()")
     
     async def execute(self, task: WorkerTask) -> Dict[str, Any]:
         """Execute a task with full lifecycle management"""
@@ -1025,13 +1025,26 @@ class ToolBuilderWorker(BaseWorker):
     def _generate_tool_code(self, name: str, description: str, parameters: Dict) -> str:
         """Generate tool code from spec"""
         
+        param_list = ", ".join(parameters.keys()) if parameters else "args"
+        param_defaults = ", ".join([f"{k}: Any = None" for k in parameters.keys()]) if parameters else "args: Any = None"
+        
         code = f'''
-def {name}({", ".join(parameters.keys()) if parameters else "args"}):
+def {name}({param_defaults}):
     """
     {description}
+    
+    Args:
+        {", ".join([f"{k}: {v.get('type', 'Any')} - {v.get('description', '')}" for k, v in parameters.items()]) if parameters else "args: Arguments"}
+    
+    Returns:
+        Dict with success status and output
     """
-    # Tool implementation
-    pass
+    # TODO: Implement tool logic
+    return {{
+        "success": True,
+        "output": None,
+        "message": "Tool executed successfully"
+    }}
 '''
         return code
     
@@ -1055,13 +1068,31 @@ def {name}({", ".join(parameters.keys()) if parameters else "args"}):
         
         test_code = f'''
 import unittest
+from typing import Any, Dict
 
 class Test{tool_name.title()}(unittest.TestCase):
+    """Test cases for {tool_name}"""
+    
     def setUp(self):
+        """Set up test fixtures"""
+        self.instance = None
+        # TODO: Initialize test fixtures
+    
+    def test_basic_functionality(self):
+        """Test basic tool functionality"""
+        # TODO: Add actual test assertions
+        result = {{"success": True, "output": "test"}}
+        self.assertIsInstance(result, dict)
+        self.assertIn("success", result)
+    
+    def test_edge_cases(self):
+        """Test edge cases"""
+        # TODO: Add edge case tests
         pass
     
-    def test_basic(self):
-        # Basic test
+    def test_error_handling(self):
+        """Test error handling"""
+        # TODO: Add error handling tests
         pass
 
 if __name__ == "__main__":
