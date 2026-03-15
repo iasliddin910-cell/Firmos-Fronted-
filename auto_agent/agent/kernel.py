@@ -4941,6 +4941,18 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 # =====================================================
                 # STEP 3: Context-Aware Tool Selection
                 # =====================================================
+                lock_mgr = get_lock_manager()
+                scope = task.input_data.get("_scope", {})
+                keys = scope.get("resource_keys", [])
+                tool_keys = get_resource_keys("pending", task.input_data.get("tool_args", {}))
+                for k in set(keys + tool_keys):
+                    if not lock_mgr.acquire(k, task.id, "exclusive"):
+                        for x in set(keys + tool_keys):
+                            lock_mgr.release_by_task(task.id)
+                        task.status = TaskStatus.PENDING
+                        task.blocked_reason = f"locked:{k}"
+                        return None
+                
                 tool_name = self._select_tool_strict(
                     task=task,
                     required_tools=required_tools,
