@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "created_at": "2026-03-15T00:00:00Z",
+  "policies": {
+    "single_run_allowed": false,
+    "min_runs_for_release": 3,
+    "flake_threshold": 0.95,
+    "quarantine_threshold": 0.70,
+    "network_policy": "local_only"
+  },
+  "tasks": {},
+  "leaderboard": {}
+}

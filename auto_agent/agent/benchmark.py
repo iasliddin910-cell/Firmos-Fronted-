@@ -12,18 +12,46 @@ Benchmarks:
 
 IMPORTANT: This module now contains the ONLY release gate - SelfImprovementGate
 which integrates with RegressionSuite for real testing.
+
+The NEW harness-based benchmark platform is in benchmarks/platform.py
+The determinism system is in benchmarks/determinism.py
+
+POLICIES (Zero-Trust + Determinism):
+- Unknown != Pass
+- No tests != Pass
+- No verifier != Pass
+- Simulation forbidden in production
+- Single run NEVER enough for release
+- All runs must be deterministic and reproducible
 """
 import json
 import logging
 import time
 import statistics
 import subprocess
+import hashlib
 from typing import Dict, List, Any, Callable, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Try to import determinism system
+try:
+    from benchmarks.determinism import (
+        RunManifest, 
+        EnvironmentFingerprint,
+        SeedController,
+        DeterministicBenchmarkRunner,
+        FlakeAnalyzer,
+        MultiRunAggregator,
+        TaskRegistry
+    )
+    DETERMINISM_AVAILABLE = True
+except ImportError:
+    DETERMINISM_AVAILABLE = False
+    logger.warning("Determinism system not available")
 
 
 # ==================== DATA CLASSES ====================
