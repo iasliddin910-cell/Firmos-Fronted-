@@ -1881,45 +1881,51 @@ class SelfImprovementEngine:
 
 class ClosedLoopReleaseManager:
     """
-    Closed-loop release system for self-improvement patches
+    Closed-loop release system with staged rollout
     
+    States: experimental -> candidate -> approved -> promoted -> rolled_back
     Features:
-    - Candidate patch management
-    - Benchmark comparison
-    - Regression testing gate
-    - Accept/reject workflow
-    - Promote/rollback
-    - Patch lineage tracking
+    - Staged rollout
+    - Canary release
+    - Automatic rollback triggers
+    - Health monitoring
     """
+    
+    STATUS_EXPERIMENTAL = "experimental"
+    STATUS_CANDIDATE = "candidate"
+    STATUS_APPROVED = "approved"
+    STATUS_PROMOTED = "promoted"
+    STATUS_ROLLED_BACK = "rolled_back"
+    STATUS_REJECTED = "rejected"
     
     def __init__(self, storage_dir: str = "data/releases"):
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
-        # Pipeline components
         self.candidate_patches: Dict[str, CandidatePatch] = {}
         self.benchmarks: Dict[str, BenchmarkResult] = {}
         self.regressions: Dict[str, RegressionResult] = {}
         self.release_candidates: Dict[str, ReleaseCandidate] = {}
+        self.health_metrics: Dict[str, Dict] = {}
+        self.health_history: List[Dict] = []
         
-        # Configuration
-        self.regression_threshold = 0.95  # 95% tests must pass
-        self.benchmark_improvement_threshold = 0.05  # 5% improvement required
+        self.rollback_triggers = {
+            "error_rate_threshold": 0.05,
+            "latency_threshold_ms": 1000,
+            "failure_count_threshold": 10,
+        }
         
-        logger.info("🔄 Closed-Loop Release Manager initialized")
+        self.regression_threshold = 0.95
+        self.benchmark_improvement_threshold = 0.05
+        
+        logger.info("🔄 Closed-Loop Release Manager initialized with staged rollout")
     
     def create_candidate_patch(self, proposal_id: str, file_path: str,
                              current_code: str, proposed_code: str,
                              reason: str, expected_improvement: str,
                              parent_patch_id: str = None) -> str:
-        """Create a candidate patch for the release pipeline"""
-        
         patch_id = f"candidate_{hashlib.md5(f'{proposal_id}{time.time()}'.encode()).hexdigest()[:8]}"
-        
-        # Generate diff
         diff = self._generate_diff(current_code, proposed_code)
-        
-        # Build lineage
         lineage = [parent_patch_id] if parent_patch_id else []
         
         candidate = CandidatePatch(
@@ -1931,14 +1937,107 @@ class ClosedLoopReleaseManager:
             diff=diff,
             reason=reason,
             expected_improvement=expected_improvement,
-            status="pending",
+            status=self.STATUS_EXPERIMENTAL,
             lineage=lineage
         )
         
         self.candidate_patches[patch_id] = candidate
-        
-        logger.info(f"📦 Created candidate patch: {patch_id}")
+        logger.info(f"📦 Created experimental patch: {patch_id}")
         return patch_id
+    
+    def promote_to_candidate(self, patch_id: str) -> bool:
+        if patch_id not in self.candidate_patches:
+            return False
+        candidate = self.candidate_patches[patch_id]
+        if candidate.benchmark_score is None:
+            return False
+        candidate.status = self.STATUS_CANDIDATE
+        logger.info(f"📦 Promoted {patch_id} to candidate")
+        return True
+    
+    def promote_to_approved(self, patch_id: str) -> bool:
+        if patch_id not in self.candidate_patches:
+            return False
+        candidate = self.candidate_patches[patch_id]
+        if not candidate.regression_passed:
+            return False
+        candidate.status = self.STATUS_APPROVED
+        logger.info(f"✅ Promoted {patch_id} to approved")
+        return True
+    
+    def promote_to_production(self, patch_id: str) -> bool:
+        if patch_id not in self.candidate_patches:
+            return False
+        candidate = self.candidate_patches[patch_id]
+        if candidate.status != self.STATUS_APPROVED:
+            return False
+        candidate.status = self.STATUS_PROMOTED
+        logger.info(f"🚀 Promoted {patch_id} to production!")
+        return True
+    
+    def rollback_patch(self, patch_id: str, reason: str) -> bool:
+        if patch_id not in self.candidate_patches:
+            return False
+        self.candidate_patches[patch_id].status = self.STATUS_ROLLED_BACK
+        self.health_history.append({
+            "patch_id": patch_id, "action": "rollback",
+            "reason": reason, "timestamp": time.time()
+        })
+        logger.warning(f"🔄 Rolled back {patch_id}: {reason}")
+        return True
+    
+    def record_health_metric(self, patch_id: str, metric: str, value: float):
+        if patch_id not in self.health_metrics:
+            self.health_metrics[patch_id] = {"error_count": 0, "latency_sum": 0, "request_count": 0}
+        if metric == "error":
+            self.health_metrics[patch_id]["error_count"] += 1
+        elif metric == "latency":
+            self.health_metrics[patch_id]["latency_sum"] += value
+        elif metric == "request":
+            self.health_metrics[patch_id]["request_count"] += 1
+    
+    def check_health_and_auto_rollback(self, patch_id: str) -> Dict:
+        if patch_id not in self.health_metrics:
+            return {"should_rollback": False}
+        
+        m = self.health_metrics[patch_id]
+        req = m.get("request_count", 0)
+        err = m.get("error_count", 0)
+        lat = m.get("latency_sum", 0)
+        
+        if req == 0:
+            return {"should_rollback": False}
+        
+        err_rate = err / req
+        avg_lat = lat / req
+        
+        if err_rate > self.rollback_triggers["error_rate_threshold"]:
+            self.rollback_patch(patch_id, f"Error rate {err_rate:.2%}")
+            return {"should_rollback": True, "reason": "error_rate"}
+        
+        if avg_lat > self.rollback_triggers["latency_threshold_ms"]:
+            self.rollback_patch(patch_id, f"Latency {avg_lat:.0f}ms")
+            return {"should_rollback": True, "reason": "latency"}
+        
+        return {"should_rollback": False, "error_rate": err_rate, "avg_latency": avg_lat}
+    
+    def start_canary_release(self, patch_id: str, traffic_percentage: int = 10) -> Dict:
+        if patch_id not in self.candidate_patches:
+            return {"success": False}
+        candidate = self.candidate_patches[patch_id]
+        if candidate.status != self.STATUS_APPROVED:
+            return {"success": False}
+        candidate.metadata = candidate.metadata or {}
+        candidate.metadata["canary"] = True
+        candidate.metadata["traffic_percentage"] = traffic_percentage
+        logger.info(f"🟡 Canary release: {patch_id} @ {traffic_percentage}%")
+        return {"success": True}
+    
+    def get_release_status(self) -> Dict:
+        counts = defaultdict(int)
+        for p in self.candidate_patches.values():
+            counts[p.status] += 1
+        return {"total": len(self.candidate_patches), "status": dict(counts)}
     
     def _generate_diff(self, old_code: str, new_code: str) -> str:
         """Generate simple diff between two code versions"""
