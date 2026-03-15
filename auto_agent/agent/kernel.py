@@ -165,6 +165,158 @@ class RecoveryStrategy(Enum):
     ABORT = "abort"
 
 
+class SelfImprovementSignal(Enum):
+    """
+    Signals for self-improvement system.
+    Emitted to help self-improvement engine learn and improve.
+    """
+    # Task-level signals
+    TASK_FAILED = "task_failed"
+    TASK_SUCCEEDED = "task_succeeded"
+    TASK_RECOVERED = "task_recovered"
+    TASK_TIMEOUT = "task_timeout"
+    
+    # Stage-level signals
+    STAGE_SUCCESS = "stage_success"
+    STAGE_FAILED = "stage_failed"
+    STAGE_SKIPPED = "stage_skipped"
+    
+    # Verification signals
+    VERIFIER_MISMATCH = "verifier_mismatch"
+    VERIFIER_FAILED = "verifier_failed"
+    VERIFIER_TIMEOUT = "verifier_timeout"
+    
+    # Patch signals
+    PATCH_APPLIED = "patch_applied"
+    PATCH_REGRESSED = "patch_regressed"
+    PATCH_FAILED = "patch_failed"
+    PATCH_ROLLED_BACK = "patch_rolled_back"
+    
+    # Tool signals
+    TOOL_UNSTABLE = "tool_unstable"
+    TOOL_FAILED = "tool_failed"
+    TOOL_SLOW = "tool_slow"
+    TOOL_CRASHED = "tool_crashed"
+    
+    # Approval signals
+    APPROVAL_BLOCKED = "approval_blocked"
+    APPROVAL_REJECTED = "approval_rejected"
+    APPROVAL_FRICTION = "approval_friction"
+    
+    # Recovery signals
+    RECOVERY_SUCCESS = "recovery_success"
+    RECOVERY_FAILED = "recovery_failed"
+    RECOVERY_PARTIAL = "recovery_partial"
+    
+    # Planning signals
+    PLAN_PARSE_FAILED = "plan_parse_failed"
+    PLAN_INVALID = "plan_invalid"
+    PLAN_RETRY = "plan_retry"
+
+class SelfImprovementEmitter:
+    """
+    Emits signals to the self-improvement system.
+    Tracks and reports signals for learning and improvement.
+    """
+    
+    def __init__(self):
+        self.signals: List[Dict] = []
+        self.signal_counts: Dict[str, int] = defaultdict(int)
+        self.recent_signals: deque = deque(maxlen=100)
+        
+    def emit(self, signal: SelfImprovementSignal, context: Dict) -> None:
+        """
+        Emit a self-improvement signal with context.
+        
+        Args:
+            signal: The type of signal
+            context: Additional context about the signal
+        """
+        signal_entry = {
+            "signal": signal.value,
+            "context": context,
+            "timestamp": time.time()
+        }
+        
+        self.signals.append(signal_entry)
+        self.signal_counts[signal.value] += 1
+        self.recent_signals.append(signal_entry)
+        
+    def emit_task_failed(self, task_id: str, error: str, stage: str) -> None:
+        """Emit TASK_FAILED signal"""
+        self.emit(SelfImprovementSignal.TASK_FAILED, {
+            "task_id": task_id,
+            "error": error,
+            "failed_stage": stage
+        })
+        
+    def emit_task_recovered(self, task_id: str, recovery_strategy: str) -> None:
+        """Emit TASK_RECOVERED signal"""
+        self.emit(SelfImprovementSignal.TASK_RECOVERED, {
+            "task_id": task_id,
+            "recovery_strategy": recovery_strategy
+        })
+        
+    def emit_patch_regressed(self, patch_id: str, regression_issues: List[str]) -> None:
+        """Emit PATCH_REGRESSED signal"""
+        self.emit(SelfImprovementSignal.PATCH_REGRESSED, {
+            "patch_id": patch_id,
+            "issues": regression_issues
+        })
+        
+    def emit_tool_unstable(self, tool_name: str, failure_count: int) -> None:
+        """Emit TOOL_UNSTABLE signal"""
+        self.emit(SelfImprovementSignal.TOOL_UNSTABLE, {
+            "tool_name": tool_name,
+            "failure_count": failure_count
+        })
+        
+    def emit_verifier_mismatch(self, task_id: str, expected: Any, actual: Any) -> None:
+        """Emit VERIFIER_MISMATCH signal"""
+        self.emit(SelfImprovementSignal.VERIFIER_MISMATCH, {
+            "task_id": task_id,
+            "expected": str(expected)[:100],
+            "actual": str(actual)[:100]
+        })
+        
+    def emit_approval_blocked(self, request_id: str, wait_time: float) -> None:
+        """Emit APPROVAL_BLOCKED signal"""
+        self.emit(SelfImprovementSignal.APPROVAL_BLOCKED, {
+            "request_id": request_id,
+            "wait_time": wait_time
+        })
+        
+    def emit_plan_parse_failed(self, plan_text: str, error: str) -> None:
+        """Emit PLAN_PARSE_FAILED signal"""
+        self.emit(SelfImprovementSignal.PLAN_PARSE_FAILED, {
+            "plan_text": plan_text[:200],
+            "error": error
+        })
+        
+    def emit_recovery_result(self, strategy: str, success: bool, details: Dict) -> None:
+        """Emit recovery result signal"""
+        if success:
+            self.emit(SelfImprovementSignal.RECOVERY_SUCCESS, {
+                "strategy": strategy,
+                "details": details
+            })
+        else:
+            self.emit(SelfImprovementSignal.RECOVERY_FAILED, {
+                "strategy": strategy,
+                "details": details
+            })
+            
+    def get_signal_summary(self) -> Dict:
+        """Get summary of all signals"""
+        return {
+            "total_signals": len(self.signals),
+            "signal_counts": dict(self.signal_counts),
+            "recent": list(self.recent_signals)[-10:]
+        }
+
+
+
+
 class TaskStatus(Enum):
     """Granular task status"""
     PENDING = "pending"
