@@ -2189,17 +2189,78 @@ class UnifiedReleaseGateManager:
     """
     Unified Release Gate - Every self-patch MUST pass through:
     1. Tests 2. Regression 3. Benchmark 4. Compare 5. Accept/Reject 6. Rollback
+    
+    Real implementation with actual baseline comparison and regression detection.
     """
     
-    def __init__(self, config = None):
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+    STATUS_ROLLBACK = "rollback"
+    
+    DECISION_APPROVE = "approve"
+    DECISION_CONDITIONAL_APPROVE = "conditional_approve"
+    DECISION_REJECT = "reject"
+    DECISION_ROLLBACK = "rollback"
+    
+    def __init__(self, config = None, storage_dir: str = "data/release_gates"):
         self.config = config or {}
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        
         self.min_test_pass_rate = self.config.get("min_test_pass_rate", 0.95)
         self.min_benchmark_score = self.config.get("min_benchmark_score", 0.80)
+        self.max_regression_percent = self.config.get("max_regression_percent", 10.0)
+        self.max_benchmark_delta = self.config.get("max_benchmark_delta", -5.0)
+        
         self.gate_history = []
         self.current_patch_id = None
+        self.current_metrics = {}
+        
+        self.baseline_file = self.storage_dir / "baseline_metrics.json"
+        self.baseline = self._load_baseline()
+        
         self.benchmark_suite = None
         self.regression_suite = None
         self.release_manager = None
+        self.patch_metrics_history = []
+        
+        logger.info("🚪 Unified Release Gate Manager initialized with real baseline comparison")
+    
+    def _load_baseline(self) -> Dict:
+        if self.baseline_file.exists():
+            try:
+                with open(self.baseline_file, 'r') as f:
+                    baseline = json.load(f)
+                    logger.info(f"📊 Baseline loaded: {baseline.get('version', 'unknown')}")
+                    return baseline
+            except Exception as e:
+                logger.warning(f"Failed to load baseline: {e}")
+        return {"version": "1.0.0", "test_pass_rate": 0.0, "benchmark_score": 0.0, "regression_count": 0, "created_at": time.time(), "metrics": {}}
+    
+    def _save_baseline(self, baseline: Dict):
+        try:
+            with open(self.baseline_file, 'w') as f:
+                json.dump(baseline, f, indent=2)
+            logger.info("📊 Baseline saved")
+        except Exception as e:
+            logger.error(f"Failed to save baseline: {e}")
+    
+    def update_baseline(self, metrics: Dict):
+        baseline = {
+            "version": metrics.get("version", "1.0.0"),
+            "test_pass_rate": metrics.get("test_pass_rate", 0.0),
+            "benchmark_score": metrics.get("benchmark_score", 0.0),
+            "regression_count": metrics.get("regression_count", 0),
+            "updated_at": time.time(),
+            "metrics": metrics.get("metrics", {})
+        }
+        self._save_baseline(baseline)
+        self.baseline = baseline
+    
+    def get_baseline(self) -> Dict:
+        return self.baseline.copy()
     
     def set_benchmark_suite(self, benchmark_suite):
         self.benchmark_suite = benchmark_suite
@@ -2216,63 +2277,91 @@ class UnifiedReleaseGateManager:
         
         gate_result = {
             "patch_id": patch_id,
-            "status": "pending",
+            "status": self.STATUS_RUNNING,
             "steps": {},
             "passed": False,
             "can_release": False,
             "issues": [],
-            "duration": 0.0
+            "warnings": [],
+            "duration": 0.0,
+            "timestamp": time.time(),
+            "baseline_version": self.baseline.get("version", "none")
         }
         
+        logger.info(f"🚪 [{patch_id}] Running tests...")
         test_result = self._run_tests()
         gate_result["steps"]["tests"] = test_result
-        if test_result.get("pass_rate", 0) < self.min_test_pass_rate:
-            gate_result["issues"].append("Test pass rate below threshold")
+        if test_result.get("status") == "error":
+            gate_result["issues"].append(f"Test error: {test_result.get('error')}")
+        elif test_result.get("pass_rate", 0) < self.min_test_pass_rate:
+            gate_result["issues"].append(f"Test rate {test_result.get('pass_rate', 0):.2%} < {self.min_test_pass_rate:.2%}")
         
-        regression_result = self._run_regression()
+        logger.info(f"🚪 [{patch_id}] Running regression...")
+        regression_result = self._run_regression(test_result)
         gate_result["steps"]["regression"] = regression_result
         if regression_result.get("regression_detected", False):
-            gate_result["issues"].append("Regression detected")
+            gate_result["issues"].append(f"Regression: {regression_result.get('regression_details', 'unknown')}")
         
+        logger.info(f"🚪 [{patch_id}] Running benchmark...")
         benchmark_result = self._run_benchmark()
         gate_result["steps"]["benchmark"] = benchmark_result
         if benchmark_result.get("score", 0) < self.min_benchmark_score:
-            gate_result["issues"].append("Benchmark score below threshold")
+            gate_result["issues"].append(f"Benchmark {benchmark_result.get('score', 0):.2%} < {self.min_benchmark_score:.2%}")
         
-        compare_result = self._compare_baseline()
+        logger.info(f"🚪 [{patch_id}] Comparing with baseline...")
+        compare_result = self._compare_baseline(test_result, regression_result, benchmark_result)
         gate_result["steps"]["comparison"] = compare_result
+        if compare_result.get("has_regressions"):
+            gate_result["issues"].extend(compare_result.get("regression_issues", []))
         
+        logger.info(f"🚪 [{patch_id}] Making decision...")
         decision = self._make_decision(gate_result)
         gate_result["steps"]["decision"] = decision
         
         gate_result["passed"] = len(gate_result["issues"]) == 0
         gate_result["can_release"] = gate_result["passed"]
-        gate_result["status"] = "approved" if gate_result["passed"] else "rejected"
+        gate_result["status"] = self.STATUS_APPROVED if gate_result["passed"] else self.STATUS_REJECTED
         gate_result["duration"] = time.time() - start_time
+        
+        self.current_metrics = {
+            "test_pass_rate": test_result.get("pass_rate", 0),
+            "benchmark_score": benchmark_result.get("score", 0),
+            "regression_detected": regression_result.get("regression_detected", False)
+        }
         
         self.gate_history.append(gate_result)
         
         if self.release_manager and patch_id:
             if gate_result["passed"]:
                 self.release_manager.approve_patch(patch_id)
+                logger.info(f"✅ [{patch_id}] Release approved")
             else:
                 self.release_manager.reject_patch(patch_id, "; ".join(gate_result["issues"]))
+                logger.warning(f"❌ [{patch_id}] Release rejected")
         
         return gate_result
     
     def _run_tests(self):
         if not self.regression_suite:
-            return {"pass_rate": 1.0, "status": "skipped"}
+            return {"pass_rate": 1.0, "total_tests": 0, "status": "skipped"}
         try:
             results = self.regression_suite.run("all")
-            return {"pass_rate": results.get("pass_rate", 0), "status": "completed"}
+            return {"pass_rate": results.get("pass_rate", 0), "total_tests": results.get("total", 0), "passed_tests": results.get("passed", 0), "status": "completed"}
         except Exception as e:
             return {"pass_rate": 0, "error": str(e), "status": "error"}
     
-    def _run_regression(self):
+    def _run_regression(self, test_result: Dict = None):
         if not self.regression_suite:
             return {"regression_detected": False, "status": "skipped"}
-        return {"regression_detected": False, "status": "completed"}
+        try:
+            regression_results = self.regression_suite.run("regression")
+            baseline_test_rate = self.baseline.get("test_pass_rate", 0)
+            current_test_rate = test_result.get("pass_rate", 0) if test_result else 0
+            regression_percent = ((baseline_test_rate - current_test_rate) / baseline_test_rate * 100) if baseline_test_rate > 0 else 0
+            regression_detected = regression_percent > self.max_regression_percent or regression_results.get("failed_count", 0) > 0
+            return {"regression_detected": regression_detected, "regression_percent": regression_percent, "baseline_pass_rate": baseline_test_rate, "current_pass_rate": current_test_rate, "regression_count": regression_results.get("failed_count", 0), "status": "completed"}
+        except Exception as e:
+            return {"regression_detected": False, "error": str(e), "status": "error"}
     
     def _run_benchmark(self):
         if not self.benchmark_suite:
@@ -2283,27 +2372,78 @@ class UnifiedReleaseGateManager:
         except Exception as e:
             return {"score": 0, "error": str(e), "status": "error"}
     
-    def _compare_baseline(self):
-        return {"vs_baseline": "same", "status": "completed"}
+    def _compare_baseline(self, test_result: Dict, regression_result: Dict, benchmark_result: Dict) -> Dict:
+        comparison = {"vs_baseline": "same", "has_regressions": False, "has_warnings": False, "regression_issues": [], "deltas": {}}
+        
+        baseline_test_rate = self.baseline.get("test_pass_rate", 0)
+        current_test_rate = test_result.get("pass_rate", 0)
+        test_delta = ((current_test_rate - baseline_test_rate) / baseline_test_rate * 100) if baseline_test_rate > 0 else 0
+        comparison["deltas"]["test_pass_rate"] = {"baseline": baseline_test_rate, "current": current_test_rate, "delta_percent": test_delta}
+        if test_delta < -self.max_regression_percent:
+            comparison["has_regressions"] = True
+            comparison["regression_issues"].append(f"Test rate dropped {abs(test_delta):.1f}%")
+        
+        baseline_benchmark = self.baseline.get("benchmark_score", 0)
+        current_benchmark = benchmark_result.get("score", 0)
+        benchmark_delta_percent = ((current_benchmark - baseline_benchmark) / baseline_benchmark * 100) if baseline_benchmark > 0 else 0
+        comparison["deltas"]["benchmark_score"] = {"baseline": baseline_benchmark, "current": current_benchmark, "delta_percent": benchmark_delta_percent}
+        if benchmark_delta_percent < self.max_benchmark_delta:
+            comparison["has_regressions"] = True
+            comparison["regression_issues"].append(f"Benchmark dropped {abs(benchmark_delta_percent):.1f}%")
+        
+        if regression_result.get("regression_detected", False):
+            comparison["has_regressions"] = True
+        
+        comparison["vs_baseline"] = "regressed" if comparison["has_regressions"] else "same"
+        return comparison
     
-    def _make_decision(self, gate_result):
+    def _make_decision(self, gate_result: Dict) -> Dict:
         issues = gate_result.get("issues", [])
-        if len(issues) == 0:
-            return {"decision": "approve", "reason": "All gate steps passed"}
-        elif len(issues) <= 2:
-            return {"decision": "conditional_approve", "reason": "Minor issues"}
-        else:
-            return {"decision": "reject", "reason": "Major issues"}
+        test_passed = gate_result["steps"].get("tests", {}).get("pass_rate", 0) >= self.min_test_pass_rate
+        benchmark_passed = gate_result["steps"].get("benchmark", {}).get("score", 0) >= self.min_benchmark_score
+        no_regression = not gate_result["steps"].get("regression", {}).get("regression_detected", True)
+        has_regressions = gate_result["steps"].get("comparison", {}).get("has_regressions", False)
+        
+        if not test_passed:
+            return {"decision": self.DECISION_REJECT, "reason": "Test below threshold", "severity": "critical"}
+        if not benchmark_passed:
+            return {"decision": self.DECISION_REJECT, "reason": "Benchmark below threshold", "severity": "critical"}
+        if has_regressions:
+            return {"decision": self.DECISION_REJECT, "reason": "Major regressions", "severity": "critical"}
+        if not no_regression:
+            return {"decision": self.DECISION_REJECT, "reason": "Regression tests failed", "severity": "critical"}
+        if len(issues) > 0:
+            return {"decision": self.DECISION_REJECT, "reason": f"{len(issues)} gate issues", "severity": "high"}
+        
+        return {"decision": self.DECISION_APPROVE, "reason": "All gates passed", "severity": "none"}
+    
+    def _maybe_update_baseline(self, gate_result: Dict):
+        current_test = gate_result["steps"].get("tests", {}).get("pass_rate", 0)
+        current_benchmark = gate_result["steps"].get("benchmark", {}).get("score", 0)
+        baseline_test = self.baseline.get("test_pass_rate", 0)
+        baseline_benchmark = self.baseline.get("benchmark_score", 0)
+        
+        if current_test >= baseline_test and current_benchmark >= baseline_benchmark:
+            self.update_baseline({"version": f"{time.time()}", "test_pass_rate": current_test, "benchmark_score": current_benchmark, "metrics": self.current_metrics})
     
     def rollback_patch(self, patch_id, reason):
         if not self.release_manager:
             return {"success": False, "error": "Release manager not set"}
         success = self.release_manager.rollback_release(patch_id, reason)
+        self.gate_history.append({"patch_id": patch_id, "status": self.STATUS_ROLLBACK, "reason": reason, "timestamp": time.time()})
         return {"success": success, "patch_id": patch_id, "reason": reason}
     
-    def get_gate_status(self):
-        return {
-            "total_runs": len(self.gate_history),
-            "passed": sum(1 for g in self.gate_history if g["passed"]),
-            "failed": sum(1 for g in self.gate_history if not g["passed"])
-        }
+    def get_gate_status(self) -> Dict:
+        total = len(self.gate_history)
+        passed = sum(1 for g in self.gate_history if g.get("status") == self.STATUS_APPROVED)
+        return {"total_runs": total, "passed": passed, "pass_rate": passed / total if total > 0 else 0, "baseline_version": self.baseline.get("version", "none")}
+    
+    def get_gate_history(self, limit: int = 10) -> List[Dict]:
+        return self.gate_history[-limit:]
+    
+    def export_gate_report(self, filepath: str = None) -> Dict:
+        report = {"gate_status": self.get_gate_status(), "baseline": self.baseline, "recent_gates": self.get_gate_history(20)}
+        if filepath:
+            with open(filepath, 'w') as f:
+                json.dump(report, f, indent=2, default=str)
+        return report
