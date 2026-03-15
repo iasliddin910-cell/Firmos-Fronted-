@@ -847,3 +847,311 @@ def create_unified_learning(api_key: str = None, data_dir: str = None):
     """Factory function for unified learning"""
     return UnifiedLearning(api_key, data_dir)
 
+
+# ==================== OBSERVED-WORLD LEARNING SYSTEM ====================
+# Advanced 24/7 learning with production feedback
+
+class ObservedWorldLearning:
+    """
+    Observed-World Learning System - Advanced 24/7 Learning
+    
+    Features:
+    - User correction feedback weighting
+    - Production task outcome feedback
+    - Benchmark-driven knowledge demotion
+    - Bad source quarantine
+    - Trust decay over time
+    - Self-observed contradiction resolution
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        # Feedback weights
+        self.feedback_weights = {
+            "user_correction": 0.9,      # User corrections are most valuable
+            "production_outcome": 0.8,   # Production results
+            "benchmark_result": 0.7,     # Benchmark performance
+            "self_observed": 0.6,        # Self-observed errors
+            "default": 0.3               # Default weight
+        }
+        
+        # Trust decay configuration
+        self.trust_decay_half_life = 30 * 24 * 3600  # 30 days
+        self.min_trust_threshold = 0.2
+        
+        # Quarantine
+        self.quarantined_sources: Set[str] = set()
+        self.quarantine_threshold = 0.3
+        
+        # Contradiction resolution
+        self.contradiction_log: List[Dict] = []
+        
+        # Production feedback cache
+        self.production_outcomes: Dict[str, Dict] = {}
+        
+        logger.info("🌍 Observed-World Learning System initialized")
+    
+    # ==================== USER CORRECTION FEEDBACK ====================
+    
+    def process_user_correction(self, entry_id: str, correction: Dict) -> Dict:
+        """
+        Process user correction feedback with high weight.
+        
+        User corrections are the most valuable feedback source.
+        """
+        correction_type = correction.get("type", "direct")
+        
+        # Higher weight for direct corrections
+        weight = self.feedback_weights["user_correction"]
+        
+        if correction_type == "direct":
+            weight *= 1.0
+        elif correction_type == "indirect":
+            weight *= 0.7
+        elif correction_type == "implicit":
+            weight *= 0.5
+        
+        return {
+            "entry_id": entry_id,
+            "correction_type": correction_type,
+            "weight": weight,
+            "applied": True
+        }
+    
+    # ==================== PRODUCTION OUTCOME FEEDBACK ====================
+    
+    def record_production_outcome(self, task_id: str, outcome: Dict):
+        """
+        Record production task outcome.
+        
+        Tracks:
+        - task success/failure
+        - knowledge used
+        - outcome quality
+        - latency
+        """
+        self.production_outcomes[task_id] = {
+            "success": outcome.get("success", False),
+            "knowledge_used": outcome.get("knowledge_used", []),
+            "quality_score": outcome.get("quality_score", 0.5),
+            "latency_ms": outcome.get("latency_ms", 0),
+            "timestamp": time.time(),
+            "user_satisfaction": outcome.get("user_satisfaction")
+        }
+    
+    def get_production_feedback(self, entry_id: str) -> Dict:
+        """Get aggregated production feedback for a knowledge entry"""
+        relevant = [
+            o for o in self.production_outcomes.values()
+            if entry_id in o.get("knowledge_used", [])
+        ]
+        
+        if not relevant:
+            return {"score": 0.5, "count": 0}
+        
+        avg_quality = sum(o["quality_score"] for o in relevant) / len(relevant)
+        success_rate = sum(1 for o in relevant if o["success"]) / len(relevant)
+        
+        return {
+            "score": avg_quality * success_rate,
+            "count": len(relevant),
+            "avg_quality": avg_quality,
+            "success_rate": success_rate
+        }
+    
+    # ==================== BENCHMARK-DRIVEN DEMOTION ====================
+    
+    def apply_benchmark_demotion(self, entry_id: str, benchmark_result: Dict):
+        """
+        Demote knowledge based on benchmark performance.
+        
+        If benchmark shows degradation, reduce knowledge confidence.
+        """
+        score = benchmark_result.get("score", 1.0)
+        
+        # Demotion factor based on score
+        if score < 0.5:
+            demotion_factor = 0.3
+        elif score < 0.7:
+            demotion_factor = 0.6
+        else:
+            demotion_factor = 1.0
+        
+        return {
+            "entry_id": entry_id,
+            "demotion_factor": demotion_factor,
+            "benchmark_score": score
+        }
+    
+    # ==================== BAD SOURCE QUARANTINE ====================
+    
+    def quarantine_source(self, source_url: str, reason: str):
+        """Quarantine a bad source"""
+        self.quarantined_sources.add(source_url)
+        
+        logger.warning(f"🔒 Source quarantined: {source_url} - {reason}")
+    
+    def is_quarantined(self, source_url: str) -> bool:
+        """Check if source is quarantined"""
+        return source_url in self.quarantined_sources
+    
+    def auto_quarantine_bad_sources(self, knowledge_entries: Dict[str, Any]) -> int:
+        """
+        Automatically quarantine sources with high failure rates.
+        """
+        source_stats = defaultdict(lambda: {"total": 0, "failures": 0})
+        
+        for entry in knowledge_entries.values():
+            source = entry.get("source", "")
+            if source:
+                source_stats[source]["total"] += 1
+                if entry.get("success_count", 0) < entry.get("usage_count", 1) * 0.3:
+                    source_stats[source]["failures"] += 1
+        
+        quarantined = 0
+        for source, stats in source_stats.items():
+            if stats["total"] >= 5:  # Minimum samples
+                failure_rate = stats["failures"] / stats["total"]
+                if failure_rate > self.quarantine_threshold:
+                    self.quarantine_source(source, f"Failure rate: {failure_rate:.1%}")
+                    quarantined += 1
+        
+        return quarantined
+    
+    # ==================== TRUST DECAY ====================
+    
+    def apply_trust_decay(self, entry: KnowledgeEntry) -> float:
+        """
+        Apply trust decay based on time since last verification.
+        
+        Older, unverified knowledge decays in confidence.
+        """
+        time_since_verify = time.time() - entry.last_verified
+        
+        # Exponential decay
+        decay_factor = 0.5 ** (time_since_verify / self.trust_decay_half_life)
+        
+        # Don't decay below minimum threshold
+        decay_factor = max(decay_factor, self.min_trust_threshold)
+        
+        return decay_factor
+    
+    def get_decayed_confidence(self, entry: KnowledgeEntry) -> float:
+        """Get confidence with decay applied"""
+        base_confidence = entry.confidence
+        decay_factor = self.apply_trust_decay(entry)
+        
+        return base_confidence * decay_factor
+    
+    # ==================== SELF-OBSERVED CONTRADICTION ====================
+    
+    def detect_self_observed_contradiction(self, entry_a: KnowledgeEntry, 
+                                          entry_b: KnowledgeEntry) -> Dict:
+        """
+        Detect and resolve contradictions from self-observation.
+        
+        When agent uses two conflicting pieces of knowledge.
+        """
+        # Calculate semantic similarity
+        similarity = self._calculate_similarity(entry_a.content, entry_b.content)
+        
+        if similarity > 0.8:
+            # Check for negation
+            negations = [("not", "is"), ("false", "true"), ("no", "yes")]
+            has_negation = any(
+                (neg[0] in entry_a.content.lower() and neg[1] in entry_b.content.lower()) or
+                (neg[1] in entry_a.content.lower() and neg[0] in entry_b.content.lower())
+                for neg in negations
+            )
+            
+            if has_negation:
+                contradiction = {
+                    "entry_a": entry_a.entry_id,
+                    "entry_b": entry_b.entry_id,
+                    "type": "self_observed",
+                    "severity": "high",
+                    "resolution": None
+                }
+                
+                # Try to resolve based on evidence
+                if entry_a.usage_count > entry_b.usage_count:
+                    contradiction["resolution"] = "prefer_a"
+                    entry_b.confidence *= 0.5
+                elif entry_b.usage_count > entry_a.usage_count:
+                    contradiction["resolution"] = "prefer_b"
+                    entry_a.confidence *= 0.5
+                else:
+                    contradiction["resolution"] = "demote_both"
+                    entry_a.confidence *= 0.7
+                    entry_b.confidence *= 0.7
+                
+                self.contradiction_log.append(contradiction)
+                return contradiction
+        
+        return {"type": "none"}
+    
+    def _calculate_similarity(self, text_a: str, text_b: str) -> float:
+        """Calculate semantic similarity between two texts"""
+        words_a = set(text_a.lower().split())
+        words_b = set(text_b.lower().split())
+        
+        if not words_a or not words_b:
+            return 0.0
+        
+        intersection = len(words_a & words_b)
+        union = len(words_a | words_b)
+        
+        return intersection / union if union > 0 else 0.0
+    
+    # ==================== MASTER LEARNING METHOD ====================
+    
+    def process_observed_feedback(self, feedback: Dict) -> Dict:
+        """
+        Process all types of observed-world feedback.
+        
+        Combines user corrections, production outcomes, benchmarks, 
+        and self-observations into unified learning signal.
+        """
+        feedback_type = feedback.get("type", "default")
+        
+        if feedback_type == "user_correction":
+            result = self.process_user_correction(
+                feedback["entry_id"],
+                feedback.get("correction", {})
+            )
+        elif feedback_type == "production":
+            self.record_production_outcome(
+                feedback["task_id"],
+                feedback.get("outcome", {})
+            )
+            result = {"processed": True}
+        elif feedback_type == "benchmark":
+            result = self.apply_benchmark_demotion(
+                feedback["entry_id"],
+                feedback.get("result", {})
+            )
+        elif feedback_type == "contradiction":
+            result = self.detect_self_observed_contradiction(
+                feedback["entry_a"],
+                feedback["entry_b"]
+            )
+        else:
+            result = {"error": "Unknown feedback type"}
+        
+        return result
+    
+    def get_learning_health(self) -> Dict:
+        """Get overall learning system health"""
+        return {
+            "quarantined_sources": len(self.quarantined_sources),
+            "contradictions_resolved": len(self.contradiction_log),
+            "production_outcomes": len(self.production_outcomes),
+            "feedback_weights": self.feedback_weights
+        }
+
+
+def create_observed_world_learning(config: Dict = None) -> ObservedWorldLearning:
+    """Factory function for ObservedWorldLearning"""
+    return ObservedWorldLearning(config)
+
