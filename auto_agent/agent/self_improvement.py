@@ -247,19 +247,233 @@ class BottleneckDetector:
 
 class PatchProposer:
     """
-    Propose code improvements
+    Propose intelligent code improvements with AI-powered patch generation
+    
+    Features:
+    - Root-cause to patch mapping
+    - AST diff generation
+    - LLM patch generation (optional)
+    - Patch risk scoring
+    - File allowlist/denylist
     """
     
-    def __init__(self):
-        self.proposals: Dict[str, PatchProposal] = {}
-        
-        logger.info("💡 Patch Proposer initialized")
+    # Root cause to fix type mapping
+    ROOT_CAUSE_MAPPINGS = {
+        "null_pointer": "add_null_check",
+        "memory_leak": "add_cleanup",
+        "performance": "optimize_algorithm",
+        "race_condition": "add_lock",
+        "deadlock": "add_timeout",
+        "infinite_loop": "add_bounds_check",
+        "buffer_overflow": "add_bounds_check",
+        "sql_injection": "sanitize_input",
+        "xss_vulnerability": "escape_output",
+        "unused_variable": "remove_dead_code",
+        "duplicate_code": "extract_method",
+        "long_function": "split_function",
+        "magic_numbers": "add_constant",
+        "hardcoded_config": "extract_config",
+        "missing_error_handling": "add_try_catch",
+        "logging_missing": "add_logging",
+    }
     
-    def propose(self, file_path: str, current_code: str, 
-               proposed_code: str, reason: str,
-               expected_improvement: str = "") -> str:
-        """Create a patch proposal"""
+    # Risk levels
+    RISK_LOW = "low"
+    RISK_MEDIUM = "medium"
+    RISK_HIGH = "high"
+    RISK_CRITICAL = "critical"
+    
+    def __init__(self, 
+                 storage_dir: str = "data/patches",
+                 allowed_files: List[str] = None,
+                 denied_files: List[str] = None):
+        self.proposals: Dict[str, PatchProposal] = {}
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
         
+        # File allowlist/denylist
+        self.allowed_files = allowed_files or ["*.py", "*.js", "*.ts", "*.json", "*.yaml", "*.yml"]
+        self.denied_files = denied_files or ["*.env", "*.pem", "*.key", "*.secret", "*.password"]
+        
+        # Patch history for learning
+        self.patch_history: List[Dict] = []
+        
+        # Initialize diff generator
+        self._diff_cache = {}
+        
+        logger.info("💡 Patch Proposer initialized with AI capabilities")
+    
+    def is_file_allowed(self, file_path: str) -> bool:
+        """Check if file is allowed for patching"""
+        import fnmatch
+        
+        # Check deny list first
+        for pattern in self.denied_files:
+            if fnmatch.fnmatch(file_path, pattern) or fnmatch.fnmatch(os.path.basename(file_path), pattern):
+                logger.warning(f"File denied by pattern: {file_path} matches {pattern}")
+                return False
+        
+        # Check allow list
+        for pattern in self.allowed_files:
+            if fnmatch.fnmatch(file_path, pattern) or fnmatch.fnmatch(os.path.basename(file_path), pattern):
+                return True
+        
+        return False
+    
+    def map_root_cause_to_fix(self, root_cause: str) -> str:
+        """Map root cause to fix type"""
+        root_cause_lower = root_cause.lower().replace(" ", "_").replace("-", "_")
+        return self.ROOT_CAUSE_MAPPINGS.get(root_cause_lower, "generic_fix")
+    
+    def generate_ast_diff(self, current_code: str, proposed_code: str) -> Dict:
+        """Generate AST-based diff between two code versions"""
+        try:
+            import ast
+            
+            # Parse both versions
+            current_ast = ast.parse(current_code) if current_code else None
+            proposed_ast = ast.parse(proposed_code) if proposed_code else None
+            
+            diff_result = {
+                "has_changes": current_code != proposed_code,
+                "current_lines": len(current_code.splitlines()) if current_code else 0,
+                "proposed_lines": len(proposed_code.splitlines()) if proposed_code else 0,
+                "line_diff": len(proposed_code.splitlines()) - len(current_code.splitlines()) if current_code and proposed_code else 0,
+            }
+            
+            if current_ast and proposed_ast:
+                # Compare function definitions
+                current_funcs = [n.name for n in ast.walk(current_ast) if isinstance(n, ast.FunctionDef)]
+                proposed_funcs = [n.name for n in ast.walk(proposed_ast) if isinstance(n, ast.FunctionDef)]
+                
+                diff_result["functions_added"] = list(set(proposed_funcs) - set(current_funcs))
+                diff_result["functions_removed"] = list(set(current_funcs) - set(proposed_funcs))
+                diff_result["functions_modified"] = list(set(current_funcs) & set(proposed_funcs))
+                
+                # Compare imports
+                current_imports = [n.module for n in ast.walk(current_ast) if isinstance(n, ast.Import)]
+                proposed_imports = [n.module for n in ast.walk(proposed_ast) if isinstance(n, ast.Import)]
+                
+                diff_result["imports_added"] = list(set(proposed_imports) - set(current_imports))
+                diff_result["imports_removed"] = list(set(current_imports) - set(proposed_imports))
+            
+            return diff_result
+            
+        except SyntaxError as e:
+            logger.warning(f"AST diff generation failed: {e}")
+            return {"error": str(e), "has_changes": current_code != proposed_code}
+    
+    def calculate_patch_risk(self, current_code: str, proposed_code: str, 
+                           fix_type: str) -> Dict[str, Any]:
+        """Calculate risk score for a patch"""
+        risk_factors = []
+        risk_score = 0.0
+        
+        # Line count impact
+        line_diff = len(proposed_code.splitlines()) - len(current_code.splitlines())
+        if abs(line_diff) > 100:
+            risk_factors.append("large_code_change")
+            risk_score += 0.3
+        elif abs(line_diff) > 50:
+            risk_factors.append("medium_code_change")
+            risk_score += 0.15
+        
+        # Critical fix types have higher risk
+        high_risk_fixes = ["add_lock", "add_try_catch", "remove_dead_code"]
+        if fix_type in high_risk_fixes:
+            risk_factors.append("high_risk_fix_type")
+            risk_score += 0.25
+        
+        # Security-related fixes
+        security_fixes = ["sanitize_input", "escape_output", "add_null_check"]
+        if fix_type in security_fixes:
+            risk_factors.append("security_critical")
+            risk_score += 0.2
+        
+        # Check for dangerous patterns in proposed code
+        dangerous_patterns = ["eval(", "exec(", "os.system(", "__import__("]
+        for pattern in dangerous_patterns:
+            if pattern in proposed_code:
+                risk_factors.append(f"dangerous_pattern:{pattern}")
+                risk_score += 0.4
+        
+        # Normalize risk score
+        risk_score = min(risk_score, 1.0)
+        
+        # Determine risk level
+        if risk_score >= 0.7:
+            risk_level = self.RISK_CRITICAL
+        elif risk_score >= 0.4:
+            risk_level = self.RISK_HIGH
+        elif risk_score >= 0.2:
+            risk_level = self.RISK_MEDIUM
+        else:
+            risk_level = self.RISK_LOW
+        
+        return {
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "risk_factors": risk_factors,
+            "line_diff": line_diff,
+            "is_safe": risk_score < 0.4
+        }
+    
+    def generate_diff(self, current_code: str, proposed_code: str) -> str:
+        """Generate unified diff format"""
+        import difflib
+        
+        current_lines = current_code.splitlines(keepends=True)
+        proposed_lines = proposed_code.splitlines(keepends=True)
+        
+        diff = difflib.unified_diff(
+            current_lines,
+            proposed_lines,
+            fromfile='original',
+            tofile='patched',
+            lineterm=''
+        )
+        
+        return ''.join(diff)
+    
+    def generate_patch(self, file_path: str, current_code: str, 
+                      root_cause: str, proposed_fix: str = None,
+                      expected_improvement: str = "",
+                      llm_suggestion: str = None) -> str:
+        """
+        Generate a complete patch proposal with risk assessment
+        
+        Args:
+            file_path: Path to the file to patch
+            current_code: Current code content
+            root_cause: Root cause of the issue (e.g., "performance", "null_pointer")
+            proposed_fix: Description of the proposed fix
+            expected_improvement: Expected improvement from the patch
+            llm_suggestion: Optional LLM-generated patch suggestion
+            
+        Returns:
+            proposal_id
+        """
+        
+        # Check file allowlist
+        if not self.is_file_allowed(file_path):
+            raise ValueError(f"File not allowed for patching: {file_path}")
+        
+        # Determine fix type from root cause
+        fix_type = self.map_root_cause_to_fix(root_cause)
+        
+        # Use LLM suggestion if provided, otherwise use proposed_fix
+        proposed_code = llm_suggestion if llm_suggestion else current_code
+        
+        # Generate diff
+        diff = self.generate_diff(current_code, proposed_code)
+        
+        # Calculate risk
+        risk_assessment = self.calculate_patch_risk(current_code, proposed_code, fix_type)
+        
+        # Generate AST diff
+        ast_diff = self.generate_ast_diff(current_code, proposed_code)
+        
+        # Create proposal
         proposal_id = f"patch_{hashlib.md5(f'{file_path}{time.time()}'.encode()).hexdigest()[:8]}"
         
         proposal = PatchProposal(
@@ -267,16 +481,82 @@ class PatchProposer:
             file_path=file_path,
             current_code=current_code,
             proposed_code=proposed_code,
-            reason=reason,
+            reason=proposed_fix or f"Fix: {root_cause} via {fix_type}",
             expected_improvement=expected_improvement,
             status="proposed"
         )
         
+        # Store additional metadata
+        proposal.metadata = {
+            "root_cause": root_cause,
+            "fix_type": fix_type,
+            "diff": diff,
+            "risk_assessment": risk_assessment,
+            "ast_diff": ast_diff,
+        }
+        
         self.proposals[proposal_id] = proposal
         
-        logger.info(f"💡 Proposed patch: {proposal_id} for {file_path}")
+        # Save patch to disk
+        self._save_patch_to_disk(proposal_id, proposal)
+        
+        logger.info(f"💡 Generated patch: {proposal_id} for {file_path} (risk: {risk_assessment['risk_level']})")
         
         return proposal_id
+    
+    def _save_patch_to_disk(self, proposal_id: str, proposal: PatchProposal):
+        """Save patch proposal to disk"""
+        try:
+            patch_file = self.storage_dir / f"{proposal_id}.json"
+            
+            patch_data = {
+                "proposal_id": proposal.proposal_id,
+                "file_path": proposal.file_path,
+                "reason": proposal.reason,
+                "expected_improvement": proposal.expected_improvement,
+                "status": proposal.status,
+                "created_at": proposal.created_at,
+                "metadata": proposal.metadata,
+                # Don't save full code to disk for security
+                "has_current_code": bool(proposal.current_code),
+                "has_proposed_code": bool(proposal.proposed_code),
+            }
+            
+            with open(patch_file, 'w') as f:
+                json.dump(patch_data, f, indent=2)
+                
+        except Exception as e:
+            logger.warning(f"Failed to save patch to disk: {e}")
+    
+    def apply_patch(self, proposal_id: str) -> bool:
+        """Apply an accepted patch to the file system"""
+        if proposal_id not in self.proposals:
+            return False
+        
+        proposal = self.proposals[proposal_id]
+        
+        if proposal.status != "accepted":
+            logger.warning(f"Cannot apply patch {proposal_id}: status is {proposal.status}")
+            return False
+        
+        try:
+            file_path = proposal.file_path
+            
+            # Create backup
+            if os.path.exists(file_path):
+                backup_path = f"{file_path}.backup.{int(time.time())}"
+                shutil.copy2(file_path, backup_path)
+            
+            # Write new code
+            with open(file_path, 'w') as f:
+                f.write(proposal.proposed_code)
+            
+            logger.info(f"💡 Applied patch: {proposal_id} to {file_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to apply patch {proposal_id}: {e}")
+            return False
     
     def accept(self, proposal_id: str) -> bool:
         """Accept a proposal"""
@@ -311,110 +591,280 @@ class PatchProposer:
 
 class SnapshotManager:
     """
-    Manage code snapshots for rollback
+    Manage atomic code snapshots for rollback with integrity verification
+    
+    Features:
+    - Atomic snapshot creation with status tracking
+    - Manifest file with checksums
+    - Complete/incomplete status
+    - Integrity verification before restore
+    - Transaction-like behavior
     """
+    
+    SNAPSHOT_STATUS_PENDING = "pending"
+    SNAPSHOT_STATUS_COMPLETE = "complete"
+    SNAPSHOT_STATUS_FAILED = "failed"
     
     def __init__(self, storage_dir: str = "data/snapshots"):
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         self.snapshots: Dict[str, Snapshot] = {}
+        self._in_progress_snapshots: Dict[str, Dict] = {}  # Track in-progress snapshots
         
-        logger.info("📸 Snapshot Manager initialized")
+        logger.info("📸 Snapshot Manager initialized with atomic support")
     
-    def create_snapshot(self, description: str, files: List[str], 
-                       version: str = "1.0.0") -> str:
-        """Create a snapshot"""
-        
-        snapshot_id = f"snap_{int(time.time())}"
-        
-        # Store files
-        file_hashes = {}
+    def _calculate_checksum(self, file_path: str) -> str:
+        """Calculate SHA256 checksum of a file"""
+        sha256 = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+    
+    def _calculate_content_checksum(self, content: str) -> str:
+        """Calculate SHA256 checksum of content"""
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    def _create_manifest(self, snapshot_id: str, files: List[str]) -> Dict:
+        """Create manifest with checksums for all files"""
+        manifest = {
+            "snapshot_id": snapshot_id,
+            "created_at": time.time(),
+            "files": {},
+            "total_files": len(files),
+            "completed_files": 0,
+            "status": self.SNAPSHOT_STATUS_PENDING,
+            "checksum": ""
+        }
         
         for filepath in files:
             try:
-                with open(filepath, 'r') as f:
-                    content = f.read()
-                    file_hashes[filepath] = hashlib.md5(content.encode()).hexdigest()
+                if os.path.exists(filepath):
+                    checksum = self._calculate_checksum(filepath)
+                    manifest["files"][filepath] = {
+                        "checksum": checksum,
+                        "size": os.path.getsize(filepath),
+                        "status": "complete"
+                    }
+                    manifest["completed_files"] += 1
+                else:
+                    manifest["files"][filepath] = {
+                        "checksum": None,
+                        "size": 0,
+                        "status": "missing"
+                    }
+            except Exception as e:
+                manifest["files"][filepath] = {"checksum": None, "size": 0, "status": "error", "error": str(e)}
+        
+        manifest_json = json.dumps(manifest["files"], sort_keys=True)
+        manifest["checksum"] = hashlib.sha256(manifest_json.encode()).hexdigest()
+        
+        return manifest
+    
+    def _verify_manifest(self, snapshot_id: str, manifest: Dict) -> bool:
+        """Verify manifest integrity"""
+        manifest_json = json.dumps(manifest["files"], sort_keys=True)
+        expected_checksum = hashlib.sha256(manifest_json.encode()).hexdigest()
+        return manifest["checksum"] == expected_checksum
+    
+    def _verify_file_integrity(self, snapshot_files_dir: Path, manifest: Dict) -> Dict[str, bool]:
+        """Verify integrity of all files in snapshot"""
+        results = {}
+        
+        for filepath, file_info in manifest["files"].items():
+            if file_info.get("status") != "complete":
+                results[filepath] = False
+                continue
+            
+            try:
+                src = snapshot_files_dir / filepath
+                if not src.exists():
+                    results[filepath] = False
+                    continue
                 
-                # Copy to snapshot storage
-                snapshot_files_dir = self.storage_dir / snapshot_id
-                snapshot_files_dir.mkdir(exist_ok=True)
-                
-                # Create relative path structure
-                dest = snapshot_files_dir / filepath
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                
-                shutil.copy2(filepath, dest)
+                current_checksum = self._calculate_checksum(str(src))
+                results[filepath] = (current_checksum == file_info["checksum"])
                 
             except Exception as e:
-                logger.error(f"Error snapshotting {filepath}: {e}")
+                results[filepath] = False
         
-        snapshot = Snapshot(
-            snapshot_id=snapshot_id,
-            description=description,
-            timestamp=time.time(),
-            files=file_hashes,
-            version=version
-        )
-        
-        self.snapshots[snapshot_id] = snapshot
-        
-        logger.info(f"📸 Created snapshot: {snapshot_id}")
-        
-        return snapshot_id
+        return results
     
-    def restore_snapshot(self, snapshot_id: str) -> bool:
-        """Restore from snapshot"""
+    def create_snapshot(self, description: str, files: List[str], 
+                       version: str = "1.0.0") -> str:
+        """Create an atomic snapshot with integrity verification"""
+        
+        snapshot_id = f"snap_{int(time.time())}"
+        temp_dir = self.storage_dir / f"{snapshot_id}.tmp"
+        final_dir = self.storage_dir / snapshot_id
+        
+        try:
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            self._in_progress_snapshots[snapshot_id] = {"status": self.SNAPSHOT_STATUS_PENDING, "files": {}}
+            
+            file_hashes = {}
+            successful_files = []
+            
+            for filepath in files:
+                try:
+                    if not os.path.exists(filepath):
+                        continue
+                    
+                    content = open(filepath, 'r').read()
+                    checksum = self._calculate_content_checksum(content)
+                    file_hashes[filepath] = checksum
+                    
+                    dest = temp_dir / filepath
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    open(dest, 'w').write(content)
+                    
+                    successful_files.append(filepath)
+                    self._in_progress_snapshots[snapshot_id]["files"][filepath] = "complete"
+                    
+                except Exception as e:
+                    self._in_progress_snapshots[snapshot_id]["files"][filepath] = f"error: {e}"
+            
+            manifest = self._create_manifest(snapshot_id, successful_files)
+            open(temp_dir / "manifest.json", 'w').write(json.dumps(manifest, indent=2))
+            
+            integrity_results = self._verify_file_integrity(temp_dir, manifest)
+            
+            if not all(integrity_results.values()):
+                failed_files = [f for f, ok in integrity_results.items() if not ok]
+                shutil.rmtree(temp_dir)
+                del self._in_progress_snapshots[snapshot_id]
+                raise Exception(f"Snapshot integrity check failed: {failed_files}")
+            
+            manifest["status"] = self.SNAPSHOT_STATUS_COMPLETE
+            temp_dir.rename(final_dir)
+            open(final_dir / "manifest.json", 'w').write(json.dumps(manifest, indent=2))
+            
+            snapshot = Snapshot(snapshot_id=snapshot_id, description=description, timestamp=time.time(), files=file_hashes, version=version)
+            snapshot.metadata = {"status": self.SNAPSHOT_STATUS_COMPLETE, "manifest_checksum": manifest["checksum"], "total_files": len(successful_files)}
+            
+            self.snapshots[snapshot_id] = snapshot
+            del self._in_progress_snapshots[snapshot_id]
+            
+            logger.info(f"📸 Created atomic snapshot: {snapshot_id}")
+            return snapshot_id
+            
+        except Exception as e:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            if snapshot_id in self._in_progress_snapshots:
+                del self._in_progress_snapshots[snapshot_id]
+            raise
+    
+    def verify_snapshot(self, snapshot_id: str) -> Dict:
+        """Verify snapshot integrity without restoring"""
+        if snapshot_id not in self.snapshots:
+            return {"valid": False, "error": "Snapshot not found"}
+        
+        snapshot_files_dir = self.storage_dir / snapshot_id
+        manifest_file = snapshot_files_dir / "manifest.json"
+        
+        if not manifest_file.exists():
+            return {"valid": False, "error": "Manifest not found"}
+        
+        with open(manifest_file, 'r') as f:
+            manifest = json.load(f)
+        
+        if not self._verify_manifest(snapshot_id, manifest):
+            return {"valid": False, "error": "Manifest checksum mismatch"}
+        
+        integrity_results = self._verify_file_integrity(snapshot_files_dir, manifest)
+        
+        return {
+            "valid": all(integrity_results.values()),
+            "snapshot_id": snapshot_id,
+            "status": manifest.get("status"),
+            "files_verified": len([v for v in integrity_results.values() if v]),
+            "files_failed": len([v for v in integrity_results.values() if not v])
+        }
+    
+    def restore_snapshot(self, snapshot_id: str, verify: bool = True) -> bool:
+        """Restore from snapshot with optional integrity verification"""
         
         if snapshot_id not in self.snapshots:
             return False
         
         snapshot = self.snapshots[snapshot_id]
-        
         snapshot_files_dir = self.storage_dir / snapshot_id
         
-        for filepath in snapshot.files.keys():
-            try:
-                src = snapshot_files_dir / filepath
-                if src.exists():
-                    shutil.copy2(src, filepath)
-            except Exception as e:
-                logger.error(f"Error restoring {filepath}: {e}")
+        if verify:
+            verification = self.verify_snapshot(snapshot_id)
+            if not verification.get("valid"):
                 return False
         
-        logger.info(f"📸 Restored snapshot: {snapshot_id}")
+        manifest_file = snapshot_files_dir / "manifest.json"
+        if not manifest_file.exists():
+            return False
         
+        with open(manifest_file, 'r') as f:
+            manifest = json.load(f)
+        
+        restored_files = []
+        
+        for filepath, file_info in manifest.get("files", {}).items():
+            if file_info.get("status") != "complete":
+                continue
+            
+            try:
+                src = snapshot_files_dir / filepath
+                if not src.exists():
+                    continue
+                
+                dest = Path(filepath)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, filepath)
+                restored_files.append(filepath)
+                
+            except Exception as e:
+                logger.error(f"Error restoring {filepath}: {e}")
+        
+        logger.info(f"📸 Restored snapshot: {snapshot_id} ({len(restored_files)} files)")
         return True
+    
+    def get_snapshot_info(self, snapshot_id: str) -> Optional[Dict]:
+        """Get detailed snapshot information"""
+        if snapshot_id not in self.snapshots:
+            return None
+        
+        snapshot = self.snapshots[snapshot_id]
+        return {
+            "snapshot_id": snapshot.snapshot_id,
+            "description": snapshot.description,
+            "timestamp": snapshot.timestamp,
+            "version": snapshot.version,
+            "total_files": len(snapshot.files),
+            "files": list(snapshot.files.keys()),
+            "metadata": snapshot.metadata
+        }
     
     def delete_snapshot(self, snapshot_id: str) -> bool:
         """Delete snapshot"""
-        
         if snapshot_id in self.snapshots:
             del self.snapshots[snapshot_id]
-            
-            # Delete files
             snapshot_files_dir = self.storage_dir / snapshot_id
             if snapshot_files_dir.exists():
                 shutil.rmtree(snapshot_files_dir)
-            
             return True
-        
         return False
     
     def list_snapshots(self) -> List[Dict]:
-        """List snapshots"""
-        
-        return [
-            {
+        """List all snapshots with status"""
+        result = []
+        for s in self.snapshots.values():
+            result.append({
                 "snapshot_id": s.snapshot_id,
                 "description": s.description,
                 "timestamp": s.timestamp,
                 "version": s.version,
-                "files": len(s.files)
-            }
-            for s in self.snapshots.values()
-        ]
+                "files": len(s.files),
+                "status": s.metadata.get("status", "unknown") if hasattr(s, 'metadata') else "unknown"
+            })
+        return result
 
 
 # ==================== EXPERIMENT MANAGER ====================
