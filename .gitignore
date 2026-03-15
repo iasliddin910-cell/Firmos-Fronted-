@@ -1,0 +1,59 @@
+# Environment files (API keys, secrets)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data
+data/
+*.db
+*.sqlite
+# Temp workspaces
+temp/
+tmp/
+*.tmp
+
+# Artifacts
+artifacts/
+outputs/
+
+# Benchmark outputs
+benchmark_results/
+*.benchmark
+
+# Screenshots
+screenshots/
+*.png
+*.jpg
+*.jpeg
+
+# Generated tools
+generated_tools/
+
+# Snapshots
+snapshots/
+
+# Agent memory
+agent_memory/
