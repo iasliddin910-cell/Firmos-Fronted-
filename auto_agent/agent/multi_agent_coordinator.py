@@ -1642,3 +1642,109 @@ def create_multi_agent_coordinator(api_key: str, tools=None, config: Dict = None
             "count": len(results)
         }
 
+
+
+# ==================== SELF-IMPROVEMENT WORKERS ====================
+
+class RootCauseAgent(BaseWorker):
+    """Agent that finds root cause of failures"""
+    
+    def __init__(self):
+        super().__init__("root_cause_agent", "Find root cause of failures")
+        
+    async def execute_task(self, task: Dict) -> Dict:
+        failure_info = task.get("failure_info", {})
+        error_type = failure_info.get("type", "unknown")
+        error_msg = failure_info.get("message", "")
+        
+        # Analyze error patterns
+        root_cause = self._analyze_root_cause(error_type, error_msg)
+        
+        return {
+            "root_cause": root_cause,
+            "confidence": 0.8,
+            "suggested_fix": root_cause.get("fix", "unknown")
+        }
+    
+    def _analyze_root_cause(self, error_type: str, error_msg: str) -> Dict:
+        """Analyze error to find root cause"""
+        if "import" in error_type.lower():
+            return {"cause": "missing_dependency", "fix": "add_import"}
+        elif "syntax" in error_type.lower():
+            return {"cause": "syntax_error", "fix": "fix_syntax"}
+        elif "memory" in error_type.lower():
+            return {"cause": "resource_limit", "fix": "optimize_memory"}
+        elif "timeout" in error_type.lower():
+            return {"cause": "infinite_loop", "fix": "add_timeout"}
+        else:
+            return {"cause": "unknown", "fix": "manual_review"}
+
+
+class PatchAgent(BaseWorker):
+    """Agent that generates patches for failures"""
+    
+    def __init__(self):
+        super().__init__("patch_agent", "Generate patches for failures")
+        
+    async def execute_task(self, task: Dict) -> Dict:
+        root_cause = task.get("root_cause", {})
+        file_path = task.get("file_path", "")
+        original_code = task.get("original_code", "")
+        
+        # Generate patch based on root cause
+        patch = self._generate_patch(root_cause, original_code)
+        
+        return {
+            "patch": patch,
+            "confidence": 0.7,
+            "risk_level": self._assess_risk(patch)
+        }
+    
+    def _generate_patch(self, root_cause: Dict, code: str) -> str:
+        """Generate patch based on root cause"""
+        fix_type = root_cause.get("fix", "unknown")
+        
+        if fix_type == "add_import":
+            return "# Add missing import"
+        elif fix_type == "fix_syntax":
+            return "# Fix syntax error"
+        elif fix_type == "optimize_memory":
+            return "# Optimize memory usage"
+        elif fix_type == "add_timeout":
+            return "# Add timeout handling"
+        else:
+            return "# Manual review needed"
+    
+    def _assess_risk(self, patch: str) -> str:
+        """Assess patch risk level"""
+        risky = ["exec", "eval", "subprocess", "os.system"]
+        if any(r in patch for r in risky):
+            return "high"
+        return "low"
+
+
+class TestAgent(BaseWorker):
+    """Agent that generates and runs tests for patches"""
+    
+    def __init__(self):
+        super().__init__("test_agent", "Generate and run tests for patches")
+        
+    async def execute_task(self, task: Dict) -> Dict:
+        patch = task.get("patch", "")
+        file_path = task.get("file_path", "")
+        
+        # Generate tests
+        tests = self._generate_tests(patch)
+        
+        # Run tests
+        results = await self._run_tests(tests)
+        
+        return {
+            "tests": tests,
+            "results": results,
+            "passed": results.get("passed", False)
+        }
+    
+    def _generate_tests(self, patch: str) -> str:
+        """Generate unit tests for patch"""
+        return 
