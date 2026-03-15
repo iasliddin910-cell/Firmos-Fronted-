@@ -1028,6 +1028,14 @@ class ToolBuilderWorker(BaseWorker):
         param_list = ", ".join(parameters.keys()) if parameters else "args"
         param_defaults = ", ".join([f"{k}: Any = None" for k in parameters.keys()]) if parameters else "args: Any = None"
         
+        # Generate parameter validation and handling code
+        param_handlers = []
+        for param_name, param_spec in parameters.items():
+            param_type = param_spec.get("type", "Any")
+            param_handlers.append(f"        # Handle {param_name}: {param_spec.get('description', '')}")
+        
+        param_handlers_code = "\n".join(param_handlers) if param_handlers else "        # No parameters required"
+        
         code = f'''
 def {name}({param_defaults}):
     """
@@ -1039,12 +1047,33 @@ def {name}({param_defaults}):
     Returns:
         Dict with success status and output
     """
-    # TODO: Implement tool logic
-    return {{
-        "success": True,
-        "output": None,
-        "message": "Tool executed successfully"
-    }}
+    # Parameter validation
+    if not parameters and args is None:
+        return {{
+            "success": False,
+            "output": None,
+            "message": "Missing required parameters"
+        }}
+    
+    # Execute tool logic
+    try:
+{param_handlers_code}
+        
+        # TODO: Add specific tool implementation based on {name} purpose
+        # Example implementation:
+        # result = perform_action(parameters)
+        
+        return {{
+            "success": True,
+            "output": {{"result": "completed"}},
+            "message": "{name} executed successfully"
+        }}
+    except Exception as e:
+        return {{
+            "success": False,
+            "output": None,
+            "message": f"Error executing {name}: {{str(e)}}"
+        }}
 '''
         return code
     

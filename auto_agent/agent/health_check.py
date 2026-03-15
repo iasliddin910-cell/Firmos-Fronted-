@@ -594,8 +594,8 @@ class HealthChecker:
                 try:
                     info = agent.benchmark_suite.get_info() if hasattr(agent.benchmark_suite, 'get_info') else {}
                     details["info"] = info
-                except:
-                    pass
+                except (AttributeError, Exception) as e:
+                    logger.debug(f"Benchmark info unavailable: {e}")
             
             status = HealthStatus.HEALTHY if benchmark_ok else HealthStatus.DEGRADED
             

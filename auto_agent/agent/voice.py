@@ -97,11 +97,38 @@ class VoiceSystem:
         logger.info("🎤 Doimiy eshitish boshlandi")
     
     def _continuous_listen(self, callback: Callable[[str], None]):
-        """Background listening loop - placeholder for audio setup"""
+        """
+        Background listening loop for continuous audio capture.
+        Uses available STT engine (Whisper or speech_recognition).
+        """
+        import time
+        
         while self.is_listening:
-            logger.debug("Waiting for audio input (STT not configured)")
-            import time
-            time.sleep(0.5)
+            try:
+                # Try to use speech_recognition if available
+                if self.recognizer and self.microphone:
+                    with self.microphone as source:
+                        self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                        audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=5)
+                    
+                    # Try to recognize
+                    if self.use_whisper and hasattr(self, 'whisper_model'):
+                        # Use Whisper
+                        import numpy as np
+                        audio_data = np.frombuffer(audio.get_raw_data(), np.int16).astype(np.float32) / 32768.0
+                        result = self.whisper_model.transcribe(audio_data, language='uz')
+                        text = result.get('text', '').strip()
+                    else:
+                        # Use Google STT
+                        text = self.recognizer.recognize_google(audio, language='uz-UZ')
+                    
+                    if text:
+                        callback(text)
+                        
+            except Exception as e:
+                logger.debug(f"Audio capture iteration: {e}")
+            
+            time.sleep(0.1)  # Small delay to prevent CPU spinning
     
     def stop_listening(self):
         """Eshitishni to'xtatish"""

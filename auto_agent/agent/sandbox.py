@@ -203,7 +203,8 @@ class WorkspaceSandbox:
             logger.warning(f"Path {path} is not within any allowed path: {self.allowed_paths}")
             return False
         
-        except Exception:
+        except (ValueError, OSError, Exception) as e:
+            logger.warning(f"Path validation error: {e}")
             return False
     
     def restrict_path(self, path: str) -> str:
@@ -657,8 +658,8 @@ class IsolatedContainer:
                     cmdline = proc.info.get('cmdline', [])
                     if cmdline and any(str(container_dir) in str(c) for c in cmdline):
                         proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    logger.debug(f"Process cleanup skipped: {e}")
         except Exception as e: logger.warning(f"Sandbox error: {e}")
             
     def apply_egress_control(self, container_id: str) -> Dict:

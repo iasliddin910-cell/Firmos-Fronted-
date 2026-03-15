@@ -99,7 +99,9 @@ class VersionManager:
         try:
             with open(self.vd / name / f"v{v}.json") as f: d = json.load(f)
             return ToolVersion(d["version"], d["code"], d["tests"], d.get("br",{}), d.get("ca",time.time()), ToolStatus(d.get("status","testing")), d.get("cb","system"))
-        except: return None
+        except Exception as e: 
+            logger.debug(f"Load version error: {e}")
+            return None
     def list_v(self, name: str) -> List[str]:
         d = self.vd / name
         return sorted([f.stem[1:] for f in d.glob("v*.json")] if d.exists() else [], key=self.parse_v, reverse=True)
@@ -111,7 +113,9 @@ class RollbackManager:
             with open(self.rd / f"{name}_{ver}_{int(time.time())}.json", "w") as f:
                 json.dump({"version": ver, "ca": time.time(), "reason": reason, "by": by, "data": data}, f)
             return True
-        except: return False
+        except Exception as e: 
+            logger.debug(f"Create rollback error: {e}")
+            return False
     def rollback(self, name: str, ver: str) -> Optional[Dict]:
         for f in self.rd.glob(f"{name}_*.json"):
             with open(f) as d: d = json.load(d)
@@ -553,8 +557,8 @@ Only return test code, no explanations."""
             try:
                 os.unlink(code_file)
                 os.unlink(test_file)
-            except:
-                pass
+            except (OSError, FileNotFoundError, Exception) as e:
+                logger.debug(f"Cleanup error: {e}")
         
         return result
 

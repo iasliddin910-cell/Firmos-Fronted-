@@ -176,8 +176,8 @@ class RecoveryMapper:
                 cat_enum = DenialCategory(category.lower())
                 cat_recovery = self.CATEGORY_RECOVERY.get(cat_enum, {})
                 base_action.update(cat_recovery)
-            except ValueError:
-                pass
+            except ValueError as e:
+                logger.debug(f"Invalid category: {e}")
         
         return base_action
     

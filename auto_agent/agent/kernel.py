@@ -502,7 +502,7 @@ class VerificationEngine:
                     if expected_selector:
                         try:
                             page.wait_for_selector(expected_selector, timeout=3000)
-                        except:
+                        except (playwright.async_api.Error, TimeoutError, Exception):
                             selector_found = False
                     signals['selector_found'] = selector_found
                     weights['selector_found'] = 1.2
@@ -521,7 +521,8 @@ class VerificationEngine:
                             auth_token = page.evaluate("() => localStorage.getItem('authToken') || sessionStorage.getItem('authToken')")
                             auth_details = {'login_form': auth_found, 'sessions': len(session_cookies), 'token': bool(auth_token)}
                             auth_valid = not auth_found or len(session_cookies) > 0 or bool(auth_token)
-                        except:
+                        except (playwright.async_api.Error, TimeoutError, Exception) as e:
+                            logger.debug(f"Auth check error (non-critical): {e}")
                             auth_valid = True
                     signals['auth_valid'] = auth_valid
                     signals['auth_details'] = auth_details
@@ -540,7 +541,8 @@ class VerificationEngine:
                                 size = os.path.getsize(screenshot_path)
                                 screenshot_valid = size > 1000
                                 screenshot_evidence = {'size': size}
-                        except:
+                        except (playwright.async_api.Error, TimeoutError, Exception) as e:
+                            logger.warning(f"Screenshot capture error: {e}")
                             screenshot_valid = False
                     signals['screenshot_captured'] = screenshot_valid
                     signals['screenshot_evidence'] = screenshot_evidence
@@ -779,7 +781,6 @@ Return JSON (no other text):
             }
         )
 
-    def _verify_code_syntax(self, data: Dict) -> VerificationResult:
     def _verify_code_syntax(self, data: Dict) -> VerificationResult:
         """Verify code has no syntax errors"""
         code = data.get("code", "")
@@ -2917,8 +2918,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                         # Check if it has tasks or looks like a plan
                         if 'tasks' in parsed or isinstance(parsed, list):
                             return re.match(r'\{[\s\S]*\}', candidate)
-                    except:
-                        pass
+                    except (json.JSONDecodeError, ValueError, Exception) as e:
+                        logger.debug(f"JSON parse attempt failed: {e}")
         
         return None
 
@@ -2942,8 +2943,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             try:
                 json.loads(json_match.group())
                 return json_match
-            except:
-                pass
+            except (json.JSONDecodeError, ValueError, Exception) as e:
+                logger.debug(f"JSON fix attempt failed: {e}")
         
         return None
 
@@ -5441,8 +5442,8 @@ Return ONLY valid JSON (no other text):
             if browser and hasattr(browser, 'get_page_text'):
                 try:
                     page_for_semantic = browser.get_page_text()
-                except:
-                    logger.debug("Browser page text unavailable")
+                except (AttributeError, Exception) as e:
+                    logger.debug(f"Browser page text unavailable: {e}")
             
             missing_semantic = []
             for pattern in semantic_patterns:
