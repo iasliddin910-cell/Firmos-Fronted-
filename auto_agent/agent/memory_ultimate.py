@@ -710,6 +710,77 @@ class ProceduralMemory:
         results.extend(self.procedural.search(query))
         return results
 
+    # ==================== TOOL RELIABILITY (if missing) ====================
+    
+    def record_tool_usage(self, tool_name: str, success: bool, duration: float):
+        """Record tool usage for reliability tracking"""
+        if not hasattr(self, 'tool_reliability_history'):
+            from collections import defaultdict
+            self.tool_reliability_history = defaultdict(lambda: {"success": 0, "failure": 0, "total": 0})
+        
+        stats = self.tool_reliability_history[tool_name]
+        stats["total"] += 1
+        if success:
+            stats["success"] += 1
+        else:
+            stats["failure"] += 1
+        stats["last_used"] = time.time()
+        stats["success_rate"] = stats["success"] / stats["total"] if stats["total"] > 0 else 0
+        
+    def get_unreliable_tools(self, threshold: float = 0.5) -> List[Dict]:
+        """Get tools that frequently fail"""
+        if not hasattr(self, 'tool_reliability_history'):
+            return []
+        unreliable = []
+        for tool, stats in self.tool_reliability_history.items():
+            if stats.get("success_rate", 1.0) < threshold:
+                unreliable.append({"tool": tool, "success_rate": stats["success_rate"], "failure_count": stats["failure"]})
+        return sorted(unreliable, key=lambda x: x["failure_count"], reverse=True)
+
+    # ==================== PATCH MEMORIES (if missing) ====================
+    
+    def record_failed_patch(self, patch_info: Dict):
+        """Record a failed patch"""
+        if not hasattr(self, 'failed_patch_memory'):
+            self.failed_patch_memory = {}
+        patch_id = patch_info.get("patch_id", str(time.time()))
+        self.failed_patch_memory[patch_id] = patch_info
+        
+    def record_accepted_patch(self, patch_id: str, reason: str, success_rate: float, benchmark_improvement: float):
+        """Record an accepted patch"""
+        if not hasattr(self, 'accepted_patch_memory'):
+            self.accepted_patch_memory = {}
+        self.accepted_patch_memory[patch_id] = {"reason": reason, "success_rate": success_rate, "benchmark_improvement": benchmark_improvement}
+        
+    def record_rejected_patch(self, patch_id: str, reason: str):
+        """Record a rejected patch"""
+        if not hasattr(self, 'rejected_patch_memory'):
+            self.rejected_patch_memory = {}
+        self.rejected_patch_memory[patch_id] = {"reason": reason}
+
+    # ==================== BENCHMARK LINEAGE ====================
+    
+    def record_benchmark_result(self, benchmark_id: str, patch_id: str, score: float):
+        """Record benchmark result over time"""
+        if not hasattr(self, 'benchmark_lineage'):
+            self.benchmark_lineage = {}
+        if benchmark_id not in self.benchmark_lineage:
+            self.benchmark_lineage[benchmark_id] = {"scores": [], "patch_id": patch_id}
+        self.benchmark_lineage[benchmark_id]["scores"].append(score)
+        
+    def get_benchmark_trend(self, benchmark_id: str) -> Dict:
+        """Get benchmark performance trend"""
+        if not hasattr(self, 'benchmark_lineage') or benchmark_id not in self.benchmark_lineage:
+            return {}
+        scores = self.benchmark_lineage[benchmark_id].get("scores", [])
+        if len(scores) < 2:
+            return {"trend": "insufficient_data"}
+        recent = sum(scores[-3:]) / min(3, len(scores))
+        older = sum(scores[:3]) / min(3, len(scores))
+        return {"trend": "improving" if recent > older else "declining" if recent < older else "stable", "change_percent": ((recent-older)/older*100) if older>0 else 0}
+
+
+
 
 class WorkingMemory:
     """Layer 1: Current task context"""
