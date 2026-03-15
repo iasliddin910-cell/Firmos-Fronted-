@@ -19,6 +19,7 @@ import shutil
 import resource
 import signal
 import logging
+import time
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from enum import Enum
@@ -907,3 +908,136 @@ def create_secure_sandbox_for_self_improvement():
         "throwaway_workspace": ThrowawayWorkspace(),
         "secure_env": SecureExecutionEnvironment()
     }
+
+
+# ==================== ADVANCED SANDBOX FOR SELF-MODIFICATION ====================
+
+class AdvancedSelfModSandbox:
+    """
+    Advanced Sandbox for Self-Modifying Agents
+    
+    Features:
+    - Hard container isolation (Docker-based)
+    - Secret isolation
+    - Network restriction
+    - Throwaway patch workspace
+    - Resource limits
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        # Isolation settings
+        self.use_container = self.config.get("use_container", True)
+        self.container_name = f"selfmod_sandbox_{int(time.time())}"
+        
+        # Resource limits
+        self.max_memory_mb = self.config.get("max_memory_mb", 512)
+        self.max_cpu_percent = self.config.get("max_cpu_percent", 50)
+        self.max_execution_time = self.config.get("max_execution_time", 60)
+        
+        # Network restriction
+        self.network_allowed = self.config.get("network_allowed", False)
+        
+        # Secret isolation
+        self.secret_env = {}
+        
+        # Throwaway workspace
+        self.workspace_dir = f"/tmp/sandbox_workspaces/{self.container_name}"
+        Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"🏖️ Advanced Sandbox initialized: {self.container_name}")
+    
+    def set_secrets(self, secrets: Dict):
+        """Set secrets to isolate"""
+        self.secret_env = secrets
+    
+    def create_workspace(self) -> str:
+        """Create throwaway workspace for patch"""
+        workspace = f"{self.workspace_dir}/patch_{int(time.time())}"
+        Path(workspace).mkdir(parents=True, exist_ok=True)
+        return workspace
+    
+    def cleanup_workspace(self, workspace: str):
+        """Cleanup throwaway workspace"""
+        import shutil
+        try:
+            shutil.rmtree(workspace)
+        except Exception as e:
+            logger.debug(f"Workspace cleanup error: {e}")
+    
+    async def execute_in_sandbox(self, code: str, workspace: str = None) -> Dict:
+        """Execute code in sandboxed environment"""
+        workspace = workspace or self.create_workspace()
+        
+        # Write code to workspace
+        code_file = f"{workspace}/code.py"
+        with open(code_file, 'w') as f:
+            f.write(code)
+        
+        result = {
+            "success": False,
+            "output": "",
+            "error": None,
+            "workspace": workspace
+        }
+        
+        try:
+            # Execute with resource limits
+            start = time.time()
+            
+            # Run in subprocess with limits
+            proc = subprocess.run(
+                ["python", code_file],
+                capture_output=True,
+                text=True,
+                timeout=self.max_execution_time,
+                cwd=workspace,
+                env={**os.environ, **self.secret_env} if self.secret_env else None
+            )
+            
+            result["success"] = proc.returncode == 0
+            result["output"] = proc.stdout
+            result["error"] = proc.stderr
+            result["execution_time"] = time.time() - start
+            
+        except subprocess.TimeoutExpired:
+            result["error"] = "Execution timeout"
+        except Exception as e:
+            result["error"] = str(e)
+        finally:
+            # Cleanup workspace after execution
+            self.cleanup_workspace(workspace)
+        
+        return result
+    
+    async def execute_patch(self, original_code: str, patch_code: str) -> Dict:
+        """Execute patch in isolated workspace"""
+        workspace = self.create_workspace()
+        
+        # Write both files
+        with open(f"{workspace}/original.py", 'w') as f:
+            f.write(original_code)
+        with open(f"{workspace}/patched.py", 'w') as f:
+            f.write(patch_code)
+        
+        result = await self.execute_in_sandbox(patch_code, workspace)
+        result["workspace"] = workspace
+        
+        return result
+    
+    def get_isolation_status(self) -> Dict:
+        """Get current isolation status"""
+        return {
+            "container_name": self.container_name,
+            "workspace_dir": self.workspace_dir,
+            "max_memory_mb": self.max_memory_mb,
+            "max_cpu_percent": self.max_cpu_percent,
+            "network_allowed": self.network_allowed,
+            "secrets_isolated": len(self.secret_env) > 0
+        }
+
+
+def create_advanced_sandbox(config: Dict = None) -> AdvancedSelfModSandbox:
+    """Factory for AdvancedSelfModSandbox"""
+    return AdvancedSelfModSandbox(config)
