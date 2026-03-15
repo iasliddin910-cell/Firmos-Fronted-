@@ -1,0 +1,73 @@
+# Tool-Creation Benchmark Tasks - Repository Symbol Indexer
+# ===================================================
+
+task_id: create_symbol_indexer
+task_type: symbol_indexer
+description: |
+  Create tool to index code symbols
+  
+  Current search doesn't understand code structure.
+  Need tool to index functions, classes, imports across large codebase.
+
+original_task: |
+  Find all function definitions across large codebase (1000+ files)
+  
+why_current_tools_insufficient: |
+  Current search doesn't understand code structure:
+  - Can't find function definitions
+  - Can't track class hierarchies
+  - Can't resolve imports
+  - Results are not structured
+
+expected_tool_behavior: |
+  - Index functions, classes, methods
+  - Track imports and dependencies
+  - Build symbol map
+  - Enable fast lookup by name, type, file
+  - Support regex patterns
+
+tool_schema:
+  name: symbol_indexer
+  input: 
+    - codebase_path: string
+    - file_types: array  # [".py", ".js", ".ts"]
+  output: 
+    - symbols: array
+    - index_time: number
+  params:
+    - include_private: boolean
+    - max_depth: number
+  returns:
+    symbol_map: object
+    statistics: object
+
+integration_requirements:
+  - registry_entry: true
+  - planner_discovery: true
+  - telemetry: true
+  - cache: true
+
+reuse_requirement: true
+difficulty: 0.65
+expected_time_minutes: 60
+
+quality_requirements:
+  code_coverage: 0.85
+  error_handling: true
+  documentation: true
+  performance: true
+
+evaluation:
+  baseline_task: "Find all authentication functions in codebase"
+  baseline_latency_ms: 30000
+  baseline_success_rate: 0.5
+  
+  with_tool_task: "Same using symbol_indexer"
+  expected_latency_ms: 2000
+  expected_success_rate: 0.95
+
+success_criteria:
+  tool_generated: true
+  tests_pass: true
+  registry_integrated: true
+  downstream_delta: 0.7

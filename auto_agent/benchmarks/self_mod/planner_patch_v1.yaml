@@ -1,0 +1,79 @@
+# Self-Modification Benchmark Tasks - Planner Patch
+# =================================================
+
+task_id: planner_thrash_fix
+task_type: planner_patch
+description: |
+  Fix planner thrashing on repeated errors
+  
+  The planner keeps retrying the same failed approach 5+ times
+  instead of trying different strategies.
+
+target_module: agent/planner.py
+target_function: plan_execution
+
+observed_failure: |
+  Planner keeps retrying the same failed approach 5+ times
+  
+failure_context:
+  retry_count: 5
+  same_error: true
+  last_5_attempts:
+    - approach: "try_same_api"
+      result: "rate_limit"
+    - approach: "try_same_api"  
+      result: "rate_limit"
+    - approach: "try_same_api"
+      result: "rate_limit"
+    - approach: "try_same_api"
+      result: "rate_limit"
+    - approach: "try_same_api"
+      result: "rate_limit"
+
+allowed_edit_scope:
+  - agent/planner.py
+  - agent/strategy.py
+
+forbidden_paths:
+  - agent/benchmark.py
+  - agent/regression_suite.py
+  - tests/
+  - data/
+
+baseline_benchmark_slice:
+  benchmark: planner_efficiency
+  metric: step_count
+  current_value: 25
+  threshold: 15
+  measurement: "average steps to complete task"
+
+required_post_checks:
+  - name: no_thrashing
+    description: "Planner should not repeat failed approaches"
+    validation: "retry_count < 3"
+  - name: diversification_works
+    description: "Planner tries different approaches"
+    validation: "approach_count >= 3"
+  - name: success_improved
+    description: "Task completion rate improved"
+    validation: "success_rate_delta > 0.1"
+
+canary_set:
+  - browser_navigation_task
+  - code_generation_task
+  - data_analysis_task
+  - file_operation_task
+  - api_call_task
+
+rollback_rule: |
+  If success_rate drops by more than 5%, revert to baseline.
+  If planner fails on canary tasks, revert immediately.
+
+difficulty: 0.6
+expected_time_minutes: 30
+
+# Success criteria
+success_criteria:
+  min_delta: 0.1  # 10% improvement minimum
+  max_regression: 0.02  # 2% max regression allowed
+  must_pass_canary: true

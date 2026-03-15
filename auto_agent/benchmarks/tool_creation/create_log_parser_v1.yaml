@@ -1,0 +1,74 @@
+# Tool-Creation Benchmark Tasks - Structured Log Parser
+# ===================================================
+
+task_id: create_log_parser
+task_type: log_parser
+description: |
+  Create tool to parse structured logs
+  
+  Current grep is too basic - no structured parsing capability.
+  Need tool to parse log files, extract error patterns, group by severity.
+
+original_task: |
+  Parse server logs and extract error patterns from 100MB+ log files
+  
+why_current_tools_insufficient: |
+  Current grep is too basic, no structured parsing.
+  - Can't extract structured data from logs
+  - Can't group by error type
+  - Can't filter by severity level
+
+expected_tool_behavior: |
+  - Parse log files (multiple formats: JSON, syslog, custom)
+  - Extract error types and counts
+  - Group by severity (ERROR, WARN, INFO)
+  - Support time-range filtering
+  - Output structured data (JSON)
+
+tool_schema:
+  name: log_parser
+  input: 
+    - log_file_path: string
+    - format: string  # json, syslog, apache, nginx, custom
+  output: 
+    - errors: array
+    - warnings: array
+    - statistics: object
+  params:
+    - severity_filter: array  # ["ERROR", "WARN"]
+    - time_range: object
+    - pattern: string
+  returns:
+    structured_errors: array
+    summary: object
+
+integration_requirements:
+  - registry_entry: true
+  - planner_discovery: true
+  - telemetry: true
+
+reuse_requirement: true
+difficulty: 0.5
+expected_time_minutes: 45
+
+# Quality requirements
+quality_requirements:
+  code_coverage: 0.8
+  error_handling: true
+  documentation: true
+
+# Evaluation
+evaluation:
+  baseline_task: "Analyze 100MB log file, extract error patterns"
+  baseline_latency_ms: 45000
+  baseline_success_rate: 0.6
+  
+  with_tool_task: "Same task using log_parser tool"
+  expected_latency_ms: 5000
+  expected_success_rate: 0.95
+
+success_criteria:
+  tool_generated: true
+  tests_pass: true
+  registry_integrated: true
+  downstream_delta: 0.5  # 50% improvement

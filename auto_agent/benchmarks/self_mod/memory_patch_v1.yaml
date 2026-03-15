@@ -1,0 +1,66 @@
+# Self-Modification Benchmark Tasks - Memory Patch
+# =================================================
+
+task_id: memory_retrieval_fix
+task_type: memory_patch
+description: |
+  Fix memory retrieval finding irrelevant files
+  
+  The memory system returns irrelevant files for queries,
+  with relevance scores below 0.3 for top results.
+
+target_module: agent/memory.py
+target_function: retrieve
+
+observed_failure: |
+  Memory returns irrelevant files for queries
+  - Top result relevance: 0.2
+  - Relevant file rank: 5+
+  - Query: "authentication code" returns "README.md"
+
+failure_context:
+  relevance_score: 0.2
+  top_result_wrong: true
+  relevant_file_rank: 5
+
+allowed_edit_scope:
+  - agent/memory.py
+  - agent/embedding.py
+  - agent/retriever.py
+
+forbidden_paths:
+  - agent/benchmark.py
+  - tests/
+  - data/
+
+baseline_benchmark_slice:
+  benchmark: memory_accuracy
+  metric: relevance_score
+  current_value: 0.35
+  threshold: 0.7
+  measurement: "average relevance score for top-5 results"
+
+required_post_checks:
+  - name: relevant_files_first
+    description: "Most relevant files should be in top-3"
+    validation: "top_3_relevance > 0.6"
+  - name: diversity_maintained
+    description: "Results should have appropriate diversity"
+    validation: "diversity_score > 0.4"
+
+canary_set:
+  - code_search_task
+  - doc_search_task
+  - config_search_task
+  - test_search_task
+
+rollback_rule: |
+  If average relevance score drops below 0.4, revert immediately.
+
+difficulty: 0.5
+expected_time_minutes: 25
+
+success_criteria:
+  min_delta: 0.2
+  max_regression: 0.05
+  must_pass_canary: true
