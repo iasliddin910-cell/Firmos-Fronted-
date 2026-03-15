@@ -59,6 +59,61 @@ from agent.multi_agent_coordinator import MultiAgentCoordinator as NewMultiAgent
 logger = logging.getLogger(__name__)
 
 
+# CANONICAL EVENT LEDGER SYSTEM
+class EventType(Enum):
+    TASK_CREATED = "task_created"
+    TASK_STARTED = "task_started"
+    TASK_COMMITTED = "task_committed"
+    TASK_FAILED = "task_failed"
+    TOOL_ROUTE_SELECTED = "tool_route_selected"
+    TOOL_EXECUTION_FINISHED = "tool_execution_finished"
+    VERIFICATION_STARTED = "verification_started"
+    RECOVERY_STARTED = "recovery_started"
+    ERROR = "error"
+
+@dataclass
+class RunEvent:
+    event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    run_id: str = ""
+    attempt_id: str = ""
+    task_id: str = ""
+    event_type: EventType = EventType.TASK_CREATED
+    stage: str = ""
+    subsystem: str = ""
+    timestamp: float = field(default_factory=time.time)
+    payload: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self):
+        return {"event_id": self.event_id, "run_id": self.run_id, "attempt_id": self.attempt_id, "task_id": self.task_id, "event_type": self.event_type.value, "stage": self.stage, "subsystem": self.subsystem, "timestamp": self.timestamp, "payload": self.payload}
+
+class RunLedger:
+    def __init__(self):
+        self.events = []
+        self._index = defaultdict(list)
+        self._lock = threading.Lock()
+    
+    def append(self, event):
+        with self._lock:
+            self.events.append(event)
+            self._index[event.task_id].append(len(self.events) - 1)
+    
+    def get_task_trace(self, task_id):
+        with self._lock:
+            return [self.events[i] for i in self._index.get(task_id, [])]
+    
+    def derive_metrics(self):
+        if not self.events:
+            return {}
+        return {"total_tasks": len(set(e.task_id for e in self.events)), "total_events": len(self.events)}
+
+_ledger = None
+def get_ledger():
+    global _ledger
+    if _ledger is None:
+        _ledger = RunLedger()
+    return _ledger
+
+
 # ==================== ENUMS ====================
 
 class KernelState(Enum):
@@ -2814,7 +2869,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                                 tasks_data = tasks_data['tasks']
 
                             if isinstance(tasks_data, list):
-                                # Create tasks with diagnostics
+                                get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
+        # Create tasks with diagnostics
                                 tasks = self._create_tasks_from_plan({"tasks": tasks_data}, response_snippet=response, parser_strategy=strategy_name)
                                 if tasks:
                                     parsing_attempts.append({
@@ -3349,7 +3405,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             if task_errors:
                 logger.warning(f"Task {i} created with warnings: {task_errors}")
             
-            # Create task with validated data
+            get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
+        # Create task with validated data
             try:
                 priority = TaskPriority.NORMAL
                 if priority == 'HIGH' or priority == 'CRITICAL':
@@ -3635,6 +3692,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 'rollback_point': None
             })
         
+        get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
         # Create tasks with full metadata
         for i, spec in enumerate(task_specs):
             # Set priority based on position and risk
@@ -3645,7 +3703,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             else:
                 priority = TaskPriority.LOW
             
-            # Create task with full metadata
+            get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
+        # Create task with full metadata
             task = Task(
                 id=f"task_{int(time.time()*1000)}_{i}",
                 description=spec['desc'],
@@ -3867,9 +3926,13 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 required_tools = task_meta.get('required_tools', [])
                 verification_type = task_meta.get('verification_type', 'manual')
                 
-                # =====================================================
+                run_id = str(uuid.uuid4())
+                attempt_id = f"{run_id}_attempt_1"
+                get_ledger().append(RunEvent(run_id=run_id, attempt_id=attempt_id, task_id=task.id, event_type=EventType.TASK_STARTED, stage="kernel", payload={"desc": task.description}))
+
                 # STEP 3: Context-Aware Tool Selection
                 # =====================================================
+                get_ledger().append(RunEvent(run_id=run_id, attempt_id=attempt_id, task_id=task.id, event_type=EventType.TOOL_ROUTE_SELECTED, stage="dispatcher"))
                 tool_name = self._select_tool_strict(
                     task=task,
                     required_tools=required_tools,
