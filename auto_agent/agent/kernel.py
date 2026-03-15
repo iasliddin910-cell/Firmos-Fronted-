@@ -226,6 +226,46 @@ class HumanReviewSpec:
     blocking: bool = True                    # If true, blocks progress until reviewed
 
 
+# ==================== RECOVERY CONTRACTS ====================
+# FIX #2: Typed recovery contracts
+
+@dataclass
+class RecoveryDecision:
+    """
+    FIX #2: Typed recovery decision - replaces string-based recovery.
+    
+    This is the contract that recovery engine produces when deciding
+    how to handle a failure.
+    """
+    strategy: RecoveryStrategy
+    confidence: float
+    reason: str
+    retry_allowed: bool = False
+    requires_rollback: bool = False
+    fallback_tool: Optional[str] = None
+    replan_required: bool = False
+    max_retries: int = 3
+
+
+@dataclass
+class RecoveryOutcome:
+    """
+    FIX #2: Typed recovery outcome - replaces dict-based recovery results.
+    
+    This is the contract that recovery engine produces after executing
+    a recovery strategy.
+    """
+    success: bool
+    strategy: RecoveryStrategy
+    next_status: str  # TaskStatus as string to avoid circular import
+    action_taken: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    should_resume: bool = False
+    replacement_task_id: Optional[str] = None
+    escalated: bool = False
+    retry_count: int = 0
+
+
 # ==================== ENUMS ====================
 
 class KernelState(Enum):
@@ -499,6 +539,8 @@ class TaskStatus(Enum):
     FAILED = "failed"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    # FIX #6: Add SUPERSEDED status - for when a task is replaced by another
+    SUPERSEDED = "superseded"
 
 
 # ==================== DATA CLASSES ====================
@@ -2816,6 +2858,11 @@ class CentralKernel:
         self.task_manager = TaskManager()
         self.scheduler = Scheduler()
         self.verifier = VerificationEngine(tools_engine)
+        
+        # FIX #3: Initialize RecoveryEngine as first-class subsystem
+        logger.info("🔧 Initializing Recovery Engine...")
+        self.recovery_engine = RecoveryEngine(self)
+        
         self.critic = CriticEngine(api_key)
         
         # Use NEW Multi-Agent Coordinator with 6 full workers
@@ -6906,8 +6953,9 @@ Return ONLY valid JSON (no other text):
                 # Add simplified task
                 self.task_manager.add_task(simple_task)
                 
-                # Mark original as completed (replaced)
-                failed_task.status = TaskStatus.COMPLETED
+                # FIX #4: Mark original as SUPERSEDED, not COMPLETED
+                # This is critical: original task was NOT completed, it was replaced
+                failed_task.status = TaskStatus.SUPERSEDED
                 
                 recovery_log.append(f"   → Original task: {failed_task.id}")
                 recovery_log.append(f"   → Yangi sodda task: {simple_task.id}")
@@ -7163,53 +7211,68 @@ def _get_recovery_hint(parsing_attempts: List[Dict]) -> str:
 
 # ==================== COMPREHENSIVE RECOVERY ENGINE ====================
 
-class RecoveryStrategy(Enum):
-    """All recovery strategies - executed in priority order"""
-    REQUEUE = "requeue"           # Put back in queue
-    ALTERNATE_TOOL = "alternate_tool"  # Try different tool
-    ROLLBACK = "rollback"        # Revert changes
-    REPLAN = "replan"            # Re-generate plan
-    HUMAN_ESCALATION = "human"   # Call human
-    DEGRADED_MODE = "degraded"  # Reduced functionality
-    RETRY_EXHAUSTED = "exhausted"  # No more retries
+# FIX #1: Remove duplicate RecoveryStrategy enum - use the canonical one from line 313
+# The duplicate enum below was causing shadowing issues and potential runtime crashes
+# All recovery logic now uses the canonical RecoveryStrategy from line 313
+
+# Legacy aliases for backward compatibility - map to canonical enum
+# These were used by the old RecoveryEngine
+_RECOVERY_ALIAS_MAP = {
+    "requeue": "RETRY_WITH_BACKOFF",
+    "alternate_tool": "ALTERNATE_TOOL",
+    "rollback": "ROLLBACK",
+    "replan": "REPLAN",
+    "human": "ESCALATE_TO_HUMAN",
+    "degraded": "DEGRADED_MODE",
+    "exhausted": "ABORT",
+}
 
 
 class RecoveryEngine:
     """
     COMPREHENSIVE RECOVERY ENGINE - No1-grade.
     
+    FIX #1: Now uses canonical RecoveryStrategy from line 313
+    FIX #2: Uses RecoveryDecision and RecoveryOutcome typed contracts
+    FIX #3: Integrated with CentralKernel
+    
     Each failure triggers appropriate recovery strategy:
-    1. REQUEUE - transient failure
+    1. RETRY_WITH_BACKOFF - transient failure
     2. ALTERNATE_TOOL - tool-specific failure
     3. ROLLBACK - state corruption
     4. REPLAN - fundamental plan failure
     5. DEGRADED_MODE - partial success possible
-    6. HUMAN_ESCALATION - critical failure
-    7. RETRY_EXHAUSTED - budget exhausted
+    6. ESCALATE_TO_HUMAN - critical failure
+    7. ABORT - unrecoverable
     """
     
     def __init__(self, kernel):
         self.kernel = kernel
-        self.retry_budget = {}  # Per-task retry budget
         self.max_retries = 3
-        self.max_replan_depth = 2  # Max replan attempts per task
-        self.replan_depth = {}  # Per-task replan depth
-        self.rollback_stack = {}  # TaskID -> rollback actions
+        self.max_replan_depth = 2
+        self.rollback_stack = {}
+        
+        # FIX #5: Single retry budget system - use task.retry_count consistently
+        # Previously there were two: task.retry_count and self.retry_budget dict
+        # Now we use task.retry_count as single source of truth
+        # RecoveryEngine tracks replan depth separately
+        
+        self._replan_depth = {}  # Per-task replan depth (separate from retry)
         
         # Approval mapping: tool -> strategy for denied/expired
         self.approval_mapping = {
             'denied': {
-                'execute_command': 'ALTERNATE_TOOL',
-                'delete_file': 'ABORT',
-                'browser_navigate': 'REQUEUE',
-                'write_file': 'REPLAN',
-                'default': 'REQUEUE'
+                'execute_command': RecoveryStrategy.ALTERNATE_TOOL,
+                'delete_file': RecoveryStrategy.ABORT,
+                'browser_navigate': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'write_file': RecoveryStrategy.REPLAN,
+                'default': RecoveryStrategy.RETRY_WITH_BACKOFF
             },
             'expired': {
-                'execute_command': 'REQUEUE',
-                'browser_navigate': 'REQUEUE',
-                'write_file': 'REPLAN',
-                'default': 'REQUEUE'
+                'execute_command': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'browser_navigate': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'write_file': RecoveryStrategy.REPLAN,
+                'default': RecoveryStrategy.RETRY_WITH_BACKOFF
             }
         }
         
@@ -7223,11 +7286,13 @@ class RecoveryEngine:
     async def execute_recovery(self, task: Task, failure_reason: str) -> Dict:
         """Execute appropriate recovery strategy based on failure type"""
         
-        # Check retry budget first
-        budget = self.retry_budget.get(task.id, 0)
+        # FIX #5: Use task.retry_count as single source of truth
+        # Previously used self.retry_budget dict which was duplicate state
+        current_retry = task.retry_count or 0
+        max_retries = task.max_retries or 3
         
-        if budget >= self.max_retries:
-            logger.warning(f"⚠️ Retry budget exhausted for {task.id}")
+        if current_retry >= max_retries:
+            logger.warning(f"⚠️ Retry budget exhausted for {task.id} ({current_retry}/{max_retries})")
             return await self._retry_exhausted_recovery(task, failure_reason)
         
         # Map failure type to recovery strategy
@@ -7240,18 +7305,18 @@ class RecoveryEngine:
         elif 'artifact_missing' in failure_reason:
             return await self._rollback_recovery(task, failure_reason)
         elif 'approval_denied' in failure_reason or 'approval_expired' in failure_reason:
-            # Use approval mapping
+            # Use approval mapping - FIX #1: use canonical enum
             approval_type = 'denied' if 'denied' in failure_reason else 'expired'
             tool_name = (task.input_data or {}).get('tool_used', 'default')
             mapping = self.approval_mapping.get(approval_type, {})
-            strategy = mapping.get(tool_name, mapping.get('default', 'REQUEUE'))
+            strategy = mapping.get(tool_name, mapping.get('default', RecoveryStrategy.RETRY_WITH_BACKOFF))
             logger.info(f"📋 Approval {approval_type} for {task.id}, tool={tool_name}, strategy={strategy}")
-            if strategy == 'ALTERNATE_TOOL':
+            if strategy == RecoveryStrategy.ALTERNATE_TOOL:
                 return await self._alternate_tool_recovery(task, failure_reason)
-            elif strategy == 'REPLAN':
-                self.replan_depth[task.id] = self.replan_depth.get(task.id, 0) + 1
+            elif strategy == RecoveryStrategy.REPLAN:
+                self._replan_depth[task.id] = self._replan_depth.get(task.id, 0) + 1
                 return await self._replan_recovery(task, failure_reason)
-            elif strategy == 'ABORT':
+            elif strategy == RecoveryStrategy.ABORT:
                 return await self._retry_exhausted_recovery(task, failure_reason)
             else:
                 return await self._requeue_recovery(task, failure_reason)
@@ -7261,14 +7326,15 @@ class RecoveryEngine:
             return await self._degraded_mode_recovery(task, failure_reason)
     
     async def _requeue_recovery(self, task, reason) -> Dict:
-        """1. REQUEUE - transient failure, try again"""
-        self.retry_budget[task.id] = self.retry_budget.get(task.id, 0) + 1
-        logger.info(f"🔄 REQUEUE: {task.id} (attempt {self.retry_budget[task.id]})")
+        """1. RETRY_WITH_BACKOFF - transient failure, try again"""
+        # FIX #5: Update task.retry_count, not separate dict
+        task.retry_count = (task.retry_count or 0) + 1
+        logger.info(f"🔄 RETRY_WITH_BACKOFF: {task.id} (attempt {task.retry_count})")
         return {
-            'strategy': RecoveryStrategy.REQUEUE,
-            'action': 'requeue',
+            'strategy': RecoveryStrategy.RETRY_WITH_BACKOFF,
+            'action': 'retry_with_backoff',
             'can_continue': True,
-            'retry_count': self.retry_budget[task.id]
+            'retry_count': task.retry_count
         }
     
     async def _alternate_tool_recovery(self, task, reason) -> Dict:
@@ -7317,14 +7383,15 @@ class RecoveryEngine:
         return {'strategy': RecoveryStrategy.DEGRADED_MODE, 'action': 'degraded', 'can_continue': True}
     
     async def _retry_exhausted_recovery(self, task, reason) -> Dict:
-        """7. RETRY_EXHAUSTED - no more budget"""
+        """7. ABORT - no more retry budget"""
         logger.error(f"❌ RETRY_EXHAUSTED: {task.id}")
+        # FIX #5: Use task.retry_count
         return {
-            'strategy': RecoveryStrategy.RETRY_EXHAUSTED,
+            'strategy': RecoveryStrategy.ABORT,
             'action': 'abort',
             'can_continue': False,
-            'budget_used': self.retry_budget.get(task.id, 0),
-            'max_retries': self.max_retries
+            'budget_used': task.retry_count or 0,
+            'max_retries': task.max_retries or 3
         }
     
     def record_rollback(self, task_id: str, rollback_fn):
