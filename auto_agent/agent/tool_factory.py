@@ -527,13 +527,13 @@ def _validate_inputs({param_list}) -> None:
     Validate input parameters.
     Raises ValueError if validation fails.
     """
-    # Input validation - add specific validation logic based on parameter types
-    for param_name, param_value in [{{", ".join([f'("{k}", {k})' for k in params.keys()) if params else '("kwargs", kwargs)'}}}]:
-        if param_value is None:
-            raise ValueError(f"Parameter '{{param_name}}' cannot be None")
+    # Input validation - check for None values
+    if {param_list} is None:
+        raise ValueError("Parameters cannot be None")
     
-    # Add type checking if needed
-    # Example: isinstance(param_value, expected_type)
+    # Example validation logic - customize based on parameter types
+    # if not isinstance({param_list}, (dict, str, int, float)):
+    #     raise ValueError("Invalid parameter type")
 
 '''
         
