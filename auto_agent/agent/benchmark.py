@@ -1945,6 +1945,6 @@ class AdvancedBenchmarkSuite:
         return results
 
 
-def create_advanced_benchmark_suite(config: Dict = None) -> AdvancedBenchmarkSuite:
-    """Factory function for AdvancedBenchmarkSuite"""
-    return AdvancedBenchmarkSuite(config)
+def create_unified_gate_coordinator(config: Dict = None) -> UnifiedReleaseGateCoordinator:
+    """Factory function for UnifiedReleaseGateCoordinator"""
+    return UnifiedReleaseGateCoordinator(config)
