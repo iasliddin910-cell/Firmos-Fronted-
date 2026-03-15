@@ -266,6 +266,45 @@ class RecoveryOutcome:
     retry_count: int = 0
 
 
+# ==================== TASK EVENTS & CHECKPOINTS ====================
+# FIX #5: Event-sourced ledger for task lifecycle
+
+@dataclass
+class TaskEvent:
+    """
+    FIX #5: Event-sourced ledger for task lifecycle.
+    
+    Every state transition is recorded as an event for:
+    - Replay capability
+    - Debugging
+    - Learning signals
+    - Evaluation
+    - Auditability
+    """
+    task_id: str
+    from_status: str
+    to_status: str
+    reason: str
+    timestamp: float = field(default_factory=time.time)
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    checkpoint_id: Optional[str] = None
+
+
+@dataclass
+class TaskCheckpoint:
+    """
+    FIX #5: Task checkpoint for durable pause/resume.
+    
+    Enables crash recovery by storing execution state.
+    """
+    task_id: str
+    checkpoint_id: str
+    last_safe_status: str
+    execution_cursor: Dict[str, Any] = field(default_factory=dict)
+    artifacts: List[str] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+
+
 # ==================== ENUMS ====================
 
 class KernelState(Enum):
@@ -525,22 +564,60 @@ class SelfImprovementEmitter:
 
 
 class TaskStatus(Enum):
-    """Granular task status"""
+    """
+    FIX #1: Canonical Task Status - Single Source of Truth
+    
+    This replaces the fragmented status system with a proper FSM.
+    
+    Key changes:
+    - COMPLETED -> COMMITTED (explicit commit after verification)
+    - Added FAILED_EXECUTION (separate from verification failure)
+    - Added REPLAN_PENDING and ESCALATED states
+    - Added PAUSED for durable pause/resume
+    - SUPERSEDED for replacement tasks
+    """
+    # Core execution flow
     PENDING = "pending"
-    DEPENDENCIES_WAITING = "dependencies_waiting"
-    APPROVAL_WAITING = "approval_waiting"
-    RUNNING = "running"
-    VERIFYING = "verifying"
-    VERIFIED = "verified"
-    FAILED_VERIFICATION = "failed_verification"
-    RETRYING = "retrying"
-    RECOVERING = "recovering"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    READY = "ready"                    # Dependencies met, ready to execute
+    RUNNING = "running"                # Actively executing
+    EXECUTED = "executed"              # Execution done, needs verification
+    VERIFYING = "verifying"            # Running verification
+    VERIFIED = "verified"              # Verification passed
+    COMMITTED = "committed"            # Final commit (was: COMPLETED)
+    
+    # Failure states
+    FAILED_EXECUTION = "failed_execution"    # Execution failed
+    FAILED_VERIFICATION = "failed_verification"  # Verification failed
+    FAILED = "failed"                  # Generic failure
+    
+    # Recovery states
+    RECOVERING = "recovering"          # Running recovery
+    RETRYING = "retrying"             # Retrying the task
+    REPLAN_PENDING = "replan_pending"  # Needs new plan
+    ESCALATED = "escalated"           # Escalated to human
+    
+    # Pause/Approval states
+    PAUSED = "paused"                 # Durably paused
+    WAITING_APPROVAL = "waiting_approval"  # Waiting for human approval
+    APPROVAL_WAITING = "approval_waiting"  # Alias for compatibility
+    
+    # Terminal states
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
-    # FIX #6: Add SUPERSEDED status - for when a task is replaced by another
-    SUPERSEDED = "superseded"
+    SUPERSEDED = "superseded"         # Replaced by another task
+    ABORTED = "aborted"               # Explicitly aborted
+    
+    # Legacy aliases for backward compatibility
+    @classmethod
+    def alias(cls, old_name: str) -> 'TaskStatus':
+        """Map old status names to new canonical ones"""
+        aliases = {
+            'COMPLETED': cls.COMMITTED,
+            'dependencies_waiting': cls.PENDING,
+            'completed': cls.COMMITTED,
+            'failed': cls.FAILED,
+        }
+        return aliases.get(old_name, cls.PENDING)
 
 
 # ==================== DATA CLASSES ====================
@@ -575,6 +652,15 @@ class Task:
     estimated_cost: float = 0.0
     artifact_expectations: List[str] = field(default_factory=list)
     rollback_point: Optional[Dict] = None
+    
+    # FIX #4: Task lineage - links between parent/superseded/replacement tasks
+    parent_task_id: Optional[str] = None          # Original task if this is replacement
+    superseded_by: Optional[str] = None            # Task that replaced this one
+    replacement_for: Optional[str] = None         # Task this one replaces
+    
+    # FIX #5: Task checkpoint for durable pause/resume
+    checkpoint_id: Optional[str] = None
+    last_safe_status: Optional[str] = None
     
     def __lt__(self, other):
         return self.priority.value < other.priority.value
@@ -2882,7 +2968,188 @@ class CentralKernel:
         # Pending approvals
         self.pending_approvals: Dict[str, Dict] = {}
         
+        # FIX #2 & #5: Task lifecycle management
+        # Event ledger for state transitions
+        self._task_event_ledger: List[TaskEvent] = []
+        # Task checkpoints for durable pause/resume
+        self._task_checkpoints: Dict[str, TaskCheckpoint] = {}
+        
+        # FIX #2: Valid transitions map
+        self._valid_transitions = self._build_valid_transitions()
+        
         logger.info("✅ Central Kernel Ready!")
+    
+    def _build_valid_transitions(self) -> Dict[str, Set[str]]:
+        """
+        FIX #3: Build valid state transitions map.
+        
+        This defines which transitions are legal in the task lifecycle.
+        """
+        return {
+            # Core execution flow
+            TaskStatus.PENDING.value: {TaskStatus.READY.value, TaskStatus.CANCELLED.value},
+            TaskStatus.READY.value: {TaskStatus.RUNNING.value, TaskStatus.PAUSED.value, TaskStatus.CANCELLED.value},
+            TaskStatus.RUNNING.value: {
+                TaskStatus.EXECUTED.value, 
+                TaskStatus.FAILED_EXECUTION.value,
+                TaskStatus.WAITING_APPROVAL.value,
+                TaskStatus.PAUSED.value
+            },
+            TaskStatus.EXECUTED.value: {TaskStatus.VERIFYING.value, TaskStatus.FAILED_EXECUTION.value},
+            TaskStatus.VERIFYING.value: {TaskStatus.VERIFIED.value, TaskStatus.FAILED_VERIFICATION.value},
+            TaskStatus.VERIFIED.value: {TaskStatus.COMMITTED.value, TaskStatus.FAILED_VERIFICATION.value},
+            TaskStatus.COMMITTED.value: set(),  # Terminal success state
+            
+            # Failure states
+            TaskStatus.FAILED_EXECUTION.value: {
+                TaskStatus.RECOVERING.value, 
+                TaskStatus.ABORTED.value,
+                TaskStatus.RETRYING.value
+            },
+            TaskStatus.FAILED_VERIFICATION.value: {
+                TaskStatus.RECOVERING.value,
+                TaskStatus.REPLAN_PENDING.value,
+                TaskStatus.ESCALATED.value,
+                TaskStatus.ABORTED.value
+            },
+            
+            # Recovery states
+            TaskStatus.RECOVERING.value: {
+                TaskStatus.RETRYING.value,
+                TaskStatus.REPLAN_PENDING.value,
+                TaskStatus.ESCALATED.value,
+                TaskStatus.ABORTED.value
+            },
+            TaskStatus.RETRYING.value: {TaskStatus.RUNNING.value, TaskStatus.FAILED_EXECUTION.value},
+            TaskStatus.REPLAN_PENDING.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
+            
+            # Approval/Pause states
+            TaskStatus.WAITING_APPROVAL.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
+            TaskStatus.PAUSED.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
+            
+            # Terminal states
+            TaskStatus.ESCALATED.value: set(),
+            TaskStatus.ABORTED.value: set(),
+            TaskStatus.TIMEOUT.value: set(),
+            TaskStatus.CANCELLED.value: set(),
+            TaskStatus.SUPERSEDED.value: set(),
+        }
+    
+    def transition_task(
+        self, 
+        task: 'Task', 
+        to_status: TaskStatus, 
+        reason: str,
+        evidence: Optional[Dict] = None
+    ) -> bool:
+        """
+        FIX #2: Centralized task state transition gate.
+        
+        This is the ONLY way to change task status - no direct task.status = ... allowed.
+        
+        This method:
+        1. Validates the transition is legal
+        2. Records the event in the ledger
+        3. Updates checkpoint if needed
+        4. Returns success/failure
+        
+        Args:
+            task: The task to transition
+            to_status: The new status
+            reason: Why this transition is happening
+            evidence: Any evidence for this transition
+            
+        Returns:
+            True if transition succeeded, False if invalid
+        """
+        from_status = task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+        
+        # Check if transition is valid
+        valid_targets = self._valid_transitions.get(from_status, set())
+        
+        if to_status.value not in valid_targets and from_status != to_status.value:
+            logger.warning(
+                f"⚠️ Invalid transition: {task.id} from {from_status} to {to_status.value}. "
+                f"Valid: {valid_targets}"
+            )
+            # Log the invalid attempt
+            self._record_event(
+                task.id, 
+                from_status, 
+                to_status.value, 
+                f"INVALID: {reason}",
+                evidence or {}
+            )
+            return False
+        
+        # Record event
+        self._record_event(
+            task.id,
+            from_status,
+            to_status.value,
+            reason,
+            evidence or {}
+        )
+        
+        # Update task status
+        old_status = task.status
+        task.status = to_status
+        
+        # Update checkpoint if needed
+        if to_status in {TaskStatus.PAUSED, TaskStatus.WAITING_APPROVAL}:
+            self._save_checkpoint(task, reason)
+        
+        logger.info(f"✅ Task {task.id}: {from_status} -> {to_status.value} ({reason})")
+        return True
+    
+    def _record_event(
+        self,
+        task_id: str,
+        from_status: str,
+        to_status: str,
+        reason: str,
+        evidence: Dict
+    ):
+        """FIX #5: Record task event in ledger"""
+        event = TaskEvent(
+            task_id=task_id,
+            from_status=from_status,
+            to_status=to_status,
+            reason=reason,
+            evidence=evidence
+        )
+        self._task_event_ledger.append(event)
+        
+        # Keep only last 1000 events to prevent memory issues
+        if len(self._task_event_ledger) > 1000:
+            self._task_event_ledger = self._task_event_ledger[-500:]
+    
+    def _save_checkpoint(self, task: 'Task', reason: str):
+        """FIX #5: Save task checkpoint for durable pause/resume"""
+        checkpoint = TaskCheckpoint(
+            task_id=task.id,
+            checkpoint_id=str(uuid.uuid4()),
+            last_safe_status=task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
+            execution_cursor={
+                'input_data': task.input_data,
+                'retry_count': task.retry_count,
+                'reason': reason
+            },
+            artifacts=task.artifacts or []
+        )
+        self._task_checkpoints[task.id] = checkpoint
+        task.checkpoint_id = checkpoint.checkpoint_id
+        task.last_safe_status = checkpoint.last_safe_status
+        
+        logger.info(f"💾 Checkpoint saved for {task.id}: {checkpoint.checkpoint_id}")
+    
+    def get_task_history(self, task_id: str) -> List[TaskEvent]:
+        """FIX #5: Get full event history for a task"""
+        return [e for e in self._task_event_ledger if e.task_id == task_id]
+    
+    def get_task_checkpoint(self, task_id: str) -> Optional[TaskCheckpoint]:
+        """FIX #5: Get checkpoint for a task"""
+        return self._task_checkpoints.get(task_id)
     
     async def process(self, user_message: str) -> str:
         """
