@@ -1,0 +1,54 @@
+task_id: browser_checkout_coupon_v1
+suite: browser
+version: "1.0"
+difficulty: medium
+
+# Prompt for the agent
+prompt: |
+  You need to complete a checkout flow using the local web application.
+  
+  1. Start the Flask app: `python app.py`
+  2. Open browser to http://localhost:5000
+  3. Add "Widget" to cart
+  4. Apply coupon code "SAVE10"
+  5. Complete checkout
+  6. Save the receipt as receipt.txt
+  
+  Take a screenshot at each step and save as evidence.
+
+# Fixture path
+fixture_path: browser/checkout_app
+
+# Tools allowed
+allowed_tools:
+  - start_app
+  - browser_navigate
+  - browser_click
+  - browser_type
+  - take_screenshot
+
+# Timeout
+timeout_sec: 180
+
+# Verifier chain
+verifier_chain:
+  - screenshot
+  - file_exists
+
+# Expected artifacts
+expected_artifacts:
+  - receipt.txt
+  - screenshot_*.png
+
+# Reset policy
+reset_policy: clean
+
+# Seed
+seed: 42
+
+# Tags
+tags:
+  - web_automation
+  - form_filling
+  - coupon_logic
+  - checkout_flow

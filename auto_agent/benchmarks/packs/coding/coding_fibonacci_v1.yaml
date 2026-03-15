@@ -1,0 +1,34 @@
+task_id: coding_fibonacci_v1
+suite: coding
+version: "1.0"
+difficulty: easy
+
+prompt: |
+  Implement a `fibonacci(n)` function in src/fib.py that returns the nth Fibonacci number.
+  The sequence starts with fib(0) = 0, fib(1) = 1, fib(2) = 1, etc.
+  
+  Write tests for edge cases: fib(0), fib(1), fib(10), fib(20).
+
+fixture_path: coding/hello_package
+
+allowed_tools:
+  - read_file
+  - edit_file
+  - execute_command
+  - execute_code
+
+timeout_sec: 60
+
+verifier_chain:
+  - pytest
+
+expected_artifacts:
+  - src/fib.py
+  - tests/test_fib.py
+
+reset_policy: clone
+seed: 42
+tags:
+  - algorithm
+  - recursion
+  - testing

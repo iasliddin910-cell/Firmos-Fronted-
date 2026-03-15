@@ -1,0 +1,91 @@
+task_id: long_build_feature_branch_v1
+suite: long_horizon
+version: "1.0"
+difficulty: hard
+
+# Prompt for the agent
+prompt: |
+  This is a long-horizon task with multiple subtasks.
+  
+  The todo application has a bug in the `get_pending_items()` function.
+  Your job is to:
+  
+  1. Understand the codebase
+  2. Find the bug by running tests
+  3. Fix the bug in src/todo.py
+  4. Verify tests pass
+  5. Write a changelog entry in docs/CHANGELOG.md
+  6. Create a summary report as summary.txt
+  
+  The fix is simple - the logic is inverted. But you need to:
+  - Run the tests to see the failure
+  - Understand what the function should do
+  - Fix the bug
+  - Verify the fix works
+
+# Fixture path
+fixture_path: long_horizon/feature_branch
+
+# Tools allowed
+allowed_tools:
+  - read_file
+  - edit_file
+  - execute_command
+  - execute_code
+
+# Timeout (longer for multi-step)
+timeout_sec: 300
+
+# Verifier chain
+verifier_chain:
+  - pytest
+  - file_exists
+  - file_diff
+
+# Expected artifacts
+expected_artifacts:
+  - src/todo.py
+  - docs/CHANGELOG.md
+  - summary.txt
+  - pytest_report.json
+
+# Reset policy
+reset_policy: clone
+
+# Seed
+seed: 42
+
+# Tags
+tags:
+  - bug_localization
+  - multi_step
+  - testing
+  - documentation
+  - recovery
+
+# Subtasks for checkpoint tracking
+subtasks:
+  - name: understand_codebase
+    description: Read and understand the todo.py code
+    checkpoint: true
+  - name: find_bug
+    description: Run tests to identify the bug
+    checkpoint: true
+  - name: fix_bug
+    description: Fix the get_pending_items function
+    checkpoint: true
+  - name: verify_fix
+    description: Run tests to verify fix works
+    checkpoint: true
+  - name: write_changelog
+    description: Write changelog entry
+    checkpoint: true
+  - name: create_summary
+    description: Create summary report
+    checkpoint: true
+
+# Initial context
+initial_context:
+  bug_description: "get_pending_items() returns completed items instead of pending"
+  failing_test: test_get_pending_items
+  expected_behavior: "Should return non-completed items"
