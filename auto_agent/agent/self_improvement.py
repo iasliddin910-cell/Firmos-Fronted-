@@ -539,61 +539,498 @@ class FailureAnalyzer:
 
 class BottleneckDetector:
     """
-    Detect performance bottlenecks
+    Advanced bottleneck detection with multi-dimensional profiling
+    
+    Features:
+    - Stage-level timing (thinking, acting, verifying, etc.)
+    - Tool-level timing (each tool's performance)
+    - Regression delta (compare current vs baseline)
+    - Benchmark delta (compare against benchmarks)
+    - Resource profiling (CPU, memory, tokens, IO, browser)
     """
     
-    def __init__(self):
-        self.metrics: Dict[str, List[float]] = defaultdict(list)
-        
-        logger.info("⏱️ Bottleneck Detector initialized")
+    # Bottleneck types
+    LATENCY = "latency"
+    TOKEN = "token"
+    TOOL = "tool"
+    IO = "io"
+    BROWSER = "browser"
+    MEMORY = "memory"
+    NETWORK = "network"
     
-    def record_metric(self, name: str, value: float):
-        """Record a metric"""
-        self.metrics[name].append(value)
+    # Execution stages
+    STAGE_PLANNING = "planning"
+    STAGE_THINKING = "thinking"
+    STAGE_ACTING = "acting"
+    STAGE_VERIFYING = "verifying"
+    STAGE_REPAIRING = "repairing"
+    STAGE_APPROVAL = "approval"
+    
+    def __init__(self, storage_dir: str = "data/bottlenecks"):
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Stage-level timing
+        self.stage_timings: Dict[str, List[float]] = defaultdict(list)
+        self.stage_histograms: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        
+        # Tool-level timing
+        self.tool_timings: Dict[str, List[float]] = defaultdict(list)
+        self.tool_call_counts: Dict[str, int] = defaultdict(int)
+        self.tool_errors: Dict[str, int] = defaultdict(int)
+        
+        # Resource profiling
+        self.cpu_usage: List[float] = []
+        self.memory_usage: List[float] = []
+        self.token_usage: List[Dict] = []  # {'prompt': int, 'completion': int, 'total': int}
+        self.io_operations: Dict[str, int] = defaultdict(int)
+        self.browser_metrics: Dict[str, List[float]] = defaultdict(list)
+        
+        # Baseline for regression detection
+        self.baseline: Dict[str, float] = {}
+        self.baseline_window = 100  # Use last 100 measurements for baseline
+        
+        # Benchmark references
+        self.benchmarks: Dict[str, Dict] = {}
+        
+        logger.info("⏱️ Bottleneck Detector initialized with advanced profiling")
+    
+    # ==================== STAGE TIMING ====================
+    
+    def record_stage_timing(self, stage: str, duration: float):
+        """Record timing for a specific execution stage"""
+        self.stage_timings[stage].append(duration)
+        
+        # Update histogram (bucket into ranges)
+        bucket = self._get_time_bucket(duration)
+        self.stage_histograms[stage][bucket] += 1
         
         # Keep last 1000
-        if len(self.metrics[name]) > 1000:
-            self.metrics[name] = self.metrics[name][-1000:]
+        if len(self.stage_timings[stage]) > 1000:
+            self.stage_timings[stage] = self.stage_timings[stage][-1000:]
     
-    def detect_bottlenecks(self) -> List[Dict]:
-        """Detect bottlenecks from metrics"""
+    def _get_time_bucket(self, duration: float) -> str:
+        """Get time bucket for histogram"""
+        if duration < 0.1:
+            return "0-100ms"
+        elif duration < 0.5:
+            return "100-500ms"
+        elif duration < 1.0:
+            return "500ms-1s"
+        elif duration < 5.0:
+            return "1-5s"
+        elif duration < 10.0:
+            return "5-10s"
+        else:
+            return "10s+"
+    
+    def get_stage_analysis(self) -> Dict:
+        """Analyze stage-level timings"""
+        stage_analysis = {}
         
-        bottlenecks = []
-        
-        for name, values in self.metrics.items():
-            if not values:
+        for stage, timings in self.stage_timings.items():
+            if not timings:
                 continue
             
-            # Calculate statistics
-            avg = sum(values) / len(values)
-            max_val = max(values)
+            sorted_timings = sorted(timings)
+            n = len(sorted_timings)
             
-            # Detect high latency
-            if avg > 5.0:  # 5 seconds
-                bottlenecks.append({
-                    "metric": name,
-                    "average": avg,
-                    "max": max_val,
-                    "severity": "high" if avg > 10 else "medium"
+            # Calculate percentiles
+            p50 = sorted_timings[int(n * 0.5)]
+            p90 = sorted_timings[int(n * 0.9)] if n > 10 else p50
+            p95 = sorted_timings[int(n * 0.95)] if n > 20 else p90
+            p99 = sorted_timings[int(n * 0.99)] if n > 100 else p95
+            
+            avg = sum(timings) / len(timings)
+            
+            # Check for regression from baseline
+            baseline_key = f"stage_{stage}"
+            regression = None
+            if baseline_key in self.baseline:
+                baseline_val = self.baseline[baseline_key]
+                regression = ((avg - baseline_val) / baseline_val) * 100 if baseline_val > 0 else 0
+            
+            stage_analysis[stage] = {
+                "count": n,
+                "avg": avg,
+                "min": min(timings),
+                "max": max(timings),
+                "p50": p50,
+                "p90": p90,
+                "p95": p95,
+                "p99": p99,
+                "histogram": dict(self.stage_histograms[stage]),
+                "regression_percent": regression,
+                "is_bottleneck": p90 > self._get_threshold_for_stage(stage)
+            }
+        
+        return stage_analysis
+    
+    def _get_threshold_for_stage(self, stage: str) -> float:
+        """Get threshold for each stage type"""
+        thresholds = {
+            self.STAGE_PLANNING: 2.0,
+            self.STAGE_THINKING: 5.0,
+            self.STAGE_ACTING: 10.0,
+            self.STAGE_VERIFYING: 5.0,
+            self.STAGE_REPAIRING: 10.0,
+            self.STAGE_APPROVAL: 2.0
+        }
+        return thresholds.get(stage, 5.0)
+    
+    # ==================== TOOL TIMING ====================
+    
+    def record_tool_timing(self, tool_name: str, duration: float, success: bool = True):
+        """Record timing for a specific tool"""
+        self.tool_timings[tool_name].append(duration)
+        self.tool_call_counts[tool_name] += 1
+        
+        if not success:
+            self.tool_errors[tool_name] += 1
+        
+        # Keep last 1000
+        if len(self.tool_timings[tool_name]) > 1000:
+            self.tool_timings[tool_name] = self.tool_timings[tool_name][-1000:]
+    
+    def get_tool_analysis(self) -> Dict:
+        """Analyze tool-level timings"""
+        tool_analysis = {}
+        
+        for tool, timings in self.tool_timings.items():
+            if not timings:
+                continue
+            
+            call_count = self.tool_call_counts[tool]
+            error_count = self.tool_errors.get(tool, 0)
+            avg = sum(timings) / len(timings)
+            
+            # Calculate reliability
+            reliability = (call_count - error_count) / call_count if call_count > 0 else 1.0
+            
+            # Check for regression
+            baseline_key = f"tool_{tool}"
+            regression = None
+            if baseline_key in self.baseline:
+                baseline_val = self.baseline[baseline_key]
+                regression = ((avg - baseline_val) / baseline_val) * 100 if baseline_val > 0 else 0
+            
+            tool_analysis[tool] = {
+                "call_count": call_count,
+                "error_count": error_count,
+                "reliability": reliability,
+                "avg_duration": avg,
+                "min_duration": min(timings),
+                "max_duration": max(timings),
+                "total_time": sum(timings),
+                "regression_percent": regression,
+                "is_bottleneck": avg > 5.0 or reliability < 0.8
+            }
+        
+        # Sort by total time spent
+        tool_analysis = dict(sorted(tool_analysis.items(), 
+                                    key=lambda x: -x[1]["total_time"]))
+        
+        return tool_analysis
+    
+    # ==================== RESOURCE PROFILING ====================
+    
+    def record_cpu_usage(self, percentage: float):
+        """Record CPU usage percentage"""
+        self.cpu_usage.append(percentage)
+        if len(self.cpu_usage) > 1000:
+            self.cpu_usage = self.cpu_usage[-1000:]
+    
+    def record_memory_usage(self, mb: float):
+        """Record memory usage in MB"""
+        self.memory_usage.append(mb)
+        if len(self.memory_usage) > 1000:
+            self.memory_usage = self.memory_usage[-1000:]
+    
+    def record_token_usage(self, prompt_tokens: int, completion_tokens: int):
+        """Record token usage"""
+        self.token_usage.append({
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+            "total": prompt_tokens + completion_tokens,
+            "timestamp": time.time()
+        })
+        if len(self.token_usage) > 1000:
+            self.token_usage = self.token_usage[-1000:]
+    
+    def record_io_operation(self, operation: str, bytes_count: int = 1):
+        """Record IO operation"""
+        self.io_operations[operation] += bytes_count
+    
+    def record_browser_metric(self, metric_name: str, value: float):
+        """Record browser-specific metric"""
+        self.browser_metrics[metric_name].append(value)
+        if len(self.browser_metrics[metric_name]) > 1000:
+            self.browser_metrics[metric_name] = self.browser_metrics[metric_name][-1000:]
+    
+    def get_resource_analysis(self) -> Dict:
+        """Analyze resource usage"""
+        analysis = {}
+        
+        # CPU
+        if self.cpu_usage:
+            avg_cpu = sum(self.cpu_usage) / len(self.cpu_usage)
+            analysis["cpu"] = {
+                "avg": avg_cpu,
+                "max": max(self.cpu_usage),
+                "min": min(self.cpu_usage),
+                "samples": len(self.cpu_usage),
+                "is_bottleneck": avg_cpu > 80.0
+            }
+        
+        # Memory
+        if self.memory_usage:
+            avg_mem = sum(self.memory_usage) / len(self.memory_usage)
+            analysis["memory"] = {
+                "avg_mb": avg_mem,
+                "max_mb": max(self.memory_usage),
+                "min_mb": min(self.memory_usage),
+                "samples": len(self.memory_usage),
+                "is_bottleneck": avg_mem > 2048  # 2GB threshold
+            }
+        
+        # Tokens
+        if self.token_usage:
+            total_prompt = sum(t["prompt"] for t in self.token_usage)
+            total_completion = sum(t["completion"] for t in self.token_usage)
+            total = total_prompt + total_completion
+            
+            analysis["tokens"] = {
+                "total_prompt": total_prompt,
+                "total_completion": total_completion,
+                "total": total,
+                "avg_per_call": total / len(self.token_usage) if self.token_usage else 0,
+                "is_bottleneck": total > 100000  # 100k tokens threshold
+            }
+        
+        # IO
+        if self.io_operations:
+            total_io = sum(self.io_operations.values())
+            analysis["io"] = {
+                "operations": dict(self.io_operations),
+                "total_bytes": total_io,
+                "is_bottleneck": total_io > 100 * 1024 * 1024  # 100MB threshold
+            }
+        
+        # Browser
+        if self.browser_metrics:
+            browser_analysis = {}
+            for metric, values in self.browser_metrics.items():
+                browser_analysis[metric] = {
+                    "avg": sum(values) / len(values),
+                    "max": max(values),
+                    "min": min(values)
+                }
+            analysis["browser"] = browser_analysis
+        
+        return analysis
+    
+    # ==================== REGRESSION DETECTION ====================
+    
+    def update_baseline(self):
+        """Update baseline from recent measurements"""
+        # Update stage baselines
+        for stage, timings in self.stage_timings.items():
+            if timings:
+                recent = timings[-self.baseline_window:]
+                self.baseline[f"stage_{stage}"] = sum(recent) / len(recent)
+        
+        # Update tool baselines
+        for tool, timings in self.tool_timings.items():
+            if timings:
+                recent = timings[-self.baseline_window:]
+                self.baseline[f"tool_{tool}"] = sum(recent) / len(recent)
+        
+        logger.info("⏱️ Baseline updated")
+    
+    def get_regression_report(self) -> Dict:
+        """Get regression report comparing current vs baseline"""
+        regressions = []
+        improvements = []
+        
+        # Check stage regressions
+        for stage in self.stage_timings:
+            baseline_key = f"stage_{stage}"
+            if baseline_key not in self.baseline:
+                continue
+            
+            current = sum(self.stage_timings[stage][-10:]) / min(10, len(self.stage_timings[stage]))
+            baseline = self.baseline[baseline_key]
+            delta = ((current - baseline) / baseline) * 100 if baseline > 0 else 0
+            
+            if delta > 20:
+                regressions.append({
+                    "type": "stage",
+                    "name": stage,
+                    "baseline": baseline,
+                    "current": current,
+                    "delta_percent": delta
+                })
+            elif delta < -20:
+                improvements.append({
+                    "type": "stage",
+                    "name": stage,
+                    "baseline": baseline,
+                    "current": current,
+                    "improvement_percent": abs(delta)
                 })
         
-        return sorted(bottlenecks, key=lambda x: -x["average"])
+        # Check tool regressions
+        for tool in self.tool_timings:
+            baseline_key = f"tool_{tool}"
+            if baseline_key not in self.baseline:
+                continue
+            
+            current = sum(self.tool_timings[tool][-10:]) / min(10, len(self.tool_timings[tool]))
+            baseline = self.baseline[baseline_key]
+            delta = ((current - baseline) / baseline) * 100 if baseline > 0 else 0
+            
+            if delta > 20:
+                regressions.append({
+                    "type": "tool",
+                    "name": tool,
+                    "baseline": baseline,
+                    "current": current,
+                    "delta_percent": delta
+                })
+        
+        return {
+            "has_regressions": len(regressions) > 0,
+            "regressions": regressions,
+            "improvements": improvements,
+            "baseline_version": max(self.baseline.keys(), default="none")
+        }
     
-    def get_metrics_summary(self) -> Dict:
-        """Get metrics summary"""
+    # ==================== BENCHMARK DELTA ====================
+    
+    def set_benchmark(self, benchmark_name: str, thresholds: Dict[str, float]):
+        """Set benchmark thresholds"""
+        self.benchmarks[benchmark_name] = {
+            "thresholds": thresholds,
+            "set_at": time.time()
+        }
+    
+    def compare_to_benchmark(self, benchmark_name: str) -> Dict:
+        """Compare current performance to benchmark"""
+        if benchmark_name not in self.benchmarks:
+            return {"error": f"Benchmark {benchmark_name} not found"}
         
-        summary = {}
+        benchmark = self.benchmarks[benchmark_name]
+        thresholds = benchmark["thresholds"]
         
-        for name, values in self.metrics.items():
-            if values:
-                summary[name] = {
-                    "count": len(values),
-                    "avg": sum(values) / len(values),
-                    "min": min(values),
-                    "max": max(values)
+        comparison = {}
+        
+        # Compare stages
+        for stage, timings in self.stage_timings.items():
+            threshold_key = f"stage_{stage}"
+            if threshold_key in thresholds:
+                current = sum(timings[-10:]) / min(10, len(timings))
+                threshold = thresholds[threshold_key]
+                comparison[stage] = {
+                    "current": current,
+                    "threshold": threshold,
+                    "within_budget": current <= threshold,
+                    "percent_of_budget": (current / threshold * 100) if threshold > 0 else 0
                 }
         
-        return summary
+        return {
+            "benchmark": benchmark_name,
+            "comparison": comparison,
+            "all_within_budget": all(v.get("within_budget", True) for v in comparison.values())
+        }
+    
+    # ==================== MAIN DETECTION ====================
+    
+    def detect_bottlenecks(self) -> List[Dict]:
+        """Comprehensive bottleneck detection"""
+        bottlenecks = []
+        
+        # Stage bottlenecks
+        for stage, timings in self.stage_timings.items():
+            if not timings:
+                continue
+            
+            recent = timings[-100:]
+            avg = sum(recent) / len(recent)
+            p90 = sorted(recent)[int(len(recent) * 0.9)] if len(recent) > 10 else avg
+            
+            threshold = self._get_threshold_for_stage(stage)
+            
+            if p90 > threshold:
+                bottlenecks.append({
+                    "type": self.LATENCY,
+                    "source": "stage",
+                    "name": stage,
+                    "avg": avg,
+                    "p90": p90,
+                    "threshold": threshold,
+                    "severity": "critical" if avg > threshold * 2 else "high" if avg > threshold else "medium"
+                })
+        
+        # Tool bottlenecks
+        for tool, timings in self.tool_timings.items():
+            if not timings:
+                continue
+            
+            recent = timings[-100:]
+            avg = sum(recent) / len(recent)
+            call_count = self.tool_call_counts.get(tool, 0)
+            error_rate = self.tool_errors.get(tool, 0) / call_count if call_count > 0 else 0
+            
+            if avg > 10.0 or error_rate > 0.2:
+                bottlenecks.append({
+                    "type": self.TOOL,
+                    "source": "tool",
+                    "name": tool,
+                    "avg_duration": avg,
+                    "call_count": call_count,
+                    "error_rate": error_rate,
+                    "severity": "critical" if error_rate > 0.3 else "high" if avg > 20 else "medium"
+                })
+        
+        # Resource bottlenecks
+        if self.cpu_usage and sum(self.cpu_usage[-100:]) / len(self.cpu_usage[-100:]) > 80:
+            bottlenecks.append({
+                "type": self.MEMORY,
+                "source": "system",
+                "name": "cpu",
+                "avg": sum(self.cpu_usage[-100:]) / len(self.cpu_usage[-100:]),
+                "severity": "high"
+            })
+        
+        if self.memory_usage and sum(self.memory_usage[-100:]) / len(self.memory_usage[-100:]) > 2048:
+            bottlenecks.append({
+                "type": self.MEMORY,
+                "source": "system",
+                "name": "memory",
+                "avg_mb": sum(self.memory_usage[-100:]) / len(self.memory_usage[-100:]),
+                "severity": "critical"
+            })
+        
+        # Sort by severity
+        severity_order = {"critical": 0, "high": 1, "medium": 2}
+        bottlenecks.sort(key=lambda x: severity_order.get(x.get("severity", "medium"), 3))
+        
+        return bottlenecks
+    
+    def get_full_report(self) -> Dict:
+        """Get comprehensive performance report"""
+        return {
+            "stage_analysis": self.get_stage_analysis(),
+            "tool_analysis": self.get_tool_analysis(),
+            "resource_analysis": self.get_resource_analysis(),
+            "regression_report": self.get_regression_report(),
+            "bottlenecks": self.detect_bottlenecks(),
+            "baseline": {k: v for k, v in self.baseline.items() if k.startswith(("stage_", "tool_"))}
+        }
+    
+    def get_metrics_summary(self) -> Dict:
+        """Get basic metrics summary (legacy compatibility)"""
+        return self.get_full_report()
 
 
 # ==================== PATCH PROPOSER ====================
