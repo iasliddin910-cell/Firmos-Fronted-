@@ -709,7 +709,7 @@ class RepairBenchmark:
                 except SyntaxError:
                     return True  # Expected syntax error found
             
-            return True  # Default pass
+            return {"passed": False, "score": 0.0, "error": "Task execution failed - requires runtime validation"}
         except Exception:
             return False
     

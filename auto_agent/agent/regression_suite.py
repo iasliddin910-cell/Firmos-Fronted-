@@ -160,11 +160,11 @@ class TestRunner:
     
     def _check_tools(self) -> bool:
         """Check tools are available"""
-        return True  # Simplified
+        return {"passed": False, "error": "Not implemented - requires test execution"}
     
     def _check_memory(self) -> bool:
         """Check memory is working"""
-        return True  # Simplified
+        return {"passed": False, "error": "Not implemented - requires test execution"}
     
     def run_test(self, test_name: str) -> TestResult:
         """Run a single test"""

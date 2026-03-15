@@ -4128,7 +4128,8 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     reliability[tool_name] = 0.5  # Default neutral
             
             return reliability
-        except Exception:
+        except (ValueError, TypeError, KeyError) as e:
+            logger.warning(f"Reliability calculation error: {e}")
             return {}
     
             return {}
