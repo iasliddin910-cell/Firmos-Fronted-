@@ -788,8 +788,8 @@ class ThrowawayWorkspace:
         try:
             subprocess.run(["pkill", "-9", "-f", str(workspace)], 
                         capture_output=True, timeout=5)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Process cleanup error: {e}")
     
     def destroy_all(self):
         """Destroy all active workspaces"""

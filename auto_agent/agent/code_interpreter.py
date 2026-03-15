@@ -1463,7 +1463,8 @@ class SWEEngine:
                         "language": self._detect_language(f.suffix),
                         "relevance_score": 0.0  # Will be calculated
                     })
-                except:
+                except Exception as e:
+                    logger.debug(f"File scan error: {e}")
                     continue
                     
             if len(files) >= max_files:
@@ -1557,7 +1558,8 @@ class SWEEngine:
                             imports.append(node.module)
                             
                 graph[str(f)] = imports
-            except:
+            except Exception as e:
+                logger.debug(f"AST parse error: {e}")
                 continue
                 
         return graph
