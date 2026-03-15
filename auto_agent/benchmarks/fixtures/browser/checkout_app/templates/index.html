@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Checkout App</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .product { border: 1px solid #ddd; padding: 10px; margin: 10px; }
+        .cart { background: #f5f5f5; padding: 10px; margin: 10px 0; }
+        .coupon { margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>🛒 Checkout Demo</h1>
+    
+    <h2>Products</h2>
+    {% for id, product in products.items() %}
+    <div class="product">
+        <h3>{{ product.name }} - ${{ product.price }}</h3>
+        <button onclick="addToCart('{{ id }}')">Add to Cart</button>
+    </div>
+    {% endfor %}
+    
+    <h2>Cart</h2>
+    <div id="cart-display" class="cart">Empty</div>
+    
+    <h2>Coupon</h2>
+    <div class="coupon">
+        <input type="text" id="coupon-code" placeholder="Enter coupon code">
+        <button onclick="applyCoupon()">Apply</button>
+    </div>
+    <div id="coupon-message"></div>
+    
+    <h2>Checkout</h2>
+    <button onclick="checkout()">Complete Checkout</button>
+    <pre id="receipt"></pre>
+    
+    <script>
+        async function addToCart(itemId) {
+            const response = await fetch('/add_to_cart', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({item_id: itemId})
+            });
+            const data = await response.json();
+            if(data.success) updateCart();
+        }
+        
+        async function applyCoupon() {
+            const code = document.getElementById('coupon-code').value;
+            const response = await fetch('/apply_coupon', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({code: code})
+            });
+            const data = await response.json();
+            document.getElementById('coupon-message').innerText = data.message || data.error;
+        }
+        
+        async function checkout() {
+            const response = await fetch('/checkout', {
+                method: 'POST'
+            });
+            const data = await response.json();
+            if(data.success) {
+                document.getElementById('receipt').innerText = JSON.stringify(data, null, 2);
+            }
+        }
+        
+        function updateCart() {
+            document.getElementById('cart-display').innerText = 'Items in cart updated';
+        }
+    </script>
+</body>
+</html>

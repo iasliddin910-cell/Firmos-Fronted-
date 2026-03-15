@@ -1,0 +1,50 @@
+task_id: coding_hello_package_v1
+suite: coding
+version: "1.0"
+difficulty: easy
+
+# Prompt for the agent
+prompt: |
+  The hello package needs a new function called `greet` that takes a name and time of day.
+  
+  Add a new function `greet(name, time)` to src/hello.py that returns:
+  - "Good morning, {name}!" if time is "morning"
+  - "Good afternoon, {name}!" if time is "afternoon"
+  - "Good evening, {name}!" if time is "evening"
+  - "Hello, {name}!" otherwise
+  
+  Then add tests for this function in tests/test_hello.py.
+
+# Fixture path
+fixture_path: coding/hello_package
+
+# Tools allowed
+allowed_tools:
+  - read_file
+  - edit_file
+  - execute_command
+  - execute_code
+
+# Timeout
+timeout_sec: 60
+
+# Verifier chain
+verifier_chain:
+  - pytest
+
+# Expected artifacts
+expected_artifacts:
+  - src/hello.py
+  - tests/test_hello.py
+
+# Reset policy
+reset_policy: clone
+
+# Seed
+seed: 42
+
+# Tags
+tags:
+  - function_implementation
+  - testing
+  - python
