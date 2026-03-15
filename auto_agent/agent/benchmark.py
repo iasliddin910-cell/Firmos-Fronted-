@@ -1837,7 +1837,8 @@ class AdvancedBenchmarkSuite:
             result["memory_robustness"] = 1.0
         except MemoryError:
             result["memory_robustness"] = 0.0
-        except:
+        except (OSError, RuntimeError) as e:
+            logger.debug(f"Memory test error: {e}")
             result["memory_robustness"] = 0.5
         
         # Test timeout robustness
@@ -1856,8 +1857,9 @@ class AdvancedBenchmarkSuite:
             result["timeout_robustness"] = 1.0
         except TimeoutError:
             result["timeout_robustness"] = 0.0
-        except:
+        except Exception as e:
             signal.alarm(0)
+            logger.debug(f"Timeout test error: {e}")
             result["timeout_robustness"] = 0.5
         
         result["overall_robustness"] = (
