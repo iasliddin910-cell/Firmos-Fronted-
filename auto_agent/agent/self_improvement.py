@@ -131,55 +131,408 @@ class ReleaseCandidate:
 
 class FailureAnalyzer:
     """
-    Analyze failures and detect patterns
+    Advanced failure analysis with multi-dimensional correlation
+    
+    Features:
+    - Module-level clustering (which file/module fails most)
+    - Tool correlation (which tool causes failures)
+    - Task-type correlation (which task types fail)
+    - Patch lineage correlation (failures after patches)
+    - Time-series degradation detection
+    - Recovery effectiveness tracking
     """
     
-    def __init__(self):
+    def __init__(self, storage_dir: str = "data/failures"):
         self.failures: List[Dict] = []
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info("🔍 Failure Analyzer initialized")
+        # Correlation indexes
+        self._file_index: Dict[str, List[int]] = defaultdict(list)  # file -> failure indices
+        self._module_index: Dict[str, List[int]] = defaultdict(list)  # module -> failure indices
+        self._tool_index: Dict[str, List[int]] = defaultdict(list)  # tool -> failure indices
+        self._task_type_index: Dict[str, List[int]] = defaultdict(list)  # task_type -> failure indices
+        self._patch_index: Dict[str, List[int]] = defaultdict(list)  # patch_id -> failure indices
+        self._time_series: List[Dict] = []  # Time-ordered failures for degradation analysis
+        
+        # Recovery tracking
+        self._recovery_attempts: List[Dict] = []
+        self._recovery_success_rate: Dict[str, float] = {}  # strategy -> success rate
+        
+        logger.info("🔍 Failure Analyzer initialized with advanced correlation")
     
     def record_failure(self, error_type: str, error_message: str, 
-                     context: Dict = None):
-        """Record a failure"""
+                      context: Dict = None):
+        """
+        Record a failure with full context for correlation analysis
         
-        self.failures.append({
+        Context should include:
+        - file_path: Which file was being processed
+        - module: Which module/component
+        - tool: Which tool was used
+        - task_type: Type of task being performed
+        - patch_id: If failure occurred after a patch
+        - recovery_used: Which recovery strategy was attempted
+        """
+        
+        context = context or {}
+        
+        failure = {
             "error_type": error_type,
             "error_message": error_message,
-            "context": context or {},
-            "timestamp": time.time()
+            "context": context,
+            "timestamp": time.time(),
+            "failure_id": f"fail_{len(self.failures)}_{int(time.time() * 1000)}"
+        }
+        
+        # Add to main list
+        idx = len(self.failures)
+        self.failures.append(failure)
+        
+        # Update indexes for correlation
+        if context.get("file_path"):
+            self._file_index[context["file_path"]].append(idx)
+        
+        if context.get("module"):
+            self._module_index[context["module"]].append(idx)
+        
+        if context.get("tool"):
+            self._tool_index[context["tool"]].append(idx)
+        
+        if context.get("task_type"):
+            self._task_type_index[context["task_type"]].append(idx)
+        
+        if context.get("patch_id"):
+            self._patch_index[context["patch_id"]].append(idx)
+        
+        # Add to time series
+        self._time_series.append({
+            "timestamp": failure["timestamp"],
+            "error_type": error_type,
+            "index": idx
         })
         
         # Keep last 1000
         if len(self.failures) > 1000:
             self.failures = self.failures[-1000:]
+            self._rebuild_indexes()
+    
+    def _rebuild_indexes(self):
+        """Rebuild correlation indexes after trimming"""
+        self._file_index.clear()
+        self._module_index.clear()
+        self._tool_index.clear()
+        self._task_type_index.clear()
+        self._patch_index.clear()
+        
+        for idx, failure in enumerate(self.failures):
+            ctx = failure.get("context", {})
+            if ctx.get("file_path"):
+                self._file_index[ctx["file_path"]].append(idx)
+            if ctx.get("module"):
+                self._module_index[ctx["module"]].append(idx)
+            if ctx.get("tool"):
+                self._tool_index[ctx["tool"]].append(idx)
+            if ctx.get("task_type"):
+                self._task_type_index[ctx["task_type"]].append(idx)
+            if ctx.get("patch_id"):
+                self._patch_index[ctx["patch_id"]].append(idx)
+    
+    def record_recovery_attempt(self, failure_id: str, strategy: str, success: bool):
+        """Record recovery attempt for effectiveness tracking"""
+        self._recovery_attempts.append({
+            "failure_id": failure_id,
+            "strategy": strategy,
+            "success": success,
+            "timestamp": time.time()
+        })
+        
+        # Update success rate
+        if strategy not in self._recovery_success_rate:
+            self._recovery_success_rate[strategy] = {"success": 0, "total": 0}
+        
+        self._recovery_success_rate[strategy]["total"] += 1
+        if success:
+            self._recovery_success_rate[strategy]["success"] += 1
+    
+    def get_file_failure_analysis(self) -> Dict:
+        """Analyze which files have most failures"""
+        file_analysis = []
+        
+        for file_path, indices in self._file_index.items():
+            error_types = defaultdict(int)
+            for idx in indices:
+                error_types[self.failures[idx]["error_type"]] += 1
+            
+            most_common_error = max(error_types.items(), key=lambda x: x[1]) if error_types else ("unknown", 0)
+            
+            file_analysis.append({
+                "file_path": file_path,
+                "failure_count": len(indices),
+                "error_types": dict(error_types),
+                "most_common_error": most_common_error[0],
+                "most_common_error_count": most_common_error[1]
+            })
+        
+        # Sort by failure count
+        file_analysis.sort(key=lambda x: -x["failure_count"])
+        
+        return {
+            "total_files_with_failures": len(file_analysis),
+            "top_failing_files": file_analysis[:10],
+            "summary": {
+                "most_failure_prone_file": file_analysis[0] if file_analysis else None,
+                "total_unique_files": len(file_analysis)
+            }
+        }
+    
+    def get_module_failure_analysis(self) -> Dict:
+        """Analyze which modules have most failures"""
+        module_analysis = []
+        
+        for module, indices in self._module_index.items():
+            error_types = defaultdict(int)
+            recent_failures = 0
+            now = time.time()
+            
+            for idx in indices:
+                error_types[self.failures[idx]["error_type"]] += 1
+                # Count failures in last hour
+                if now - self.failures[idx]["timestamp"] < 3600:
+                    recent_failures += 1
+            
+            most_common_error = max(error_types.items(), key=lambda x: x[1]) if error_types else ("unknown", 0)
+            
+            module_analysis.append({
+                "module": module,
+                "failure_count": len(indices),
+                "recent_failures_1h": recent_failures,
+                "error_types": dict(error_types),
+                "most_common_error": most_common_error[0],
+                "is_degrading": recent_failures > 5  # Flag if many recent failures
+            })
+        
+        module_analysis.sort(key=lambda x: -x["failure_count"])
+        
+        return {
+            "total_modules_with_failures": len(module_analysis),
+            "top_failing_modules": module_analysis[:10],
+            "degrading_modules": [m for m in module_analysis if m.get("is_degrading")]
+        }
+    
+    def get_tool_failure_correlation(self) -> Dict:
+        """Analyze which tools correlate with failures"""
+        tool_analysis = []
+        
+        for tool, indices in self._tool_index.items():
+            error_types = defaultdict(int)
+            total_failures = len(indices)
+            
+            for idx in indices:
+                error_types[self.failures[idx]["error_type"]] += 1
+            
+            # Calculate failure rate (failures / total uses) if we track tool uses
+            tool_analysis.append({
+                "tool": tool,
+                "failure_count": total_failures,
+                "error_types": dict(error_types),
+                "failure_rate": total_failures / max(1, self._get_tool_use_count(tool)),
+                "reliability_score": 1.0 - (total_failures / max(1, self._get_tool_use_count(tool)))
+            })
+        
+        tool_analysis.sort(key=lambda x: -x["failure_count"])
+        
+        return {
+            "total_tools_with_failures": len(tool_analysis),
+            "top_failing_tools": tool_analysis[:10],
+            "unreliable_tools": [t for t in tool_analysis if t.get("reliability_score", 1.0) < 0.8]
+        }
+    
+    def _get_tool_use_count(self, tool: str) -> int:
+        """Get total uses of a tool (would need to be tracked separately)"""
+        # This would need to be tracked from actual tool usage
+        return max(len(self._tool_index.get(tool, [])), 1)
+    
+    def get_task_type_correlation(self) -> Dict:
+        """Analyze which task types have most failures"""
+        task_analysis = []
+        
+        for task_type, indices in self._task_type_index.items():
+            error_types = defaultdict(int)
+            for idx in indices:
+                error_types[self.failures[idx]["error_type"]] += 1
+            
+            task_analysis.append({
+                "task_type": task_type,
+                "failure_count": len(indices),
+                "error_types": dict(error_types)
+            })
+        
+        task_analysis.sort(key=lambda x: -x["failure_count"])
+        
+        return {
+            "total_task_types_with_failures": len(task_analysis),
+            "highest_risk_tasks": task_analysis[:10]
+        }
+    
+    def get_patch_lineage_correlation(self) -> Dict:
+        """Analyze failures that occurred after patches"""
+        patch_analysis = []
+        
+        for patch_id, indices in self._patch_index.items():
+            # Find the patch timestamp
+            patch_time = self._get_patch_timestamp(patch_id)
+            
+            # Get failures after this patch
+            post_patch_failures = []
+            for idx in indices:
+                if self.failures[idx]["timestamp"] > patch_time:
+                    post_patch_failures.append({
+                        "error_type": self.failures[idx]["error_type"],
+                        "timestamp": self.failures[idx]["timestamp"],
+                        "time_after_patch": self.failures[idx]["timestamp"] - patch_time
+                    })
+            
+            if post_patch_failures:
+                patch_analysis.append({
+                    "patch_id": patch_id,
+                    "failures_after_patch": len(post_patch_failures),
+                    "first_failure_time": min(f["time_after_patch"] for f in post_patch_failures),
+                    "errors": [f["error_type"] for f in post_patch_failures[:5]]
+                })
+        
+        patch_analysis.sort(key=lambda x: -x["failures_after_patch"])
+        
+        return {
+            "total_patches_with_failures": len(patch_analysis),
+            "regression_causing_patches": patch_analysis[:10],
+            "likely_regressions": [p for p in patch_analysis if p["failures_after_patch"] >= 3]
+        }
+    
+    def _get_patch_timestamp(self, patch_id: str) -> float:
+        """Get patch creation timestamp"""
+        # Would need to query patch registry
+        return time.time() - 86400  # Default to 1 day ago
+    
+    def get_time_series_degradation(self, window_minutes: int = 60) -> Dict:
+        """Detect time-series degradation patterns"""
+        if not self._time_series:
+            return {"degradation_detected": False, "message": "No time series data"}
+        
+        now = time.time()
+        window_ms = window_minutes * 60
+        
+        # Count failures in recent windows
+        recent_failures = [f for f in self._time_series if now - f["timestamp"] < window_ms]
+        older_failures = [f for f in self._time_series 
+                         if window_ms < now - f["timestamp"] < window_ms * 2]
+        
+        recent_count = len(recent_failures)
+        older_count = len(older_failures)
+        
+        # Calculate trend
+        if older_count > 0:
+            change_ratio = (recent_count - older_count) / older_count
+        else:
+            change_ratio = recent_count
+        
+        # Determine if degrading
+        is_degrading = recent_count > older_count * 1.5 and recent_count > 5
+        
+        # Get error type distribution
+        recent_errors = defaultdict(int)
+        for f in recent_failures:
+            recent_errors[f["error_type"]] += 1
+        
+        return {
+            "degradation_detected": is_degrading,
+            "recent_failures": recent_count,
+            "older_failures": older_count,
+            "change_ratio": change_ratio,
+            "trend": "increasing" if change_ratio > 0.1 else "stable" if change_ratio > -0.1 else "decreasing",
+            "window_minutes": window_minutes,
+            "top_recent_errors": dict(sorted(recent_errors.items(), key=lambda x: -x[1])[:5])
+        }
+    
+    def get_recovery_effectiveness(self) -> Dict:
+        """Analyze which recovery strategies are most effective"""
+        strategy_stats = defaultdict(lambda: {"success": 0, "total": 0})
+        
+        for attempt in self._recovery_attempts:
+            strategy = attempt.get("strategy", "unknown")
+            strategy_stats[strategy]["total"] += 1
+            if attempt.get("success"):
+                strategy_stats[strategy]["success"] += 1
+        
+        # Calculate success rates
+        effectiveness = []
+        for strategy, stats in strategy_stats.items():
+            success_rate = stats["success"] / max(1, stats["total"])
+            effectiveness.append({
+                "strategy": strategy,
+                "total_attempts": stats["total"],
+                "successful_recoveries": stats["success"],
+                "success_rate": success_rate,
+                "effectiveness": "high" if success_rate > 0.7 else "medium" if success_rate > 0.4 else "low"
+            })
+        
+        effectiveness.sort(key=lambda x: -x["success_rate"])
+        
+        return {
+            "total_recovery_attempts": len(self._recovery_attempts),
+            "strategy_effectiveness": effectiveness,
+            "most_effective_strategy": effectiveness[0] if effectiveness else None,
+            "ineffective_strategies": [e for e in effectiveness if e["effectiveness"] == "low"]
+        }
     
     def analyze_patterns(self) -> Dict:
-        """Analyze failure patterns"""
-        
-        # Count by type
-        type_counts = defaultdict(int)
-        for f in self.failures:
-            type_counts[f["error_type"]] += 1
-        
-        # Find common patterns
-        patterns = []
-        for error_type, count in sorted(type_counts.items(), key=lambda x: -x[1]):
-            if count >= 3:
-                patterns.append({
-                    "error_type": error_type,
-                    "count": count,
-                    "frequency": count / len(self.failures) if self.failures else 0
-                })
+        """Comprehensive multi-dimensional failure analysis"""
         
         return {
             "total_failures": len(self.failures),
-            "patterns": patterns[:10]
+            "file_analysis": self.get_file_failure_analysis(),
+            "module_analysis": self.get_module_failure_analysis(),
+            "tool_correlation": self.get_tool_failure_correlation(),
+            "task_type_correlation": self.get_task_type_correlation(),
+            "patch_lineage": self.get_patch_lineage_correlation(),
+            "time_series_degradation": self.get_time_series_degradation(),
+            "recovery_effectiveness": self.get_recovery_effectiveness()
         }
+    
+    def get_top_failures(self, limit: int = 10) -> List[Dict]:
+        """Get most common failures with context"""
+        error_counts = defaultdict(lambda: {"count": 0, "examples": []})
+        
+        for f in self.failures:
+            error_type = f["error_type"]
+            error_counts[error_type]["count"] += 1
+            if len(error_counts[error_type]["examples"]) < 3:
+                error_counts[error_type]["examples"].append({
+                    "message": f["error_message"][:100],
+                    "context": f.get("context", {})
+                })
+        
+        sorted_errors = sorted(error_counts.items(), key=lambda x: -x[1]["count"])
+        
+        return [
+            {"error_type": e[0], "count": e[1]["count"], "examples": e[1]["examples"]}
+            for e in sorted_errors[:limit]
+        ]
     
     def get_recent_failures(self, limit: int = 50) -> List[Dict]:
         """Get recent failures"""
         return self.failures[-limit:]
+    
+    def export_analysis(self, filepath: str = None) -> Dict:
+        """Export full analysis to file or return as dict"""
+        analysis = self.analyze_patterns()
+        
+        if filepath:
+            with open(filepath, 'w') as f:
+                json.dump(analysis, f, indent=2, default=str)
+            logger.info(f"📊 Failure analysis exported to {filepath}")
+        
+        return analysis
 
 
 # ==================== BOTTLENECK DETECTOR ====================
