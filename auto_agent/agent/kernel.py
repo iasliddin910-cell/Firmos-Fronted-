@@ -3800,6 +3800,27 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             }
         }
 
+
+        # =====================================================
+        # CANONICAL TOOL REGISTRY - Single Source of Truth
+        # =====================================================
+        CANONICAL_TOOLS = {
+            'read_file': {'implemented': True, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {'path': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['file', 'manual'], 'fallback_tools': []},
+            'write_file': {'implemented': True, 'provider': 'tools_engine', 'dangerous': True, 'arg_schema': {'path': 'str', 'content': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['file', 'manual'], 'fallback_tools': []},
+            'delete_file': {'implemented': True, 'provider': 'tools_engine', 'dangerous': True, 'arg_schema': {'path': 'str'}, 'sandbox_modes': ['advanced'], 'verification_types': ['manual'], 'fallback_tools': []},
+            'execute_command': {'implemented': True, 'provider': 'tools_engine', 'dangerous': True, 'arg_schema': {'command': 'str'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['server', 'manual'], 'fallback_tools': ['execute_code']},
+            'execute_code': {'implemented': True, 'provider': 'code_engine', 'dangerous': True, 'arg_schema': {'code': 'str'}, 'sandbox_modes': ['advanced'], 'verification_types': ['code', 'manual'], 'fallback_tools': []},
+            'web_search': {'implemented': True, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {'query': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['manual'], 'fallback_tools': []},
+            'web_request': {'implemented': False, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {'url': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['manual'], 'fallback_tools': ['web_search']},
+            'browser_navigate': {'implemented': False, 'provider': 'browser_engine', 'dangerous': False, 'arg_schema': {'url': 'str'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['browser', 'manual'], 'fallback_tools': []},
+            'browser_click': {'implemented': False, 'provider': 'browser_engine', 'dangerous': False, 'arg_schema': {'index': 'int'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['browser', 'manual'], 'fallback_tools': []},
+            'browser_type': {'implemented': False, 'provider': 'browser_engine', 'dangerous': False, 'arg_schema': {'index': 'int', 'text': 'str'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['browser', 'manual'], 'fallback_tools': []},
+            'install_package': {'implemented': False, 'provider': 'dependency_handler', 'dangerous': True, 'arg_schema': {'package': 'str'}, 'sandbox_modes': ['advanced'], 'verification_types': ['manual'], 'fallback_tools': []},
+            'take_screenshot': {'implemented': True, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['screenshot', 'manual'], 'fallback_tools': []}
+        }
+        
+        def get_implemented_tools():
+            return [name for name, spec in CANONICAL_TOOLS.items() if spec.get('implemented', False)]
         # Get tool reliability history for smart selection
         tool_reliability = self._get_tool_reliability_history()
         
@@ -4134,6 +4155,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
     
             return {}
     def _select_tool_strict(
+        self,
         task: Task,
         required_tools: List[str],
         task_meta: Dict,
@@ -4163,18 +4185,21 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             self._tool_failure_history = {}
             self._tool_failure_window = 300
 
-        # 1. REQUIRED TOOLS - MUST HAVE
-        for rt in required_tools:
-            if rt in available_tools:
-                logger.info(f"Tool selected (required): {rt}")
-                return rt
+        # 1. REQUIRED TOOLS - Constraint Filter (NOT hard override)
+        if required_tools:
+            candidate_tools = [t for t in available_tools if t in required_tools]
+            if not candidate_tools:
+                logger.warning(f"Required tools {required_tools} not in available tools")
+                candidate_tools = available_tools
+        else:
+            candidate_tools = available_tools
 
-        # Get context
+        # CONTEXT - Use task fields (NOT task_meta dict)
         description = task.description.lower()
-        verification_type = task_meta.get('verification_type', 'manual')
+        verification_type = task.verification_type if hasattr(task, 'verification_type') and task.verification_type else task_meta.get('verification_type', 'manual')
         expected_artifacts = task_meta.get('expected_artifacts', [])
-        sandbox_mode = task_meta.get('sandbox_mode', 'normal')
-        approval_policy = task_meta.get('approval_policy', 'auto')
+        sandbox_mode = task.sandbox_mode if hasattr(task, 'sandbox_mode') and task.sandbox_mode else task_meta.get('sandbox_mode', 'normal')
+        approval_policy = task.approval_policy if hasattr(task, 'approval_policy') and task.approval_policy else task_meta.get('approval_policy', 'auto')
 
         # Get environment state
         env_state = self._get_environment_state()
@@ -4207,9 +4232,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         }
 
         SANDBOX_COMPAT = {
-            'safe': ['read_file', 'web_search', 'web_request'],
-            'normal': ['read_file', 'write_file', 'execute_command', 'web_search', 'web_request', 'browser_navigate'],
-            'advanced': ['read_file', 'write_file', 'execute_command', 'execute_code', 'install_package', 'browser_navigate']
+            'safe': ['read_file', 'web_search', 'take_screenshot'],
+            'normal': ['read_file', 'write_file', 'execute_command', 'web_search', 'take_screenshot', 'browser_navigate'],
+            'advanced': ['read_file', 'write_file', 'execute_command', 'execute_code', 'take_screenshot']
         }
 
         APPROVAL_COST = {
@@ -4222,7 +4247,14 @@ Return JSON with tasks array containing: id, description, priority, dependencies
 
         scores, diagnostics, current_time = {}, {}, time.time()
 
-        for tool in available_tools:
+        implemented_tools = get_implemented_tools()
+        candidate_tools = [t for t in candidate_tools if t in implemented_tools]
+        
+        if not candidate_tools:
+            logger.error(f"No implemented tools available! candidates={candidate_tools}, implemented={implemented_tools}")
+            return None
+
+        for tool in candidate_tools:
             score = 0
             tool_diag = {
                 'reliability': 0, 'failure_penalty': 0, 'keyword': 0,
