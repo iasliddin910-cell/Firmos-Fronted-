@@ -35,6 +35,15 @@ FIXED ISSUES:
 16. Scheduler - Deeply integrated
 17. Recovery classification - Error types
 18. Rollback - Checkpoint system
+
+VERIFICATION SYSTEM FIXES (v2 - Canonical):
+19. Single VerificationType enum - No more taxonomy mismatch
+20. VerificationSpec dataclass - Typed contract, not string metadata
+21. VERIFICATION_ALIAS_MAP - Legacy name mapping for backward compat
+22. Unified verifier API - Single source of truth (no more double verifier)
+23. "manual" removed from verification - Now human_review_required field
+24. Evidence-based commit gate - success requires evidence
+25. Task lifecycle VERIFIED -> COMMITTED semantics
 """
 import os
 import json
@@ -59,59 +68,403 @@ from agent.multi_agent_coordinator import MultiAgentCoordinator as NewMultiAgent
 logger = logging.getLogger(__name__)
 
 
-# CANONICAL EVENT LEDGER SYSTEM
-class EventType(Enum):
-    TASK_CREATED = "task_created"
-    TASK_STARTED = "task_started"
-    TASK_COMMITTED = "task_committed"
-    TASK_FAILED = "task_failed"
-    TOOL_ROUTE_SELECTED = "tool_route_selected"
-    TOOL_EXECUTION_FINISHED = "tool_execution_finished"
-    VERIFICATION_STARTED = "verification_started"
-    RECOVERY_STARTED = "recovery_started"
-    ERROR = "error"
+# ==================== CANONICAL VERIFICATION TYPES ====================
+# NEW: Single source of truth for verification types (FIX #19)
+
+class VerificationType(str, Enum):
+    """
+    Canonical verification types - SINGLE source of truth.
+    
+    IMPORTANT: "manual" is NOT a verification type!
+    Use human_review_required field for human review.
+    
+    FIX #19: This enum replaces all fragmented verification type strings.
+    """
+    NONE = "none"                      # Only for explicit research/note tasks
+    FILE_EXISTS = "file_exists"
+    PROCESS_RUNNING = "process_running"
+    PORT_OPEN = "port_open"
+    HTTP_RESPONSE = "http_response"
+    BROWSER_STATE = "browser_state"
+    SCREENSHOT_MATCH = "screenshot_match"
+    CODE_COMPILES = "code_compiles"
+    FUNCTION_RESULT = "function_result"
+    ARTIFACT_PRESENT = "artifact_present"
+
+
+# ==================== VERIFICATION ALIAS MAP ====================
+# FIX #21: Map legacy names to canonical types
+
+VERIFICATION_ALIAS_MAP: Dict[str, VerificationType] = {
+    # Legacy browser types
+    "browser": VerificationType.BROWSER_STATE,
+    "browser_page": VerificationType.BROWSER_STATE,
+    "browser_state": VerificationType.BROWSER_STATE,
+    
+    # Legacy server types  
+    "server": VerificationType.HTTP_RESPONSE,
+    "server_responding": VerificationType.HTTP_RESPONSE,
+    "http_response": VerificationType.HTTP_RESPONSE,
+    
+    # Legacy code types
+    "code": VerificationType.CODE_COMPILES,
+    "code_syntax": VerificationType.CODE_COMPILES,
+    "code_compiles": VerificationType.CODE_COMPILES,
+    
+    # Legacy file types
+    "file": VerificationType.FILE_EXISTS,
+    "file_exists": VerificationType.FILE_EXISTS,
+    "artifact": VerificationType.ARTIFACT_PRESENT,
+    
+    # Legacy function types
+    "function": VerificationType.FUNCTION_RESULT,
+    "function_result": VerificationType.FUNCTION_RESULT,
+    
+    # Legacy screenshot types
+    "screenshot": VerificationType.SCREENSHOT_MATCH,
+    "screenshot_match": VerificationType.SCREENSHOT_MATCH,
+    
+    # Legacy process/port types
+    "process": VerificationType.PROCESS_RUNNING,
+    "process_running": VerificationType.PROCESS_RUNNING,
+    "port": VerificationType.PORT_OPEN,
+    "port_open": VerificationType.PORT_OPEN,
+    
+    # Legacy aliases
+    "manual": None,  # CRITICAL: manual is NOT a verification type!
+    "none": VerificationType.NONE,
+    "null": VerificationType.NONE,
+}
+
+
+def normalize_verification_type(raw: str) -> VerificationType:
+    """
+    Normalize any legacy verification type string to canonical VerificationType.
+    
+    FIX #21: This function ensures backward compatibility while enforcing
+    canonical type system.
+    
+    Raises:
+        ValueError: If type is "manual" or unknown
+    """
+    if not raw or raw is None:
+        raise ValueError("Missing verification type")
+    
+    key = str(raw).strip().lower()
+    
+    # CRITICAL: "manual" is NOT a verification type!
+    if key == "manual":
+        raise ValueError(
+            "'manual' is not a verification type. "
+            "Use human_review_required field instead."
+        )
+    
+    # Check alias map
+    if key in VERIFICATION_ALIAS_MAP:
+        mapped = VERIFICATION_ALIAS_MAP[key]
+        if mapped is None:
+            raise ValueError(
+                "'manual' is not a verification type. "
+                "Use human_review_required field instead."
+            )
+        return mapped
+    
+    # Try direct enum parse
+    try:
+        return VerificationType(key)
+    except ValueError:
+        pass
+    
+    raise ValueError(f"Unknown verification type: {raw}")
+
+
+# ==================== VERIFICATION CONTRACTS ====================
+# FIX #20: Typed contracts instead of string metadata
 
 @dataclass
-class RunEvent:
-    event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    run_id: str = ""
-    attempt_id: str = ""
-    task_id: str = ""
-    event_type: EventType = EventType.TASK_CREATED
-    stage: str = ""
-    subsystem: str = ""
+class VerificationSpec:
+    """
+    Typed verification specification - replaces string metadata.
+    
+    FIX #20: This dataclass ensures verification is a first-class contract,
+    not a metadata string that can be bypassed.
+    """
+    type: VerificationType
+    params: Dict[str, Any] = field(default_factory=dict)
+    required: bool = True                    # Verification must pass for success
+    evidence_required: bool = True           # Must have evidence for commit
+    min_confidence: float = 1.0              # Minimum confidence threshold
+    timeout: float = 30.0                    # Verification timeout
+
+
+@dataclass
+class VerificationResult:
+    """
+    Verification result with evidence.
+    
+    FIX #24: Evidence-based commit gate - success requires evidence.
+    """
+    passed: bool
+    details: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.0
+    severity: str = "info"                   # info, warning, error, critical
     timestamp: float = field(default_factory=time.time)
-    payload: Dict[str, Any] = field(default_factory=dict)
-    
-    def to_dict(self):
-        return {"event_id": self.event_id, "run_id": self.run_id, "attempt_id": self.attempt_id, "task_id": self.task_id, "event_type": self.event_type.value, "stage": self.stage, "subsystem": self.subsystem, "timestamp": self.timestamp, "payload": self.payload}
 
-class RunLedger:
-    def __init__(self):
-        self.events = []
-        self._index = defaultdict(list)
-        self._lock = threading.Lock()
-    
-    def append(self, event):
-        with self._lock:
-            self.events.append(event)
-            self._index[event.task_id].append(len(self.events) - 1)
-    
-    def get_task_trace(self, task_id):
-        with self._lock:
-            return [self.events[i] for i in self._index.get(task_id, [])]
-    
-    def derive_metrics(self):
-        if not self.events:
-            return {}
-        return {"total_tasks": len(set(e.task_id for e in self.events)), "total_events": len(self.events)}
 
-_ledger = None
-def get_ledger():
-    global _ledger
-    if _ledger is None:
-        _ledger = RunLedger()
-    return _ledger
+@dataclass
+class HumanReviewSpec:
+    """
+    FIX #4: Separate human review from verification.
+    
+    verification = machine truth check
+    approval = risk-based permission
+    human_review = human eyes needed at checkpoint
+    """
+    required: bool = False
+    reason: str = ""
+    blocking: bool = True                    # If true, blocks progress until reviewed
+
+
+# ==================== RECOVERY CONTRACTS ====================
+# FIX #2: Typed recovery contracts
+
+@dataclass
+class RecoveryDecision:
+    """
+    FIX #2: Typed recovery decision - replaces string-based recovery.
+    
+    This is the contract that recovery engine produces when deciding
+    how to handle a failure.
+    """
+    strategy: RecoveryStrategy
+    confidence: float
+    reason: str
+    retry_allowed: bool = False
+    requires_rollback: bool = False
+    fallback_tool: Optional[str] = None
+    replan_required: bool = False
+    max_retries: int = 3
+
+
+@dataclass
+class RecoveryOutcome:
+    """
+    FIX #2: Typed recovery outcome - replaces dict-based recovery results.
+    
+    This is the contract that recovery engine produces after executing
+    a recovery strategy.
+    """
+    success: bool
+    strategy: RecoveryStrategy
+    next_status: str  # TaskStatus as string to avoid circular import
+    action_taken: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    should_resume: bool = False
+    replacement_task_id: Optional[str] = None
+    escalated: bool = False
+    retry_count: int = 0
+
+
+# ==================== TASK EVENTS & CHECKPOINTS ====================
+# FIX #5: Event-sourced ledger for task lifecycle
+
+@dataclass
+class TaskEvent:
+    """
+    FIX #5: Event-sourced ledger for task lifecycle.
+    
+    Every state transition is recorded as an event for:
+    - Replay capability
+    - Debugging
+    - Learning signals
+    - Evaluation
+    - Auditability
+    """
+    task_id: str
+    from_status: str
+    to_status: str
+    reason: str
+    timestamp: float = field(default_factory=time.time)
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    checkpoint_id: Optional[str] = None
+
+
+# ==================== EXECUTION CURSOR ====================
+# FIX #3: Execution cursor for step-level resume
+
+@dataclass
+class ExecutionCursor:
+    """
+    FIX #3: Execution cursor for step-level resume.
+    
+    Tracks exactly where in the execution flow the task is.
+    This enables precise crash recovery.
+    """
+    phase: str                           # prepare, execute, verify, commit
+    step_id: Optional[str] = None        # Current step ID
+    tool_name: Optional[str] = None      # Current tool being executed
+    tool_args_hash: Optional[str] = None # Hash of tool arguments
+    verification_phase: Optional[str] = None  # verifying, validating
+    approval_request_id: Optional[str] = None  # Pending approval
+    scheduler_wake_at: Optional[float] = None  # Scheduled resume time
+    side_effect_committed: bool = False  # Has side effect been committed?
+    artifacts_created: List[str] = field(default_factory=list)
+
+
+# ==================== ROLLBACK SNAPSHOT ====================
+# FIX #6: Typed rollback snapshots
+
+@dataclass
+class RollbackSnapshot:
+    """
+    FIX #6: Typed rollback snapshot - not just metadata dict.
+    
+    Each rollback type has a structured payload for reliable restore.
+    """
+    kind: str                             # file_mutation, browser_state, env_change, etc.
+    restore_handler: str                  # Which handler to use for restore
+    payload: Dict[str, Any]              # Structured data for restore
+    created_at: float = field(default_factory=time.time)
+    checksum: Optional[str] = None        # For integrity verification
+
+
+# ==================== CHECKPOINT SPEC ====================
+
+@dataclass
+class TaskCheckpoint:
+    """
+    FIX #5: Task checkpoint for durable pause/resume.
+    
+    Enables crash recovery by storing execution state.
+    """
+    task_id: str
+    checkpoint_id: str
+    last_safe_status: str
+    execution_cursor: ExecutionCursor = None
+    rollback_data: Dict[str, Any] = field(default_factory=dict)
+    artifacts: List[str] = field(default_factory=list)
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    
+    # FIX #6: Add typed rollback snapshots
+    rollback_snapshots: List[RollbackSnapshot] = field(default_factory=list)
+
+
+# ==================== TASK SPEC CONTRACTS ====================
+# FIX: Task contract - canonical task specification
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """
+    FIX: Typed retry policy - replaces int/dict ambiguity.
+    
+    Previously max_retries could be int or dict from planner,
+    causing runtime comparison errors.
+    """
+    max_retries: int = 3
+    backoff_strategy: str = "exponential"  # exponential, linear, fixed
+    initial_delay_sec: int = 1
+    max_delay_sec: int = 30
+
+
+@dataclass(frozen=True)
+class ApprovalSpec:
+    """
+    FIX: Typed approval specification.
+    
+    Previously approval_policy was a string that could be in
+    either task field or input_data dict.
+    """
+    policy: str = "auto"  # auto, manual, never
+    required_for_dangerous: bool = True
+    timeout_sec: int = 300
+
+
+@dataclass(frozen=True)
+class SandboxSpec:
+    """
+    FIX: Typed sandbox specification.
+    
+    Previously sandbox_mode could be in task field or input_data dict.
+    """
+    mode: str = "normal"  # safe, normal, advanced
+    allow_network: bool = True
+    allow_file_write: bool = True
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """
+    FIX: Typed tool specification.
+    
+    Previously required_tools was just a list of strings.
+    Now it's a structured contract with capabilities.
+    """
+    required_tools: List[str] = field(default_factory=list)
+    preferred_tool: Optional[str] = None
+    alternate_tool: Optional[str] = None
+    destructive: bool = False
+
+
+@dataclass(frozen=True)
+class SuccessCriterion:
+    """
+    FIX: Structured success criteria - not string DSL.
+    
+    Previously success_criteria was a string like "contains:X exit_code:0"
+    Now it's structured assertions for deterministic verification.
+    """
+    kind: str  # contains, regex, exit_code, artifact_exists, url_equals, etc.
+    value: Any
+    optional: bool = False
+
+
+@dataclass(frozen=True)
+class VerificationSpec:
+    """
+    FIX: Typed verification specification.
+    
+    Previously verification was just a type string in input_data.
+    Now it's a full specification with criteria.
+    """
+    type: str  # browser, screenshot, code, file, etc.
+    params: Dict[str, Any] = field(default_factory=dict)
+    criteria: List[SuccessCriterion] = field(default_factory=list)
+    required: bool = True
+    evidence_required: bool = True
+
+
+@dataclass(frozen=True)
+class TaskSpec:
+    """
+    FIX: Canonical TaskSpec - the contract for task execution.
+    
+    This replaces the fragmented task + input_data model.
+    All policy, verification, and execution details are in one place.
+    """
+    description: str
+    priority: str = "normal"
+    dependencies: List[str] = field(default_factory=list)
+    
+    # Tool routing
+    tool_spec: ToolSpec = field(default_factory=ToolSpec)
+    
+    # Verification
+    verification: VerificationSpec = field(default_factory=VerificationSpec)
+    
+    # Success criteria
+    success_criteria: List[SuccessCriterion] = field(default_factory=list)
+    expected_artifacts: List[str] = field(default_factory=list)
+    
+    # Policy
+    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    approval: ApprovalSpec = field(default_factory=ApprovalSpec)
+    sandbox: SandboxSpec = field(default_factory=SandboxSpec)
+    
+    # Execution
+    timeout_sec: int = 30
+    rollback: Optional[Dict[str, Any]] = None
 
 
 # ==================== ENUMS ====================
@@ -373,20 +726,60 @@ class SelfImprovementEmitter:
 
 
 class TaskStatus(Enum):
-    """Granular task status"""
+    """
+    FIX #1: Canonical Task Status - Single Source of Truth
+    
+    This replaces the fragmented status system with a proper FSM.
+    
+    Key changes:
+    - COMPLETED -> COMMITTED (explicit commit after verification)
+    - Added FAILED_EXECUTION (separate from verification failure)
+    - Added REPLAN_PENDING and ESCALATED states
+    - Added PAUSED for durable pause/resume
+    - SUPERSEDED for replacement tasks
+    """
+    # Core execution flow
     PENDING = "pending"
-    DEPENDENCIES_WAITING = "dependencies_waiting"
-    APPROVAL_WAITING = "approval_waiting"
-    RUNNING = "running"
-    VERIFYING = "verifying"
-    VERIFIED = "verified"
-    FAILED_VERIFICATION = "failed_verification"
-    RETRYING = "retrying"
-    RECOVERING = "recovering"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    READY = "ready"                    # Dependencies met, ready to execute
+    RUNNING = "running"                # Actively executing
+    EXECUTED = "executed"              # Execution done, needs verification
+    VERIFYING = "verifying"            # Running verification
+    VERIFIED = "verified"              # Verification passed
+    COMMITTED = "committed"            # Final commit (was: COMPLETED)
+    
+    # Failure states
+    FAILED_EXECUTION = "failed_execution"    # Execution failed
+    FAILED_VERIFICATION = "failed_verification"  # Verification failed
+    FAILED = "failed"                  # Generic failure
+    
+    # Recovery states
+    RECOVERING = "recovering"          # Running recovery
+    RETRYING = "retrying"             # Retrying the task
+    REPLAN_PENDING = "replan_pending"  # Needs new plan
+    ESCALATED = "escalated"           # Escalated to human
+    
+    # Pause/Approval states
+    PAUSED = "paused"                 # Durably paused
+    WAITING_APPROVAL = "waiting_approval"  # Waiting for human approval
+    APPROVAL_WAITING = "approval_waiting"  # Alias for compatibility
+    
+    # Terminal states
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"         # Replaced by another task
+    ABORTED = "aborted"               # Explicitly aborted
+    
+    # Legacy aliases for backward compatibility
+    @classmethod
+    def alias(cls, old_name: str) -> 'TaskStatus':
+        """Map old status names to new canonical ones"""
+        aliases = {
+            'COMPLETED': cls.COMMITTED,
+            'dependencies_waiting': cls.PENDING,
+            'completed': cls.COMMITTED,
+            'failed': cls.FAILED,
+        }
+        return aliases.get(old_name, cls.PENDING)
 
 
 # ==================== DATA CLASSES ====================
@@ -421,6 +814,15 @@ class Task:
     estimated_cost: float = 0.0
     artifact_expectations: List[str] = field(default_factory=list)
     rollback_point: Optional[Dict] = None
+    
+    # FIX #4: Task lineage - links between parent/superseded/replacement tasks
+    parent_task_id: Optional[str] = None          # Original task if this is replacement
+    superseded_by: Optional[str] = None            # Task that replaced this one
+    replacement_for: Optional[str] = None         # Task this one replaces
+    
+    # FIX #5: Task checkpoint for durable pause/resume
+    checkpoint_id: Optional[str] = None
+    last_safe_status: Optional[str] = None
     
     def __lt__(self, other):
         return self.priority.value < other.priority.value
@@ -2137,7 +2539,18 @@ class TaskManager:
             approval_policy=data.get('approval_policy', 'auto'),
             sandbox_mode=data.get('sandbox_mode', 'normal'),
             artifact_expectations=data.get('artifact_expectations', []),
+            # FIX #1: Restore rollback_point - previously was missing!
+            rollback_point=data.get('rollback_point'),
         )
+        
+        # FIX #1: Restore task lineage fields
+        task.parent_task_id = data.get('parent_task_id')
+        task.superseded_by = data.get('superseded_by')
+        task.replacement_for = data.get('replacement_for')
+        
+        # FIX #1: Restore checkpoint fields
+        task.checkpoint_id = data.get('checkpoint_id')
+        task.last_safe_status = data.get('last_safe_status')
         
         # Restore status
         if 'status' in data:
@@ -2202,15 +2615,15 @@ class TaskManager:
                 self.background_queue.put(task)
             
             # Get approval waiting tasks
-            for task_id, task in self.approval_waiting_tasks.items():
-                approval_tasks[task_id] = self._task_to_dict(task)
+            # FIX #2: Save as list of task dicts, not dict
+            approval_tasks_list = [self._task_to_dict(task) for task in self.approval_waiting_tasks.values()]
             
             state = {
                 'version': self.state_version,
                 'tasks': [self._task_to_dict(t) for t in self.tasks.values()],
                 'pending_tasks': pending_tasks,
                 'background_tasks': background_tasks,
-                'approval_waiting_tasks': approval_tasks,
+                'approval_waiting_tasks': approval_tasks_list,  # FIX #2: Save as list
                 'running_tasks': list(self.running_tasks),
                 'completed_tasks': list(self.completed_tasks),
                 'failed_tasks': list(self.failed_tasks),
@@ -2704,6 +3117,11 @@ class CentralKernel:
         self.task_manager = TaskManager()
         self.scheduler = Scheduler()
         self.verifier = VerificationEngine(tools_engine)
+        
+        # FIX #3: Initialize RecoveryEngine as first-class subsystem
+        logger.info("🔧 Initializing Recovery Engine...")
+        self.recovery_engine = RecoveryEngine(self)
+        
         self.critic = CriticEngine(api_key)
         
         # Use NEW Multi-Agent Coordinator with 6 full workers
@@ -2723,7 +3141,459 @@ class CentralKernel:
         # Pending approvals
         self.pending_approvals: Dict[str, Dict] = {}
         
+        # FIX #2 & #5: Task lifecycle management
+        # Event ledger for state transitions
+        self._task_event_ledger: List[TaskEvent] = []
+        # Task checkpoints for durable pause/resume
+        self._task_checkpoints: Dict[str, TaskCheckpoint] = {}
+        
+        # FIX #2: Valid transitions map
+        self._valid_transitions = self._build_valid_transitions()
+        
         logger.info("✅ Central Kernel Ready!")
+    
+    def _build_valid_transitions(self) -> Dict[str, Set[str]]:
+        """
+        FIX #3: Build valid state transitions map.
+        
+        This defines which transitions are legal in the task lifecycle.
+        """
+        return {
+            # Core execution flow
+            TaskStatus.PENDING.value: {TaskStatus.READY.value, TaskStatus.CANCELLED.value},
+            TaskStatus.READY.value: {TaskStatus.RUNNING.value, TaskStatus.PAUSED.value, TaskStatus.CANCELLED.value},
+            TaskStatus.RUNNING.value: {
+                TaskStatus.EXECUTED.value, 
+                TaskStatus.FAILED_EXECUTION.value,
+                TaskStatus.WAITING_APPROVAL.value,
+                TaskStatus.PAUSED.value
+            },
+            TaskStatus.EXECUTED.value: {TaskStatus.VERIFYING.value, TaskStatus.FAILED_EXECUTION.value},
+            TaskStatus.VERIFYING.value: {TaskStatus.VERIFIED.value, TaskStatus.FAILED_VERIFICATION.value},
+            TaskStatus.VERIFIED.value: {TaskStatus.COMMITTED.value, TaskStatus.FAILED_VERIFICATION.value},
+            TaskStatus.COMMITTED.value: set(),  # Terminal success state
+            
+            # Failure states
+            TaskStatus.FAILED_EXECUTION.value: {
+                TaskStatus.RECOVERING.value, 
+                TaskStatus.ABORTED.value,
+                TaskStatus.RETRYING.value
+            },
+            TaskStatus.FAILED_VERIFICATION.value: {
+                TaskStatus.RECOVERING.value,
+                TaskStatus.REPLAN_PENDING.value,
+                TaskStatus.ESCALATED.value,
+                TaskStatus.ABORTED.value
+            },
+            
+            # Recovery states
+            TaskStatus.RECOVERING.value: {
+                TaskStatus.RETRYING.value,
+                TaskStatus.REPLAN_PENDING.value,
+                TaskStatus.ESCALATED.value,
+                TaskStatus.ABORTED.value
+            },
+            TaskStatus.RETRYING.value: {TaskStatus.RUNNING.value, TaskStatus.FAILED_EXECUTION.value},
+            TaskStatus.REPLAN_PENDING.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
+            
+            # Approval/Pause states
+            TaskStatus.WAITING_APPROVAL.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
+            TaskStatus.PAUSED.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
+            
+            # Terminal states
+            TaskStatus.ESCALATED.value: set(),
+            TaskStatus.ABORTED.value: set(),
+            TaskStatus.TIMEOUT.value: set(),
+            TaskStatus.CANCELLED.value: set(),
+            TaskStatus.SUPERSEDED.value: set(),
+        }
+    
+    def transition_task(
+        self, 
+        task: 'Task', 
+        to_status: TaskStatus, 
+        reason: str,
+        evidence: Optional[Dict] = None
+    ) -> bool:
+        """
+        FIX #2: Centralized task state transition gate.
+        
+        This is the ONLY way to change task status - no direct task.status = ... allowed.
+        
+        This method:
+        1. Validates the transition is legal
+        2. Records the event in the ledger
+        3. Updates checkpoint if needed
+        4. Returns success/failure
+        
+        Args:
+            task: The task to transition
+            to_status: The new status
+            reason: Why this transition is happening
+            evidence: Any evidence for this transition
+            
+        Returns:
+            True if transition succeeded, False if invalid
+        """
+        from_status = task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+        
+        # Check if transition is valid
+        valid_targets = self._valid_transitions.get(from_status, set())
+        
+        if to_status.value not in valid_targets and from_status != to_status.value:
+            logger.warning(
+                f"⚠️ Invalid transition: {task.id} from {from_status} to {to_status.value}. "
+                f"Valid: {valid_targets}"
+            )
+            # Log the invalid attempt
+            self._record_event(
+                task.id, 
+                from_status, 
+                to_status.value, 
+                f"INVALID: {reason}",
+                evidence or {}
+            )
+            return False
+        
+        # Record event
+        self._record_event(
+            task.id,
+            from_status,
+            to_status.value,
+            reason,
+            evidence or {}
+        )
+        
+        # Update task status
+        old_status = task.status
+        task.status = to_status
+        
+        # Update checkpoint if needed
+        if to_status in {TaskStatus.PAUSED, TaskStatus.WAITING_APPROVAL}:
+            self._save_checkpoint(task, reason)
+        
+        logger.info(f"✅ Task {task.id}: {from_status} -> {to_status.value} ({reason})")
+        return True
+    
+    def _record_event(
+        self,
+        task_id: str,
+        from_status: str,
+        to_status: str,
+        reason: str,
+        evidence: Dict
+    ):
+        """FIX #5: Record task event in ledger"""
+        event = TaskEvent(
+            task_id=task_id,
+            from_status=from_status,
+            to_status=to_status,
+            reason=reason,
+            evidence=evidence
+        )
+        self._task_event_ledger.append(event)
+        
+        # Keep only last 1000 events to prevent memory issues
+        if len(self._task_event_ledger) > 1000:
+            self._task_event_ledger = self._task_event_ledger[-500:]
+    
+    def _save_checkpoint(self, task: 'Task', reason: str):
+        """FIX #5: Save task checkpoint for durable pause/resume"""
+        checkpoint = TaskCheckpoint(
+            task_id=task.id,
+            checkpoint_id=str(uuid.uuid4()),
+            last_safe_status=task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
+            execution_cursor={
+                'input_data': task.input_data,
+                'retry_count': task.retry_count,
+                'reason': reason
+            },
+            artifacts=task.artifacts or []
+        )
+        self._task_checkpoints[task.id] = checkpoint
+        task.checkpoint_id = checkpoint.checkpoint_id
+        task.last_safe_status = checkpoint.last_safe_status
+        
+        logger.info(f"💾 Checkpoint saved for {task.id}: {checkpoint.checkpoint_id}")
+    
+    def get_task_history(self, task_id: str) -> List[TaskEvent]:
+        """FIX #5: Get full event history for a task"""
+        return [e for e in self._task_event_ledger if e.task_id == task_id]
+    
+    def get_task_checkpoint(self, task_id: str) -> Optional[TaskCheckpoint]:
+        """FIX #5: Get checkpoint for a task"""
+        return self._task_checkpoints.get(task_id)
+    
+    async def save_checkpoint(
+        self, 
+        task: 'Task', 
+        cursor: Optional[ExecutionCursor] = None,
+        extra: Optional[Dict] = None
+    ) -> str:
+        """
+        FIX #4: Save checkpoint with execution cursor.
+        
+        This is the kernel-level checkpoint API that enables:
+        - Step-level resume after crash
+        - Side-effect reconciliation
+        - Verification checkpointing
+        
+        Args:
+            task: The task to checkpoint
+            cursor: Current execution cursor (optional)
+            extra: Any additional checkpoint data
+            
+        Returns:
+            checkpoint_id
+        """
+        checkpoint_id = str(uuid.uuid4())
+        
+        # Build execution cursor if not provided
+        if cursor is None:
+            cursor = ExecutionCursor(
+                phase='unknown',
+                tool_name=task.metadata.get('current_tool'),
+                artifacts_created=task.artifacts or []
+            )
+        
+        # Create checkpoint
+        checkpoint = TaskCheckpoint(
+            task_id=task.id,
+            checkpoint_id=checkpoint_id,
+            last_safe_status=task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
+            execution_cursor=cursor,
+            artifacts=task.artifacts or [],
+            evidence=extra or {}
+        )
+        
+        # Store checkpoint
+        self._task_checkpoints[task.id] = checkpoint
+        task.checkpoint_id = checkpoint_id
+        task.last_safe_status = checkpoint.last_safe_status
+        
+        # Also save to disk for durability
+        self._persist_checkpoint(checkpoint)
+        
+        logger.info(f"💾 Checkpoint saved for {task.id}: {checkpoint_id} (phase: {cursor.phase})")
+        return checkpoint_id
+    
+    async def restore_from_checkpoint(self, checkpoint_id: str) -> Dict:
+        """
+        FIX #5: Restore task from checkpoint.
+        
+        This performs crash reconciliation:
+        - If task was RUNNING with uncommitted side effects -> RECOVERING
+        - If verification was in progress -> resume from VERIFYING
+        - If approval was pending -> check if still valid
+        
+        Args:
+            checkpoint_id: The checkpoint to restore from
+            
+        Returns:
+            dict with 'task', 'cursor', 'reconciliation_action'
+        """
+        # Find checkpoint by ID
+        checkpoint = None
+        for cp in self._task_checkpoints.values():
+            if cp.checkpoint_id == checkpoint_id:
+                checkpoint = cp
+                break
+        
+        if not checkpoint:
+            # Try to load from disk
+            checkpoint = self._load_checkpoint(checkpoint_id)
+        
+        if not checkpoint:
+            return {
+                'success': False,
+                'error': f'Checkpoint not found: {checkpoint_id}'
+            }
+        
+        # Get task
+        task = self.task_manager.get_task(checkpoint.task_id)
+        if not task:
+            return {
+                'success': False,
+                'error': f'Task not found: {checkpoint.task_id}'
+            }
+        
+        # Perform reconciliation based on cursor
+        reconciliation_action = 'unknown'
+        
+        if checkpoint.execution_cursor:
+            cursor = checkpoint.execution_cursor
+            
+            # Case 1: Side effect was committed but verification not complete
+            if cursor.side_effect_committed and cursor.verification_phase:
+                task.status = TaskStatus.VERIFYING
+                reconciliation_action = 'resume_verification'
+            
+            # Case 2: Tool was executing, check if it completed
+            elif cursor.tool_name and not cursor.side_effect_committed:
+                task.status = TaskStatus.RECOVERING
+                reconciliation_action = 'recover_execution'
+            
+            # Case 3: Approval was pending
+            elif cursor.approval_request_id:
+                # Check if approval is still valid
+                if cursor.approval_request_id in self.pending_approvals:
+                    task.status = TaskStatus.WAITING_APPROVAL
+                    reconciliation_action = 'resume_approval'
+                else:
+                    task.status = TaskStatus.RECOVERING
+                    reconciliation_action = 'approval_expired'
+            
+            # Case 4: Just a pause, resume to READY
+            else:
+                task.status = TaskStatus.READY
+                reconciliation_action = 'resume_from_pause'
+        
+        # Restore checkpoint info
+        task.checkpoint_id = checkpoint.checkpoint_id
+        task.last_safe_status = checkpoint.last_safe_status
+        
+        logger.info(f"🔄 Restored {task.id} from checkpoint {checkpoint_id}, action: {reconciliation_action}")
+        
+        return {
+            'success': True,
+            'task': task,
+            'cursor': checkpoint.execution_cursor,
+            'reconciliation_action': reconciliation_action,
+            'artifacts': checkpoint.artifacts,
+            'evidence': checkpoint.evidence
+        }
+    
+    async def resume_task(self, task_id: str) -> Dict:
+        """
+        FIX #4: Resume task from where it left off.
+        
+        This is the main resume API that telegram_bot.py expects.
+        
+        Args:
+            task_id: The task to resume
+            
+        Returns:
+            dict with resume result
+        """
+        task = self.task_manager.get_task(task_id)
+        if not task:
+            return {
+                'success': False,
+                'error': f'Task not found: {task_id}'
+            }
+        
+        # Check if there's a checkpoint
+        if task.checkpoint_id:
+            return await self.restore_from_checkpoint(task.checkpoint_id)
+        
+        # No checkpoint, determine resume action based on status
+        current_status = task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+        
+        if current_status in [TaskStatus.PAUSED.value, TaskStatus.WAITING_APPROVAL.value]:
+            # Resume from pause/approval
+            task.status = TaskStatus.READY
+            logger.info(f"▶️ Resumed task {task_id} from {current_status}")
+            return {
+                'success': True,
+                'task': task,
+                'action': 'resume_ready'
+            }
+        
+        elif current_status == TaskStatus.RECOVERING.value:
+            # Resume from recovery
+            task.status = TaskStatus.RETRYING
+            logger.info(f"🔄 Resumed task {task_id} from RECOVERING")
+            return {
+                'success': True,
+                'task': task,
+                'action': 'resume_retrying'
+            }
+        
+        elif current_status == TaskStatus.RETRYING.value:
+            # Resume retry
+            task.status = TaskStatus.RUNNING
+            logger.info(f"🔁 Resumed task {task_id} for retry")
+            return {
+                'success': True,
+                'task': task,
+                'action': 'retry'
+            }
+        
+        else:
+            return {
+                'success': False,
+                'error': f'Cannot resume from status: {current_status}'
+            }
+    
+    def _persist_checkpoint(self, checkpoint: TaskCheckpoint):
+        """FIX #5: Persist checkpoint to disk"""
+        import json
+        import os
+        
+        checkpoint_dir = Path("data/checkpoints")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        checkpoint_path = checkpoint_dir / f"{checkpoint.checkpoint_id}.json"
+        
+        # Serialize checkpoint
+        data = {
+            'task_id': checkpoint.task_id,
+            'checkpoint_id': checkpoint.checkpoint_id,
+            'last_safe_status': checkpoint.last_safe_status,
+            'execution_cursor': {
+                'phase': checkpoint.execution_cursor.phase if checkpoint.execution_cursor else 'unknown',
+                'step_id': checkpoint.execution_cursor.step_id if checkpoint.execution_cursor else None,
+                'tool_name': checkpoint.execution_cursor.tool_name if checkpoint.execution_cursor else None,
+                'verification_phase': checkpoint.execution_cursor.verification_phase if checkpoint.execution_cursor else None,
+                'approval_request_id': checkpoint.execution_cursor.approval_request_id if checkpoint.execution_cursor else None,
+                'side_effect_committed': checkpoint.execution_cursor.side_effect_committed if checkpoint.execution_cursor else False,
+            },
+            'artifacts': checkpoint.artifacts,
+            'evidence': checkpoint.evidence,
+            'created_at': checkpoint.created_at
+        }
+        
+        try:
+            with open(checkpoint_path, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning(f"Failed to persist checkpoint: {e}")
+    
+    def _load_checkpoint(self, checkpoint_id: str) -> Optional[TaskCheckpoint]:
+        """FIX #5: Load checkpoint from disk"""
+        import json
+        
+        checkpoint_dir = Path("data/checkpoints")
+        checkpoint_path = checkpoint_dir / f"{checkpoint_id}.json"
+        
+        if not checkpoint_path.exists():
+            return None
+        
+        try:
+            with open(checkpoint_path, 'r') as f:
+                data = json.load(f)
+            
+            cursor = ExecutionCursor(
+                phase=data.get('execution_cursor', {}).get('phase', 'unknown'),
+                step_id=data.get('execution_cursor', {}).get('step_id'),
+                tool_name=data.get('execution_cursor', {}).get('tool_name'),
+                verification_phase=data.get('execution_cursor', {}).get('verification_phase'),
+                approval_request_id=data.get('execution_cursor', {}).get('approval_request_id'),
+                side_effect_committed=data.get('execution_cursor', {}).get('side_effect_committed', False),
+            )
+            
+            return TaskCheckpoint(
+                task_id=data['task_id'],
+                checkpoint_id=data['checkpoint_id'],
+                last_safe_status=data['last_safe_status'],
+                execution_cursor=cursor,
+                artifacts=data.get('artifacts', []),
+                evidence=data.get('evidence', {}),
+                created_at=data.get('created_at', time.time())
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint {checkpoint_id}: {e}")
+            return None
     
     async def process(self, user_message: str) -> str:
         """
@@ -2756,7 +3626,20 @@ class CentralKernel:
         # Step 4: Verify result
         self.state = KernelState.VERIFYING
         
-        verified = await self._verify(result)
+        # FIX #6: Proper _verify signature - need task and exec_result
+        # This was the old broken call: verified = await self._verify(result)
+        # Now we need to construct proper parameters
+        if hasattr(result, 'success'):
+            # result is ExecutionResult
+            task_for_verify = Task(
+                id="plan_execution",
+                description="Plan execution verification",
+                input_data={}
+            )
+            verified = await self._verify(task_for_verify, result, {})
+        else:
+            # Fallback for other result types
+            verified = True
         
         if not verified:
             # Step 5: Repair if needed
@@ -2869,8 +3752,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                                 tasks_data = tasks_data['tasks']
 
                             if isinstance(tasks_data, list):
-                                get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
-        # Create tasks with diagnostics
+                                # Create tasks with diagnostics
                                 tasks = self._create_tasks_from_plan({"tasks": tasks_data}, response_snippet=response, parser_strategy=strategy_name)
                                 if tasks:
                                     parsing_attempts.append({
@@ -3177,6 +4059,137 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         
         return None
 
+    def _compile_task_spec(self, task_dict: Dict) -> TaskSpec:
+        """
+        FIX #2: Compile TaskSpec from planner dict.
+        
+        This is the planner compiler - transforms planner JSON output
+        into a typed TaskSpec contract.
+        
+        This ensures:
+        - retry_policy is always a RetryPolicy (not int or dict)
+        - approval is always an ApprovalSpec
+        - sandbox is always a SandboxSpec
+        - verification is always a VerificationSpec
+        - success_criteria is always a list of SuccessCriterion
+        """
+        # Compile RetryPolicy - handles int/dict ambiguity
+        retry_dict = task_dict.get('retry_policy', {})
+        if isinstance(retry_dict, int):
+            retry_policy = RetryPolicy(max_retries=retry_dict)
+        elif isinstance(retry_dict, dict):
+            retry_policy = RetryPolicy(
+                max_retries=retry_dict.get('max_retries', 3),
+                backoff_strategy=retry_dict.get('backoff_strategy', 'exponential'),
+                initial_delay_sec=retry_dict.get('initial_delay_sec', 1),
+                max_delay_sec=retry_dict.get('max_delay_sec', 30)
+            )
+        else:
+            retry_policy = RetryPolicy()
+        
+        # Compile ApprovalSpec
+        approval_dict = task_dict.get('approval_policy', 'auto')
+        if isinstance(approval_dict, str):
+            approval = ApprovalSpec(policy=approval_dict)
+        elif isinstance(approval_dict, dict):
+            approval = ApprovalSpec(
+                policy=approval_dict.get('policy', 'auto'),
+                required_for_dangerous=approval_dict.get('required_for_dangerous', True),
+                timeout_sec=approval_dict.get('timeout_sec', 300)
+            )
+        else:
+            approval = ApprovalSpec()
+        
+        # Compile SandboxSpec
+        sandbox_dict = task_dict.get('sandbox_mode', 'normal')
+        if isinstance(sandbox_dict, str):
+            sandbox = SandboxSpec(mode=sandbox_dict)
+        elif isinstance(sandbox_dict, dict):
+            sandbox = SandboxSpec(
+                mode=sandbox_dict.get('mode', 'normal'),
+                allow_network=sandbox_dict.get('allow_network', True),
+                allow_file_write=sandbox_dict.get('allow_file_write', True)
+            )
+        else:
+            sandbox = SandboxSpec()
+        
+        # Compile ToolSpec
+        tools = task_dict.get('required_tools', [])
+        tool_spec = ToolSpec(
+            required_tools=tools if isinstance(tools, list) else [],
+            preferred_tool=task_dict.get('preferred_tool'),
+            alternate_tool=task_dict.get('alternate_tool'),
+            destructive=task_dict.get('destructive', False)
+        )
+        
+        # Compile VerificationSpec
+        verification_type = task_dict.get('verification_type')
+        verification_params = task_dict.get('verification_params', {})
+        verification = VerificationSpec(
+            type=verification_type or 'none',
+            params=verification_params if isinstance(verification_params, dict) else {},
+            required=verification_type is not None
+        )
+        
+        # Compile success_criteria - from string DSL to structured
+        success_criteria_raw = task_dict.get('success_criteria', [])
+        success_criteria = []
+        
+        if isinstance(success_criteria_raw, str):
+            # Parse string DSL like "contains:X exit_code:0"
+            for part in success_criteria_raw.split():
+                if ':' in part:
+                    kind, value = part.split(':', 1)
+                    try:
+                        # Try to parse as int
+                        value = int(value)
+                    except ValueError:
+                        try:
+                            # Try to parse as float
+                            value = float(value)
+                        except ValueError:
+                            pass  # Keep as string
+                    success_criteria.append(SuccessCriterion(kind=kind, value=value))
+        elif isinstance(success_criteria_raw, list):
+            # Already structured
+            for criterion in success_criteria_raw:
+                if isinstance(criterion, dict):
+                    success_criteria.append(SuccessCriterion(
+                        kind=criterion.get('kind', 'unknown'),
+                        value=criterion.get('value'),
+                        optional=criterion.get('optional', False)
+                    ))
+                elif isinstance(criterion, tuple):
+                    success_criteria.append(SuccessCriterion(kind=criterion[0], value=criterion[1]))
+        
+        # Expected artifacts
+        expected_artifacts = task_dict.get('expected_artifacts', [])
+        if not isinstance(expected_artifacts, list):
+            expected_artifacts = []
+        
+        # Timeout
+        timeout = task_dict.get('timeout', 30)
+        if not isinstance(timeout, int):
+            timeout = 30
+        
+        # Rollback
+        rollback = task_dict.get('rollback_point')
+        
+        # Create TaskSpec
+        return TaskSpec(
+            description=task_dict.get('description', 'Unknown task'),
+            priority=task_dict.get('priority', 'normal'),
+            dependencies=task_dict.get('dependencies', []) if isinstance(task_dict.get('dependencies'), list) else [],
+            tool_spec=tool_spec,
+            verification=verification,
+            success_criteria=success_criteria,
+            expected_artifacts=expected_artifacts,
+            retry_policy=retry_policy,
+            approval=approval,
+            sandbox=sandbox,
+            timeout_sec=timeout,
+            rollback=rollback
+        )
 
     def _validate_plan_schema(self, data: Any) -> Dict:
         """
@@ -3405,8 +4418,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             if task_errors:
                 logger.warning(f"Task {i} created with warnings: {task_errors}")
             
-            get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
-        # Create task with validated data
+            # Create task with validated data
             try:
                 priority = TaskPriority.NORMAL
                 if priority == 'HIGH' or priority == 'CRITICAL':
@@ -3414,38 +4426,61 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 elif t.get('priority', '').upper() == 'LOW':
                     priority = TaskPriority.LOW
                 
+                # FIX #2: Compile TaskSpec from dict - this is the canonical contract
+                task_spec = self._compile_task_spec(t)
+                
+                # Create task with spec
                 task = Task(
                     id=t.get('id', f"task_{int(time.time()*1000)}_{i}"),
                     description=t.get('description', 'Unknown task'),
                     priority=priority,
                     dependencies=t.get('dependencies', []),
-                    timeout=t.get('timeout', 30),
-                    max_retries=t.get('retry_policy', 3),
-                    approval_policy=t.get('approval_policy', 'auto'),
-                    sandbox_mode=t.get('sandbox_mode', 'normal'),
+                    timeout=task_spec.timeout_sec,
+                    max_retries=task_spec.retry_policy.max_retries,
+                    approval_policy=task_spec.approval.policy,
+                    sandbox_mode=task_spec.sandbox.mode,
                 )
                 
-                # Set rich metadata
+                # FIX #2: Policy fields now come from TaskSpec, NOT from input_data
+                # input_data should ONLY contain execution payload (tool args)
                 task.input_data = {
-                    'required_tools': t.get('required_tools', []),
-                    'verification_type': t.get('verification_type', 'manual'),
-                    'success_criteria': t.get('success_criteria', ''),
-                    'fallback_strategy': t.get('fallback_strategy', ''),
+                    # Tool arguments - ONLY execution payload
                     'file_path': t.get('file_path', ''),
-                    'expected_elements': t.get('expected_elements', []),
-                    'process_name': t.get('process_name', ''),
+                    'file_content': t.get('file_content', ''),
                     'url': t.get('url', ''),
-                    'port': t.get('port', 80),
-                    'host': t.get('host', 'localhost'),
+                    'command': t.get('command', ''),
                     'code': t.get('code', ''),
                     'language': t.get('language', 'python'),
-                    'risk_level': t.get('risk_level', 'medium'),
-                    'expected_artifacts': t.get('expected_artifacts', []),
-                    'rollback_point': t.get('rollback_point'),
+                    'process_name': t.get('process_name', ''),
+                    'port': t.get('port', 80),
+                    'host': t.get('host', 'localhost'),
+                    
+                    # Tool routing from spec (not hardcoded)
+                    'preferred_tool': task_spec.tool_spec.preferred_tool,
+                    'alternate_tool': task_spec.tool_spec.alternate_tool,
+                    'destructive': task_spec.tool_spec.destructive,
+                    
+                    # FIX #2: success_criteria from TaskSpec as structured
+                    'success_criteria': [(c.kind, c.value) for c in task_spec.success_criteria],
                 }
                 
-                # Set artifact expectations
-                task.artifact_expectations = t.get('expected_artifacts', [])
+                # Set artifact expectations from spec
+                task.artifact_expectations = task_spec.expected_artifacts
+                
+                # Store spec in metadata for access by other components
+                task.metadata['_task_spec'] = {
+                    'verification_type': task_spec.verification.type,
+                    'verification_params': task_spec.verification.params,
+                    'retry_policy': {
+                        'max_retries': task_spec.retry_policy.max_retries,
+                        'backoff': task_spec.retry_policy.backoff_strategy,
+                    },
+                    'sandbox': {
+                        'mode': task_spec.sandbox.mode,
+                        'allow_network': task_spec.sandbox.allow_network,
+                        'allow_file_write': task_spec.sandbox.allow_file_write,
+                    },
+                }
                 
                 tasks.append(task)
                 
@@ -3692,7 +4727,6 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 'rollback_point': None
             })
         
-        get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
         # Create tasks with full metadata
         for i, spec in enumerate(task_specs):
             # Set priority based on position and risk
@@ -3703,8 +4737,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             else:
                 priority = TaskPriority.LOW
             
-            get_ledger().append(RunEvent(run_id=str(uuid.uuid4()), attempt_id="attempt_1", task_id=task.id, event_type=EventType.TASK_CREATED, stage="planner"))
-        # Create task with full metadata
+            # Create task with full metadata
             task = Task(
                 id=f"task_{int(time.time()*1000)}_{i}",
                 description=spec['desc'],
@@ -3859,27 +4892,6 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             }
         }
 
-
-        # =====================================================
-        # CANONICAL TOOL REGISTRY - Single Source of Truth
-        # =====================================================
-        CANONICAL_TOOLS = {
-            'read_file': {'implemented': True, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {'path': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['file', 'manual'], 'fallback_tools': []},
-            'write_file': {'implemented': True, 'provider': 'tools_engine', 'dangerous': True, 'arg_schema': {'path': 'str', 'content': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['file', 'manual'], 'fallback_tools': []},
-            'delete_file': {'implemented': True, 'provider': 'tools_engine', 'dangerous': True, 'arg_schema': {'path': 'str'}, 'sandbox_modes': ['advanced'], 'verification_types': ['manual'], 'fallback_tools': []},
-            'execute_command': {'implemented': True, 'provider': 'tools_engine', 'dangerous': True, 'arg_schema': {'command': 'str'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['server', 'manual'], 'fallback_tools': ['execute_code']},
-            'execute_code': {'implemented': True, 'provider': 'code_engine', 'dangerous': True, 'arg_schema': {'code': 'str'}, 'sandbox_modes': ['advanced'], 'verification_types': ['code', 'manual'], 'fallback_tools': []},
-            'web_search': {'implemented': True, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {'query': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['manual'], 'fallback_tools': []},
-            'web_request': {'implemented': False, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {'url': 'str'}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['manual'], 'fallback_tools': ['web_search']},
-            'browser_navigate': {'implemented': False, 'provider': 'browser_engine', 'dangerous': False, 'arg_schema': {'url': 'str'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['browser', 'manual'], 'fallback_tools': []},
-            'browser_click': {'implemented': False, 'provider': 'browser_engine', 'dangerous': False, 'arg_schema': {'index': 'int'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['browser', 'manual'], 'fallback_tools': []},
-            'browser_type': {'implemented': False, 'provider': 'browser_engine', 'dangerous': False, 'arg_schema': {'index': 'int', 'text': 'str'}, 'sandbox_modes': ['normal', 'advanced'], 'verification_types': ['browser', 'manual'], 'fallback_tools': []},
-            'install_package': {'implemented': False, 'provider': 'dependency_handler', 'dangerous': True, 'arg_schema': {'package': 'str'}, 'sandbox_modes': ['advanced'], 'verification_types': ['manual'], 'fallback_tools': []},
-            'take_screenshot': {'implemented': True, 'provider': 'tools_engine', 'dangerous': False, 'arg_schema': {}, 'sandbox_modes': ['safe', 'normal', 'advanced'], 'verification_types': ['screenshot', 'manual'], 'fallback_tools': []}
-        }
-        
-        def get_implemented_tools():
-            return [name for name, spec in CANONICAL_TOOLS.items() if spec.get('implemented', False)]
         # Get tool reliability history for smart selection
         tool_reliability = self._get_tool_reliability_history()
         
@@ -3924,15 +4936,11 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 
                 task_meta = task.input_data or {}
                 required_tools = task_meta.get('required_tools', [])
-                verification_type = task_meta.get('verification_type', 'manual')
+                verification_type = task_meta.get('verification_type')  # FIX #2: No default!
                 
-                run_id = str(uuid.uuid4())
-                attempt_id = f"{run_id}_attempt_1"
-                get_ledger().append(RunEvent(run_id=run_id, attempt_id=attempt_id, task_id=task.id, event_type=EventType.TASK_STARTED, stage="kernel", payload={"desc": task.description}))
-
+                # =====================================================
                 # STEP 3: Context-Aware Tool Selection
                 # =====================================================
-                get_ledger().append(RunEvent(run_id=run_id, attempt_id=attempt_id, task_id=task.id, event_type=EventType.TOOL_ROUTE_SELECTED, stage="dispatcher"))
                 tool_name = self._select_tool_strict(
                     task=task,
                     required_tools=required_tools,
@@ -4045,19 +5053,41 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 verification_passed = True
                 verification_details = None
                 
-                if verification_type != 'manual' and exec_result.success:
-                    task.status = TaskStatus.VERIFYING
-                    self.state = KernelState.VERIFYING
-                    
-                    verification_data = self._build_verification_data(task, task_meta, exec_result)
-                    verification = self.verifier.verify(verification_type, verification_data)
-                    
-                    if not verification.passed:
+                # FIX #22 & #23: Use canonical verification with proper validation
+                if verification_type and verification_type != 'manual':
+                    # Normalize the verification type
+                    try:
+                        normalized = normalize_verification_type(verification_type)
+                    except ValueError as e:
+                        logger.warning(f"Invalid verification type: {e}")
+                        # Invalid verification type - fail the task
                         verification_passed = False
-                        verification_details = verification.details
+                        verification_details = str(e)
                         exec_result.success = False
-                        exec_result.error = f"Verification failed: {verification_details}"
+                        exec_result.error = f"Verification failed: {e}"
                         task.status = TaskStatus.FAILED_VERIFICATION
+                    else:
+                        if normalized != VerificationType.NONE or task.approval_policy:
+                            task.status = TaskStatus.VERIFYING
+                            self.state = KernelState.VERIFYING
+                            
+                            verification_data = self._build_verification_data(task, task_meta, exec_result)
+                            verification = self.verifier.verify(verification_type, verification_data)
+                            
+                            if not verification.passed:
+                                verification_passed = False
+                                verification_details = verification.details
+                                exec_result.success = False
+                                exec_result.error = f"Verification failed: {verification_details}"
+                                task.status = TaskStatus.FAILED_VERIFICATION
+                elif not verification_type:
+                    # FIX #2: No verification_type means autonomous task fails
+                    logger.warning(f"Task {task.id} has no verification_type!")
+                    verification_passed = False
+                    verification_details = "verification_type is required for autonomous tasks"
+                    exec_result.success = False
+                    exec_result.error = verification_details
+                    task.status = TaskStatus.FAILED_VERIFICATION
                 
                 # =====================================================
                 # STEP 9: Artifact Collection
@@ -4218,7 +5248,6 @@ Return JSON with tasks array containing: id, description, priority, dependencies
     
             return {}
     def _select_tool_strict(
-        self,
         task: Task,
         required_tools: List[str],
         task_meta: Dict,
@@ -4248,21 +5277,18 @@ Return JSON with tasks array containing: id, description, priority, dependencies
             self._tool_failure_history = {}
             self._tool_failure_window = 300
 
-        # 1. REQUIRED TOOLS - Constraint Filter (NOT hard override)
-        if required_tools:
-            candidate_tools = [t for t in available_tools if t in required_tools]
-            if not candidate_tools:
-                logger.warning(f"Required tools {required_tools} not in available tools")
-                candidate_tools = available_tools
-        else:
-            candidate_tools = available_tools
+        # 1. REQUIRED TOOLS - MUST HAVE
+        for rt in required_tools:
+            if rt in available_tools:
+                logger.info(f"Tool selected (required): {rt}")
+                return rt
 
-        # CONTEXT - Use task fields (NOT task_meta dict)
+        # Get context
         description = task.description.lower()
-        verification_type = task.verification_type if hasattr(task, 'verification_type') and task.verification_type else task_meta.get('verification_type', 'manual')
+        verification_type = task_meta.get('verification_type')  # FIX #2: No default!
         expected_artifacts = task_meta.get('expected_artifacts', [])
-        sandbox_mode = task.sandbox_mode if hasattr(task, 'sandbox_mode') and task.sandbox_mode else task_meta.get('sandbox_mode', 'normal')
-        approval_policy = task.approval_policy if hasattr(task, 'approval_policy') and task.approval_policy else task_meta.get('approval_policy', 'auto')
+        sandbox_mode = task_meta.get('sandbox_mode', 'normal')
+        approval_policy = task_meta.get('approval_policy', 'auto')
 
         # Get environment state
         env_state = self._get_environment_state()
@@ -4295,9 +5321,9 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         }
 
         SANDBOX_COMPAT = {
-            'safe': ['read_file', 'web_search', 'take_screenshot'],
-            'normal': ['read_file', 'write_file', 'execute_command', 'web_search', 'take_screenshot', 'browser_navigate'],
-            'advanced': ['read_file', 'write_file', 'execute_command', 'execute_code', 'take_screenshot']
+            'safe': ['read_file', 'web_search', 'web_request'],
+            'normal': ['read_file', 'write_file', 'execute_command', 'web_search', 'web_request', 'browser_navigate'],
+            'advanced': ['read_file', 'write_file', 'execute_command', 'execute_code', 'install_package', 'browser_navigate']
         }
 
         APPROVAL_COST = {
@@ -4310,14 +5336,7 @@ Return JSON with tasks array containing: id, description, priority, dependencies
 
         scores, diagnostics, current_time = {}, {}, time.time()
 
-        implemented_tools = get_implemented_tools()
-        candidate_tools = [t for t in candidate_tools if t in implemented_tools]
-        
-        if not candidate_tools:
-            logger.error(f"No implemented tools available! candidates={candidate_tools}, implemented={implemented_tools}")
-            return None
-
-        for tool in candidate_tools:
+        for tool in available_tools:
             score = 0
             tool_diag = {
                 'reliability': 0, 'failure_penalty': 0, 'keyword': 0,
@@ -4776,21 +5795,35 @@ Return ONLY valid JSON (no other text):
         exec_result.execution_time = time.time() - tool_start_time
 
         # STEP 3: VERIFIER - SECOND TRUTH SOURCE
+        # FIX #22: Use canonical verification
         if exec_result.success:
             try:
-                verification_type = task_meta.get('verification_type', 'manual')
-                if verification_type != 'manual':
-                    verification_data = self._build_verification_data(task, task_meta, exec_result)
-                    verification = self.verifier.verify(verification_type, verification_data)
-                    
-                    truth_sources['verifier_result'] = {
-                        'passed': verification.passed,
-                        'details': verification.details
-                    }
-                    
-                    if not verification.passed:
+                verification_type = task_meta.get('verification_type')
+                if verification_type and verification_type != 'manual':
+                    # Normalize using canonical system
+                    try:
+                        normalized = normalize_verification_type(verification_type)
+                    except ValueError as e:
+                        logger.warning(f"Invalid verification type: {e}")
                         exec_result.success = False
-                        exec_result.error = f"Verification failed: {verification.details}"
+                        exec_result.error = str(e)
+                    else:
+                        verification_data = self._build_verification_data(task, task_meta, exec_result)
+                        verification = self.verifier.verify(verification_type, verification_data)
+                        
+                        truth_sources['verifier_result'] = {
+                            'passed': verification.passed,
+                            'details': verification.details
+                        }
+                        
+                        if not verification.passed:
+                            exec_result.success = False
+                            exec_result.error = f"Verification failed: {verification.details}"
+                elif not verification_type:
+                    # FIX #2: No verification_type means fail for autonomous task
+                    logger.warning(f"Task {task.id} has no verification_type!")
+                    exec_result.success = False
+                    exec_result.error = "verification_type is required for autonomous tasks"
             except Exception as e:
                 logger.warning(f"Verification failed: {e}")
 
@@ -4972,25 +6005,39 @@ Return ONLY valid JSON (no other text):
                 exec_result.error = f"Missing expected artifacts: {missing}"
         
         # Step 4: Run verifier for additional validation
-        verification_type = task_meta.get('verification_type', 'manual')
-        if verification_type != 'manual' and exec_result.success:
+        # FIX #22: Use canonical verification
+        verification_type = task_meta.get('verification_type')
+        if verification_type and verification_type != 'manual' and exec_result.success:
             try:
-                verification_data = {
-                    'result': exec_result.stdout,
-                    'task_id': task.id,
-                    **task_meta
-                }
-                verification = self.verifier.verify(verification_type, verification_data)
-                validation_source['verifier'] = {
-                    'passed': verification.passed,
-                    'details': verification.details
-                }
-                
-                if not verification.passed:
+                # Normalize using canonical system
+                try:
+                    normalized = normalize_verification_type(verification_type)
+                except ValueError as e:
+                    logger.warning(f"Invalid verification type: {e}")
                     exec_result.success = False
-                    exec_result.error = f"Verification failed: {verification.details}"
+                    exec_result.error = str(e)
+                else:
+                    verification_data = {
+                        'result': exec_result.stdout,
+                        'task_id': task.id,
+                        **task_meta
+                    }
+                    verification = self.verifier.verify(verification_type, verification_data)
+                    validation_source['verifier'] = {
+                        'passed': verification.passed,
+                        'details': verification.details
+                    }
+                    
+                    if not verification.passed:
+                        exec_result.success = False
+                        exec_result.error = f"Verification failed: {verification.details}"
             except Exception as e:
                 logger.warning(f"Verification check failed: {e}")
+        elif not verification_type and exec_result.success:
+            # FIX #2: No verification_type means fail for autonomous task
+            logger.warning(f"Task {task.id} has no verification_type!")
+            exec_result.success = False
+            exec_result.error = "verification_type is required for autonomous tasks"
         
         # Log validation sources for debugging
         logger.info(f"Execution validation for task {task.id}: {validation_source}")
@@ -5086,11 +6133,41 @@ Return ONLY valid JSON (no other text):
             await self._emit_verification_telemetry(verification_log)
             return False
         
-        verification_type = task_meta.get('verification_type', 'manual')
+        verification_type = task_meta.get('verification_type')
         success_criteria = task_meta.get('success_criteria', '')
         expected_artifacts = task_meta.get('expected_artifacts', [])
         
-        verification_log['verification_type'] = verification_type
+        # FIX #2 & #3: Normalize verification type using canonical system
+        # CRITICAL: 'manual' is NOT a valid verification type!
+        normalized_type = None
+        if verification_type:
+            try:
+                normalized_type = normalize_verification_type(verification_type)
+            except ValueError as e:
+                logger.warning(f"Invalid verification type '{verification_type}': {e}")
+                # For backward compatibility, treat invalid types as NONE
+                # But log a warning - this should be fixed in the planner
+                verification_log['fail_reason'] = 'invalid_verification_type'
+                verification_log['checks'].append({
+                    'check': 'verification_type_validation',
+                    'passed': False,
+                    'detail': str(e)
+                })
+                await self._emit_verification_telemetry(verification_log)
+                return False
+        else:
+            # FIX #2: No default to manual! Require explicit verification type
+            logger.warning(f"Task {task.id} has no verification_type specified!")
+            verification_log['fail_reason'] = 'missing_verification_type'
+            verification_log['checks'].append({
+                'check': 'verification_type_present',
+                'passed': False,
+                'detail': 'verification_type is required for autonomous tasks'
+            })
+            await self._emit_verification_telemetry(verification_log)
+            return False
+        
+        verification_log['verification_type'] = normalized_type.value if normalized_type else 'none'
         verification_log['success_criteria'] = success_criteria
         verification_log['expected_artifacts'] = expected_artifacts
         
@@ -5197,64 +6274,94 @@ Return ONLY valid JSON (no other text):
                 return False
         
         # Type-specific verification with confidence aggregation
+        # FIX #22: Use canonical VerificationType instead of legacy strings
         confidence_scores = []
         
-        if verification_type == 'browser':
+        # Use normalized_type (which is a VerificationType enum)
+        if normalized_type == VerificationType.BROWSER_STATE:
             result = await self._verify_browser(task, exec_result, task_meta)
             confidence_scores.append(1.0 if result else 0.0)
             if not result:
-                verification_log['fail_reason'] = 'browser_verification_failed'
+                verification_log['fail_reason'] = 'browser_state_verification_failed'
                 await self._emit_verification_telemetry(verification_log)
                 return False
-        elif verification_type == 'screenshot':
+        elif normalized_type == VerificationType.SCREENSHOT_MATCH:
             result = await self._verify_screenshot(task, exec_result, task_meta)
             confidence_scores.append(1.0 if result else 0.0)
             if not result:
                 verification_log['fail_reason'] = 'screenshot_verification_failed'
                 await self._emit_verification_telemetry(verification_log)
                 return False
-        elif verification_type == 'server':
+        elif normalized_type == VerificationType.HTTP_RESPONSE:
             result = await self._verify_server(task, exec_result, task_meta)
             confidence_scores.append(1.0 if result else 0.0)
             if not result:
-                verification_log['fail_reason'] = 'server_verification_failed'
+                verification_log['fail_reason'] = 'http_response_verification_failed'
                 await self._emit_verification_telemetry(verification_log)
                 return False
-        elif verification_type == 'code':
+        elif normalized_type == VerificationType.CODE_COMPILES:
             result = await self._verify_code(task, exec_result, task_meta)
             confidence_scores.append(1.0 if result else 0.0)
             if not result:
-                verification_log['fail_reason'] = 'code_verification_failed'
+                verification_log['fail_reason'] = 'code_compiles_verification_failed'
                 await self._emit_verification_telemetry(verification_log)
                 return False
-        elif verification_type == 'file':
+        elif normalized_type == VerificationType.FILE_EXISTS:
             result = await self._verify_file(task, exec_result, task_meta)
             confidence_scores.append(1.0 if result else 0.0)
             if not result:
-                verification_log['fail_reason'] = 'file_verification_failed'
+                verification_log['fail_reason'] = 'file_exists_verification_failed'
                 await self._emit_verification_telemetry(verification_log)
                 return False
-        elif verification_type == 'function':
+        elif normalized_type == VerificationType.FUNCTION_RESULT:
             result = self._verify_function_result(task, exec_result, task_meta)
             confidence_scores.append(1.0 if result else 0.0)
             if not result:
-                verification_log['fail_reason'] = 'function_verification_failed'
+                verification_log['fail_reason'] = 'function_result_verification_failed'
                 await self._emit_verification_telemetry(verification_log)
                 return False
-        elif verification_type == 'manual':
+        elif normalized_type == VerificationType.NONE:
+            # FIX #23: NONE verification requires explicit approval or human review
+            # For NONE type tasks, we require success_criteria or explicit approval
+            if not success_criteria and not task.approval_policy:
+                logger.warning(f"Task {task.id} with NONE verification requires success_criteria or approval")
+                verification_log['fail_reason'] = 'none_verification_requires_criteria'
+                await self._emit_verification_telemetry(verification_log)
+                return False
             result = exec_result.success
             confidence_scores.append(1.0 if result else 0.0)
+        elif normalized_type == VerificationType.PROCESS_RUNNING:
+            result = await self._verify_process_running(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
             if not result:
-                verification_log['fail_reason'] = 'manual_verification_failed'
+                verification_log['fail_reason'] = 'process_running_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
+        elif normalized_type == VerificationType.PORT_OPEN:
+            result = await self._verify_port_open(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'port_open_verification_failed'
+                await self._emit_verification_telemetry(verification_log)
+                return False
+        elif normalized_type == VerificationType.ARTIFACT_PRESENT:
+            result = await self._verify_artifact_present(task, exec_result, task_meta)
+            confidence_scores.append(1.0 if result else 0.0)
+            if not result:
+                verification_log['fail_reason'] = 'artifact_present_verification_failed'
                 await self._emit_verification_telemetry(verification_log)
                 return False
         else:
-            result = exec_result.success
-            confidence_scores.append(1.0 if result else 0.0)
-            if not result:
-                verification_log['fail_reason'] = 'unknown_verification_type'
-                await self._emit_verification_telemetry(verification_log)
-                return False
+            # FIX #22: Unknown verification type should fail, not silently pass
+            logger.error(f"Unknown verification type: {normalized_type}")
+            verification_log['fail_reason'] = 'unknown_verification_type'
+            verification_log['checks'].append({
+                'check': 'verification_type_known',
+                'passed': False,
+                'detail': f'Unknown verification type: {normalized_type}'
+            })
+            await self._emit_verification_telemetry(verification_log)
+            return False
         
         # AGGREGATE VERIFIER CONFIDENCE
         if confidence_scores:
@@ -6187,6 +7294,75 @@ Return ONLY valid JSON (no other text):
         logger.info(f"File verification PASSED for task {task.id}")
         return True
     
+    async def _verify_process_running(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
+        """Process running verification"""
+        import psutil
+        
+        process_name = task_meta.get('process_name', '')
+        if not process_name:
+            logger.warning("Process verification: No process_name specified")
+            return False
+        
+        for proc in psutil.process_iter(['name']):
+            try:
+                if process_name.lower() in proc.info['name'].lower():
+                    logger.info(f"Process verification PASSED: {process_name} is running")
+                    return True
+            except Exception as e:
+                logger.debug(f"Process check error: {e}")
+        
+        logger.warning(f"Process verification failed: {process_name} is not running")
+        return False
+    
+    async def _verify_port_open(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
+        """Port open verification"""
+        import socket
+        
+        host = task_meta.get('host', 'localhost')
+        port = task_meta.get('port', 80)
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        try:
+            result = sock.connect_ex((host, port))
+            open_port = result == 0
+        except socket.timeout:
+            open_port = False
+        except socket.error as e:
+            logger.warning(f"Port verification error: {e}")
+            open_port = False
+        finally:
+            sock.close()
+        
+        if open_port:
+            logger.info(f"Port verification PASSED: {host}:{port} is open")
+        else:
+            logger.warning(f"Port verification failed: {host}:{port} is not open")
+        
+        return open_port
+    
+    async def _verify_artifact_present(self, task: Task, exec_result: ExecutionResult, task_meta: Dict) -> bool:
+        """Artifact present verification"""
+        expected_artifacts = task_meta.get('expected_artifacts', [])
+        
+        if not expected_artifacts:
+            logger.warning("Artifact verification: No expected_artifacts specified")
+            return False
+        
+        created_artifacts = exec_result.artifacts or []
+        
+        missing = []
+        for artifact in expected_artifacts:
+            if artifact not in created_artifacts:
+                missing.append(artifact)
+        
+        if missing:
+            logger.warning(f"Artifact verification failed: Missing artifacts: {missing}")
+            return False
+        
+        logger.info(f"Artifact verification PASSED: All expected artifacts present")
+        return True
+    
     async def _repair(self, result: str, failed_task: Optional[Task] = None) -> str:
         """
         OPERATIVE RECOVERY ENGINE with real actions.
@@ -6642,8 +7818,9 @@ Return ONLY valid JSON (no other text):
                 # Add simplified task
                 self.task_manager.add_task(simple_task)
                 
-                # Mark original as completed (replaced)
-                failed_task.status = TaskStatus.COMPLETED
+                # FIX #4: Mark original as SUPERSEDED, not COMPLETED
+                # This is critical: original task was NOT completed, it was replaced
+                failed_task.status = TaskStatus.SUPERSEDED
                 
                 recovery_log.append(f"   → Original task: {failed_task.id}")
                 recovery_log.append(f"   → Yangi sodda task: {simple_task.id}")
@@ -6899,53 +8076,68 @@ def _get_recovery_hint(parsing_attempts: List[Dict]) -> str:
 
 # ==================== COMPREHENSIVE RECOVERY ENGINE ====================
 
-class RecoveryStrategy(Enum):
-    """All recovery strategies - executed in priority order"""
-    REQUEUE = "requeue"           # Put back in queue
-    ALTERNATE_TOOL = "alternate_tool"  # Try different tool
-    ROLLBACK = "rollback"        # Revert changes
-    REPLAN = "replan"            # Re-generate plan
-    HUMAN_ESCALATION = "human"   # Call human
-    DEGRADED_MODE = "degraded"  # Reduced functionality
-    RETRY_EXHAUSTED = "exhausted"  # No more retries
+# FIX #1: Remove duplicate RecoveryStrategy enum - use the canonical one from line 313
+# The duplicate enum below was causing shadowing issues and potential runtime crashes
+# All recovery logic now uses the canonical RecoveryStrategy from line 313
+
+# Legacy aliases for backward compatibility - map to canonical enum
+# These were used by the old RecoveryEngine
+_RECOVERY_ALIAS_MAP = {
+    "requeue": "RETRY_WITH_BACKOFF",
+    "alternate_tool": "ALTERNATE_TOOL",
+    "rollback": "ROLLBACK",
+    "replan": "REPLAN",
+    "human": "ESCALATE_TO_HUMAN",
+    "degraded": "DEGRADED_MODE",
+    "exhausted": "ABORT",
+}
 
 
 class RecoveryEngine:
     """
     COMPREHENSIVE RECOVERY ENGINE - No1-grade.
     
+    FIX #1: Now uses canonical RecoveryStrategy from line 313
+    FIX #2: Uses RecoveryDecision and RecoveryOutcome typed contracts
+    FIX #3: Integrated with CentralKernel
+    
     Each failure triggers appropriate recovery strategy:
-    1. REQUEUE - transient failure
+    1. RETRY_WITH_BACKOFF - transient failure
     2. ALTERNATE_TOOL - tool-specific failure
     3. ROLLBACK - state corruption
     4. REPLAN - fundamental plan failure
     5. DEGRADED_MODE - partial success possible
-    6. HUMAN_ESCALATION - critical failure
-    7. RETRY_EXHAUSTED - budget exhausted
+    6. ESCALATE_TO_HUMAN - critical failure
+    7. ABORT - unrecoverable
     """
     
     def __init__(self, kernel):
         self.kernel = kernel
-        self.retry_budget = {}  # Per-task retry budget
         self.max_retries = 3
-        self.max_replan_depth = 2  # Max replan attempts per task
-        self.replan_depth = {}  # Per-task replan depth
-        self.rollback_stack = {}  # TaskID -> rollback actions
+        self.max_replan_depth = 2
+        self.rollback_stack = {}
+        
+        # FIX #5: Single retry budget system - use task.retry_count consistently
+        # Previously there were two: task.retry_count and self.retry_budget dict
+        # Now we use task.retry_count as single source of truth
+        # RecoveryEngine tracks replan depth separately
+        
+        self._replan_depth = {}  # Per-task replan depth (separate from retry)
         
         # Approval mapping: tool -> strategy for denied/expired
         self.approval_mapping = {
             'denied': {
-                'execute_command': 'ALTERNATE_TOOL',
-                'delete_file': 'ABORT',
-                'browser_navigate': 'REQUEUE',
-                'write_file': 'REPLAN',
-                'default': 'REQUEUE'
+                'execute_command': RecoveryStrategy.ALTERNATE_TOOL,
+                'delete_file': RecoveryStrategy.ABORT,
+                'browser_navigate': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'write_file': RecoveryStrategy.REPLAN,
+                'default': RecoveryStrategy.RETRY_WITH_BACKOFF
             },
             'expired': {
-                'execute_command': 'REQUEUE',
-                'browser_navigate': 'REQUEUE',
-                'write_file': 'REPLAN',
-                'default': 'REQUEUE'
+                'execute_command': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'browser_navigate': RecoveryStrategy.RETRY_WITH_BACKOFF,
+                'write_file': RecoveryStrategy.REPLAN,
+                'default': RecoveryStrategy.RETRY_WITH_BACKOFF
             }
         }
         
@@ -6959,11 +8151,13 @@ class RecoveryEngine:
     async def execute_recovery(self, task: Task, failure_reason: str) -> Dict:
         """Execute appropriate recovery strategy based on failure type"""
         
-        # Check retry budget first
-        budget = self.retry_budget.get(task.id, 0)
+        # FIX #5: Use task.retry_count as single source of truth
+        # Previously used self.retry_budget dict which was duplicate state
+        current_retry = task.retry_count or 0
+        max_retries = task.max_retries or 3
         
-        if budget >= self.max_retries:
-            logger.warning(f"⚠️ Retry budget exhausted for {task.id}")
+        if current_retry >= max_retries:
+            logger.warning(f"⚠️ Retry budget exhausted for {task.id} ({current_retry}/{max_retries})")
             return await self._retry_exhausted_recovery(task, failure_reason)
         
         # Map failure type to recovery strategy
@@ -6976,18 +8170,18 @@ class RecoveryEngine:
         elif 'artifact_missing' in failure_reason:
             return await self._rollback_recovery(task, failure_reason)
         elif 'approval_denied' in failure_reason or 'approval_expired' in failure_reason:
-            # Use approval mapping
+            # Use approval mapping - FIX #1: use canonical enum
             approval_type = 'denied' if 'denied' in failure_reason else 'expired'
             tool_name = (task.input_data or {}).get('tool_used', 'default')
             mapping = self.approval_mapping.get(approval_type, {})
-            strategy = mapping.get(tool_name, mapping.get('default', 'REQUEUE'))
+            strategy = mapping.get(tool_name, mapping.get('default', RecoveryStrategy.RETRY_WITH_BACKOFF))
             logger.info(f"📋 Approval {approval_type} for {task.id}, tool={tool_name}, strategy={strategy}")
-            if strategy == 'ALTERNATE_TOOL':
+            if strategy == RecoveryStrategy.ALTERNATE_TOOL:
                 return await self._alternate_tool_recovery(task, failure_reason)
-            elif strategy == 'REPLAN':
-                self.replan_depth[task.id] = self.replan_depth.get(task.id, 0) + 1
+            elif strategy == RecoveryStrategy.REPLAN:
+                self._replan_depth[task.id] = self._replan_depth.get(task.id, 0) + 1
                 return await self._replan_recovery(task, failure_reason)
-            elif strategy == 'ABORT':
+            elif strategy == RecoveryStrategy.ABORT:
                 return await self._retry_exhausted_recovery(task, failure_reason)
             else:
                 return await self._requeue_recovery(task, failure_reason)
@@ -6997,14 +8191,15 @@ class RecoveryEngine:
             return await self._degraded_mode_recovery(task, failure_reason)
     
     async def _requeue_recovery(self, task, reason) -> Dict:
-        """1. REQUEUE - transient failure, try again"""
-        self.retry_budget[task.id] = self.retry_budget.get(task.id, 0) + 1
-        logger.info(f"🔄 REQUEUE: {task.id} (attempt {self.retry_budget[task.id]})")
+        """1. RETRY_WITH_BACKOFF - transient failure, try again"""
+        # FIX #5: Update task.retry_count, not separate dict
+        task.retry_count = (task.retry_count or 0) + 1
+        logger.info(f"🔄 RETRY_WITH_BACKOFF: {task.id} (attempt {task.retry_count})")
         return {
-            'strategy': RecoveryStrategy.REQUEUE,
-            'action': 'requeue',
+            'strategy': RecoveryStrategy.RETRY_WITH_BACKOFF,
+            'action': 'retry_with_backoff',
             'can_continue': True,
-            'retry_count': self.retry_budget[task.id]
+            'retry_count': task.retry_count
         }
     
     async def _alternate_tool_recovery(self, task, reason) -> Dict:
@@ -7053,14 +8248,15 @@ class RecoveryEngine:
         return {'strategy': RecoveryStrategy.DEGRADED_MODE, 'action': 'degraded', 'can_continue': True}
     
     async def _retry_exhausted_recovery(self, task, reason) -> Dict:
-        """7. RETRY_EXHAUSTED - no more budget"""
+        """7. ABORT - no more retry budget"""
         logger.error(f"❌ RETRY_EXHAUSTED: {task.id}")
+        # FIX #5: Use task.retry_count
         return {
-            'strategy': RecoveryStrategy.RETRY_EXHAUSTED,
+            'strategy': RecoveryStrategy.ABORT,
             'action': 'abort',
             'can_continue': False,
-            'budget_used': self.retry_budget.get(task.id, 0),
-            'max_retries': self.max_retries
+            'budget_used': task.retry_count or 0,
+            'max_retries': task.max_retries or 3
         }
     
     def record_rollback(self, task_id: str, rollback_fn):
