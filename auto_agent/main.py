@@ -155,14 +155,28 @@ class OmniAgent:
         self.benchmark_suite = create_benchmark_suite(self.brain)
         self.regression_suite = create_regression_suite()
         
+        # Connect regression_suite to patch_lifecycle internally
+        self.regression_suite.patch_lifecycle.set_benchmark_suite(self.benchmark_suite)
+        
         # Connect to kernel
         self.kernel.benchmark_suite = self.benchmark_suite
         self.kernel.regression_suite = self.regression_suite
         
-        # 11. Self-Improvement
-        logger.info("🔄 Initializing Self-Improvement Engine...")
+        # 11. Self-Improvement (INTEGRATED with Patch Lifecycle)
+        logger.info("🔄 Initializing Self-Improvement Engine with Patch Lifecycle...")
         from agent.self_improvement import create_self_improvement_engine
         self.self_improvement = create_self_improvement_engine()
+        
+        # CRITICAL: Connect self_improvement with regression_suite and benchmark_suite
+        # This enables the complete patch pipeline:
+        # patch_apply -> unit_tests -> regression_suite -> benchmark_suite -> compare_baseline -> decision -> rollback
+        self.self_improvement.set_regression_suite(self.regression_suite)
+        self.self_improvement.set_benchmark_suite(self.benchmark_suite)
+        
+        # Also connect regression_suite to self_improvement (bidirectional)
+        if hasattr(self.regression_suite, 'patch_lifecycle'):
+            # Patch lifecycle is already integrated
+            pass
         
         # Connect to kernel
         self.kernel.self_improvement = self.self_improvement

@@ -11,6 +11,7 @@ Features:
 - A/B testing
 - Release snapshots
 - Rollback
+- INTEGRATED with PatchLifecycle from regression_suite.py
 """
 import os
 import json
@@ -25,6 +26,14 @@ from collections import defaultdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Import PatchLifecycle from regression_suite for integrated patch pipeline
+try:
+    from regression_suite import PatchLifecycle, RegressionSuite
+    PATCH_LIFECYCLE_AVAILABLE = True
+except ImportError:
+    PATCH_LIFECYCLE_AVAILABLE = False
+    logger.warning("PatchLifecycle not available - using legacy mode")
 
 
 # ==================== DATA CLASSES ====================
@@ -1751,7 +1760,11 @@ class ExperimentManager:
 
 class SelfImprovementEngine:
     """
-    Complete self-improvement system
+    Complete self-improvement system with INTEGRATED Patch Lifecycle
+    
+    Now fully integrated with regression_suite.py PatchLifecycle:
+    - patch_apply -> unit_tests -> regression_suite -> benchmark_suite 
+    - compare_baseline -> decision -> rollback_if_needed
     """
     
     def __init__(self, workspace_dir: str = None):
@@ -1764,7 +1777,144 @@ class SelfImprovementEngine:
         self.snapshot_manager = SnapshotManager()
         self.experiment_manager = ExperimentManager()
         
+        # INTEGRATED: Patch Lifecycle from regression_suite.py
+        if PATCH_LIFECYCLE_AVAILABLE:
+            self.patch_lifecycle = PatchLifecycle(storage_dir=str(self.workspace_dir / "data" / "patches"))
+            logger.info("🔄 Self-Improvement Engine initialized with PatchLifecycle")
+        else:
+            self.patch_lifecycle = None
+            logger.warning("⚠️ Self-Improvement Engine initialized WITHOUT PatchLifecycle")
+        
+        # Reference to benchmark and regression suites (set externally)
+        self.benchmark_suite = None
+        self.regression_suite = None
+        
         logger.info("🚀 Self-Improvement Engine initialized")
+    
+    def set_benchmark_suite(self, suite):
+        """Set benchmark suite for patch pipeline"""
+        self.benchmark_suite = suite
+        if self.patch_lifecycle:
+            self.patch_lifecycle.set_benchmark_suite(suite)
+    
+    def set_regression_suite(self, suite):
+        """Set regression suite for patch pipeline"""
+        self.regression_suite = suite
+        if self.patch_lifecycle:
+            self.patch_lifecycle.set_regression_suite(suite)
+    
+    # ==================== INTEGRATED PATCH PIPELINE ====================
+    
+    def run_patch_pipeline(self, patch_id: str, file_path: str, original_code: str,
+                          patched_code: str, reason: str = "") -> Dict:
+        """
+        Run complete patch lifecycle pipeline (INTEGRATED with regression_suite.py)
+        
+        Pipeline steps:
+        1. patch_apply - Apply patch to code
+        2. unit_tests - Run unit tests  
+        3. regression_suite - Run regression tests
+        4. benchmark_suite - Run benchmark tests
+        5. compare_baseline - Compare with baseline
+        6. decision - Make approve/deny decision
+        7. rollback_if_needed - Rollback if failed
+        
+        Args:
+            patch_id: Unique patch identifier
+            file_path: Path to file to patch
+            original_code: Original code
+            patched_code: New patched code
+            reason: Reason for patch
+            
+        Returns:
+            Dict with complete pipeline results
+        """
+        if not self.patch_lifecycle:
+            logger.error("PatchLifecycle not available!")
+            return {"success": False, "error": "PatchLifecycle not available"}
+        
+        # Connect suites if provided
+        if self.regression_suite:
+            self.patch_lifecycle.set_regression_suite(self.regression_suite)
+        if self.benchmark_suite:
+            self.patch_lifecycle.set_benchmark_suite(self.benchmark_suite)
+        
+        # Run complete pipeline
+        return self.patch_lifecycle.run_full_pipeline(
+            patch_id=patch_id,
+            file_path=file_path,
+            original_code=original_code,
+            patched_code=patched_code,
+            reason=reason,
+            auto_rollback_on_fail=True
+        )
+    
+    def apply_and_test_patch(self, patch_id: str, file_path: str, 
+                            original_code: str, patched_code: str,
+                            reason: str = "") -> Dict:
+        """
+        Apply patch and run through complete testing pipeline.
+        
+        This is the main entry point for self-improvement patches.
+        
+        Args:
+            patch_id: Unique patch identifier
+            file_path: Path to file to patch
+            original_code: Original code
+            patched_code: New patched code  
+            reason: Reason for patch
+            
+        Returns:
+            Dict with test results and decision
+        """
+        logger.info(f"🧪 [{patch_id}] Running patch through pipeline...")
+        
+        # Run full pipeline
+        result = self.run_patch_pipeline(
+            patch_id=patch_id,
+            file_path=file_path,
+            original_code=original_code,
+            patched_code=patched_code,
+            reason=reason
+        )
+        
+        # Log result
+        if result.get("success"):
+            logger.info(f"✅ [{patch_id}] Patch APPROVED and applied!")
+        else:
+            logger.warning(f"❌ [{patch_id}] Patch REJECTED: {result.get('issues', [])}")
+        
+        return result
+    
+    def get_patch_status(self, patch_id: str) -> Dict:
+        """Get status of a patch in the pipeline"""
+        if not self.patch_lifecycle:
+            return {}
+        return self.patch_lifecycle.get_patch_status(patch_id)
+    
+    def get_all_patches(self) -> List[Dict]:
+        """Get all patches in the pipeline"""
+        if not self.patch_lifecycle:
+            return []
+        return self.patch_lifecycle.get_all_patches()
+    
+    def rollback_patch(self, patch_id: str, reason: str = "") -> Dict:
+        """Rollback a patch"""
+        if not self.patch_lifecycle:
+            return {"success": False, "error": "PatchLifecycle not available"}
+        return self.patch_lifecycle.rollback(patch_id, reason)
+    
+    def capture_baseline(self) -> Dict:
+        """Capture current state as baseline"""
+        if not self.patch_lifecycle:
+            return {}
+        return self.patch_lifecycle.capture_baseline()
+    
+    def get_pipeline_history(self, limit: int = 20) -> List[Dict]:
+        """Get pipeline execution history"""
+        if not self.patch_lifecycle:
+            return []
+        return self.patch_lifecycle.get_pipeline_history(limit)
     
     def analyze_and_improve(self) -> Dict:
         """Run analysis and propose improvements"""
