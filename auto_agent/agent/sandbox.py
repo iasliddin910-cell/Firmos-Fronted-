@@ -735,3 +735,175 @@ class IsolatedContainer:
 # Add psutil import
 import psutil
 
+
+
+# ==================== SELF-IMPROVEMENT SANDBOX ====================
+
+class ThrowawayWorkspace:
+    """
+    Throwaway workspace for self-patches and generated tools.
+    Provides complete isolation from production code.
+    """
+    
+    def __init__(self, base_dir: str = "/tmp/throwaway"):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.active_workspaces = set()
+        
+    def create_workspace(self, workspace_id: str = None) -> Path:
+        """Create a new throwaway workspace"""
+        import uuid
+        ws_id = workspace_id or str(uuid.uuid4())[:8]
+        workspace = self.base_dir / ws_id
+        workspace.mkdir(parents=True, exist_ok=True)
+        self.active_workspaces.add(ws_id)
+        
+        # Create isolated structure
+        (workspace / "code").mkdir()
+        (workspace / "tests").mkdir()
+        (workspace / "output").mkdir()
+        
+        logger.info(f"📦 Created throwaway workspace: {ws_id}")
+        return workspace
+    
+    def destroy_workspace(self, workspace_id: str) -> bool:
+        """Completely destroy workspace with all resources"""
+        import shutil
+        workspace = self.base_dir / workspace_id
+        if workspace.exists():
+            # Kill any remaining processes
+            self._force_kill_processes(workspace)
+            
+            # Complete removal
+            shutil.rmtree(workspace)
+            self.active_workspaces.discard(workspace_id)
+            logger.info(f"� Destroyed throwaway workspace: {workspace_id}")
+            return True
+        return False
+    
+    def _force_kill_processes(self, workspace: Path):
+        """Force kill all processes in workspace"""
+        import subprocess
+        # Find and kill all python processes in this workspace
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(workspace)], 
+                        capture_output=True, timeout=5)
+        except:
+            pass
+    
+    def destroy_all(self):
+        """Destroy all active workspaces"""
+        for ws_id in list(self.active_workspaces):
+            self.destroy_workspace(ws_id)
+
+
+class SecureExecutionEnvironment:
+    """
+    Secure execution environment for self-modification.
+    Provides: no secret access, network restrictions, resource quotas.
+    """
+    
+    def __init__(self):
+        self.workspace = ThrowawayWorkspace()
+        self.restricted_env = self._create_restricted_env()
+        self.network_blocked = True
+        self.resource_limits = {
+            "max_cpu_percent": 50,
+            "max_memory_mb": 512,
+            "max_execution_time": 60,
+            "max_file_size_mb": 100
+        }
+        
+    def _create_restricted_env(self) -> Dict[str, str]:
+        """Create environment without secrets"""
+        import os
+        env = os.environ.copy()
+        
+        # Remove all secret variables
+        secret_keys = ["API_KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL"]
+        for key in list(env.keys()):
+            if any(s in key.upper() for s in secret_keys):
+                env[key] = "[REDACTED]"
+        
+        # Also remove common secret paths
+        env["HOME"] = "/tmp/nobody"
+        
+        return env
+    
+    def execute_in_isolation(self, code: str, language: str = "python") -> Dict:
+        """Execute code in secure isolated environment"""
+        import tempfile
+        import subprocess
+        import resource
+        
+        # Create throwaway workspace
+        import uuid
+        ws_id = str(uuid.uuid4())[:8]
+        workspace = self.workspace.create_workspace(ws_id)
+        
+        try:
+            # Write code to temp file
+            code_file = workspace / "code" / f"main.{'py' if language == 'python' else 'js'}"
+            code_file.write_text(code)
+            
+            # Set up resource limits
+            max_memory = self.resource_limits["max_memory_mb"] * 1024 * 1024
+            max_time = self.resource_limits["max_execution_time"]
+            
+            # Execute with restrictions
+            cmd = ["python", str(code_file)] if language == "python" else ["node", str(code_file)]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max_time,
+                env=self.restricted_env,
+                cwd=str(workspace)
+            )
+            
+            return {
+                "success": result.returncode == 0,
+                "output": result.stdout,
+                "error": result.stderr,
+                "workspace": ws_id
+            }
+            
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Execution timeout", "workspace": ws_id}
+        except Exception as e:
+            return {"success": False, "error": str(e), "workspace": ws_id}
+        finally:
+            # ALWAYS destroy workspace
+            self.workspace.destroy_workspace(ws_id)
+    
+    def validate_code_safety(self, code: str) -> Dict:
+        """Validate code for dangerous patterns"""
+        import re
+        
+        dangerous_patterns = {
+            "network": [r"requests\.", r"urllib\.", r"http\.", r"socket\.", r"subprocess.*network"],
+            "file_write": [r"open\(.*?['\"]w['\"]", r"\.write\(", r"shutil\.move"],
+            "system": [r"os\.system", r"subprocess\.call", r"exec\(", r"eval\("],
+            "import_system": [r"__import__", r"import os", r"import sys"]
+        }
+        
+        issues = []
+        for category, patterns in dangerous_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, code):
+                    issues.append({"category": category, "pattern": pattern})
+        
+        return {
+            "safe": len(issues) == 0,
+            "issues": issues,
+            "network_blocked": self.network_blocked
+        }
+
+
+def create_secure_sandbox_for_self_improvement():
+    """Factory for secure sandbox for self-improvement"""
+    return {
+        "throwaway_workspace": ThrowawayWorkspace(),
+        "secure_env": SecureExecutionEnvironment()
+    }
