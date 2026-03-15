@@ -659,6 +659,50 @@ class KnowledgeGovernance:
         except Exception as e:
             logger.debug(f"Could not process task outcomes: {e}")
     
+    def _update_trust_from_outcome(self, source: str, success: bool):
+        """Update source trust based on task outcome"""
+        if source not in self.source_trust:
+            self.source_trust[source] = 0.5
+        if success:
+            self.source_trust[source] = min(1.0, self.source_trust[source] + 0.05)
+        else:
+            self.source_trust[source] = max(0.0, self.source_trust[source] - 0.1)
+        logger.info(f"Source trust: {source} -> {self.source_trust[source]:.3f}")
+
+    def _update_procedural_memory(self, entry_id: str, outcome: Dict):
+        """Update procedural memory with task execution details"""
+        if outcome.get("success") and outcome.get("steps"):
+            self.procedural_memory[entry_id] = {
+                "steps": outcome["steps"],
+                "success_rate": outcome.get("success_rate", 1.0),
+                "last_used": time.time(),
+                "task_type": outcome.get("task_type", "unknown")
+            }
+
+    def _handle_contradiction(self, entry_id: str, contradicts_with: str):
+        """Handle contradiction between knowledge entries"""
+        entry = self.pipeline.knowledge.get(entry_id)
+        other = self.pipeline.knowledge.get(contradicts_with)
+        if entry and other:
+            entry.contradictions.append(contradicts_with)
+            other.contradictions.append(entry_id)
+            entry.confidence = max(0.0, entry.confidence - 0.2)
+            other.confidence = max(0.0, other.confidence - 0.2)
+            logger.warning(f"Contradiction: {entry_id} <-> {contradicts_with}")
+
+    def _evaluate_knowledge_promotion(self, entry, outcome: Dict):
+        """Evaluate and promote/demote knowledge based on outcome"""
+        if hasattr(entry, 'usage_count') and entry.usage_count > 0:
+            success_rate = entry.success_count / entry.usage_count
+            if success_rate > 0.9 and entry.usage_count > 5:
+                entry.trust_level = "high"
+                entry.priority = "high"
+            elif success_rate < 0.5 and entry.usage_count > 3:
+                entry.trust_level = "low"
+                entry.priority = "low"
+                entry.needs_review = True
+
+
     def _update_source_trust_from_feedback(self):
         """Update source trust based on aggregate feedback"""
         source_performance = defaultdict(lambda: {"success": 0, "failure": 0})
