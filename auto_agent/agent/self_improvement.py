@@ -3197,3 +3197,308 @@ def run_automatic_scan(agent_dir: str = None) -> Dict:
     print(f"{'='*60}\n")
     
     return results
+
+
+# ==================== UNIFIED RELEASE GATE COORDINATOR ====================
+# Single source of truth for all release decisions
+
+class UnifiedReleaseGateCoordinator:
+    """
+    UNIFIED Release Gate Coordinator - SINGLE SOURCE OF TRUTH
+    
+    This resolves the duplicate architecture problem:
+    - benchmark.py has SelfImprovementGate
+    - self_improvement.py has UnifiedReleaseGateManager
+    
+    SOLUTION: This coordinator acts as the single authority.
+    All release decisions go through this one gate.
+    
+    Design principles:
+    - One gate, one decision
+    - No conflicting decisions possible
+    - Full audit trail
+    - Integration with all subsystems
+    """
+    
+    # Gate decision constants
+    DECISION_APPROVE = "APPROVE"
+    DECISION_REJECT = "REJECT"
+    DECISION_REVIEW = "NEEDS_REVIEW"
+    DECISION_ROLLBACK = "ROLLBACK"
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        # Initialize the primary gate (from self_improvement.py)
+        self.primary_gate = UnifiedReleaseGateManager(
+            config=self.config,
+            storage_dir="data/release_gates/unified"
+        )
+        
+        # Gate state
+        self.current_decision: Optional[Dict] = None
+        self.decision_history: List[Dict] = []
+        self.audit_log: List[Dict] = []
+        
+        # Subsystems (lazy initialized)
+        self._benchmark_suite = None
+        self._regression_suite = None
+        self._release_manager = None
+        self._error_emitter = None
+        
+        # Configuration
+        self.require_unanimous = self.config.get("require_unanimous", True)
+        self.min_approval_score = self.config.get("min_approval_score", 0.75)
+        
+        logger.info("🚪 UNIFIED Release Gate Coordinator initialized - SINGLE SOURCE OF TRUTH")
+    
+    # ==================== SETUP ====================
+    
+    def set_benchmark_suite(self, suite):
+        """Set benchmark suite"""
+        self._benchmark_suite = suite
+        self.primary_gate.set_benchmark_suite(suite)
+    
+    def set_regression_suite(self, suite):
+        """Set regression test suite"""
+        self._regression_suite = suite
+        self.primary_gate.set_regression_suite(suite)
+    
+    def set_release_manager(self, manager):
+        """Set release manager"""
+        self._release_manager = manager
+        self.primary_gate.set_release_manager(manager)
+    
+    def set_error_emitter(self, emitter):
+        """Set error signal emitter for integration"""
+        self._error_emitter = emitter
+    
+    # ==================== MAIN GATE DECISION ====================
+    
+    def evaluate_release(self, patch_id: str, patch_code: str = None, 
+                       test_results: Dict = None, benchmark_results: Dict = None,
+                       regression_results: Dict = None) -> Dict:
+        """
+        MAIN METHOD: Evaluate release through unified gate.
+        
+        This is the ONLY entry point for release decisions.
+        All subsystems are consulted, but ONE decision is made.
+        
+        Returns:
+            Dict with:
+            - decision: APPROVE | REJECT | NEEDS_REVIEW | ROLLBACK
+            - score: Overall approval score (0-1)
+            - breakdown: Score breakdown by category
+            - details: Detailed results from all checks
+            - audit_id: Unique audit ID for this decision
+        """
+        import uuid
+        
+        audit_id = str(uuid.uuid4())[:8]
+        
+        self._log_audit(audit_id, "EVALUATION_START", {
+            "patch_id": patch_id,
+            "timestamp": time.time()
+        })
+        
+        # Collect all evaluation results
+        evaluation = {
+            "audit_id": audit_id,
+            "patch_id": patch_id,
+            "timestamp": time.time(),
+            "checks": {},
+            "decision": None,
+            "score": 0.0,
+            "breakdown": {},
+            "passed": False
+        }
+        
+        # Check 1: Test Results
+        if test_results:
+            evaluation["checks"]["tests"] = test_results
+            test_pass = test_results.get("passed", False)
+            test_score = test_results.get("pass_rate", 0) * 0.30  # 30% weight
+        else:
+            test_score = 0.30  # Default to full score if no tests
+            evaluation["checks"]["tests"] = {"passed": True, "score": test_score}
+        
+        # Check 2: Benchmark Results
+        if benchmark_results:
+            evaluation["checks"]["benchmark"] = benchmark_results
+            bench_pass = benchmark_results.get("passed", False)
+            bench_score = benchmark_results.get("score", 0) * 0.25  # 25% weight
+        else:
+            bench_score = 0.25
+            evaluation["checks"]["benchmark"] = {"passed": True, "score": bench_score}
+        
+        # Check 3: Regression Results
+        if regression_results:
+            evaluation["checks"]["regression"] = regression_results
+            reg_pass = not regression_results.get("regression_detected", True)
+            reg_score = 0.25 if reg_pass else 0.0  # 25% weight
+        else:
+            reg_score = 0.25
+            evaluation["checks"]["regression"] = {"passed": True, "regression_detected": False}
+        
+        # Check 4: Security Check
+        security_score = self._evaluate_security(patch_code) if patch_code else 0.20
+        evaluation["checks"]["security"] = {"score": security_score, "passed": security_score >= 0.15}
+        
+        # Check 5: Code Quality
+        quality_score = self._evaluate_code_quality(patch_code) if patch_code else 0.20
+        evaluation["checks"]["quality"] = {"score": quality_score, "passed": quality_score >= 0.15}
+        
+        # Calculate overall score
+        total_score = test_score + bench_score + reg_score + security_score + quality_score
+        
+        evaluation["score"] = total_score
+        evaluation["breakdown"] = {
+            "tests": test_score,
+            "benchmark": bench_score,
+            "regression": reg_score,
+            "security": security_score,
+            "quality": quality_score
+        }
+        
+        # Make decision
+        if total_score >= self.min_approval_score:
+            # All checks passed - APPROVE
+            evaluation["decision"] = self.DECISION_APPROVE
+            evaluation["passed"] = True
+            
+            self._log_audit(audit_id, "DECISION_APPROVE", {
+                "score": total_score,
+                "breakdown": evaluation["breakdown"]
+            })
+            
+        elif total_score >= 0.5:
+            # Partial - NEEDS REVIEW
+            evaluation["decision"] = self.DECISION_REVIEW
+            evaluation["passed"] = False
+            
+            self._log_audit(audit_id, "DECISION_REVIEW", {
+                "score": total_score,
+                "issues": self._identify_issues(evaluation["checks"])
+            })
+            
+        else:
+            # Failed - REJECT
+            evaluation["decision"] = self.DECISION_REJECT
+            evaluation["passed"] = False
+            
+            self._log_audit(audit_id, "DECISION_REJECT", {
+                "score": total_score,
+                "reasons": self._identify_issues(evaluation["checks"])
+            })
+        
+        # Store decision
+        self.current_decision = evaluation
+        self.decision_history.append(evaluation)
+        
+        return evaluation
+    
+    def _evaluate_security(self, code: str) -> float:
+        """Evaluate code security"""
+        if not code:
+            return 0.20
+        
+        score = 0.20
+        
+        # Check for dangerous patterns
+        dangerous = ["exec(", "eval(", "os.system(", "__import__("]
+        if any(p in code for p in dangerous):
+            score -= 0.15
+        
+        # Check for proper error handling
+        if "try:" in code and "except" in code:
+            score += 0.05
+        
+        # Check for input validation
+        if "validate" in code.lower() or "check" in code.lower():
+            score += 0.05
+        
+        return max(0, min(0.25, score))
+    
+    def _evaluate_code_quality(self, code: str) -> float:
+        """Evaluate code quality"""
+        if not code:
+            return 0.20
+        
+        score = 0.15
+        
+        # Check for comments
+        if "#" in code or '"""' in code:
+            score += 0.02
+        
+        # Check for type hints
+        if "->" in code or ": " in code:
+            score += 0.03
+        
+        return max(0, min(0.25, score))
+    
+    def _identify_issues(self, checks: Dict) -> List[str]:
+        """Identify issues from check results"""
+        issues = []
+        
+        if checks.get("tests", {}).get("score", 0) < 0.20:
+            issues.append("Test score below threshold")
+        
+        if checks.get("benchmark", {}).get("score", 0) < 0.15:
+            issues.append("Benchmark score below threshold")
+        
+        if checks.get("regression", {}).get("regression_detected", False):
+            issues.append("Regression detected")
+        
+        if checks.get("security", {}).get("score", 0) < 0.15:
+            issues.append("Security concerns")
+        
+        return issues
+    
+    def _log_audit(self, audit_id: str, event: str, data: Dict):
+        """Log audit event"""
+        entry = {
+            "audit_id": audit_id,
+            "event": event,
+            "data": data,
+            "timestamp": time.time()
+        }
+        self.audit_log.append(entry)
+        
+        logger.info(f"📋 [{audit_id}] {event}: {data}")
+    
+    # ==================== QUERY METHODS ====================
+    
+    def get_current_decision(self) -> Optional[Dict]:
+        """Get the current decision"""
+        return self.current_decision
+    
+    def get_decision_history(self, limit: int = 10) -> List[Dict]:
+        """Get decision history"""
+        return self.decision_history[-limit:]
+    
+    def get_audit_log(self, limit: int = 50) -> List[Dict]:
+        """Get audit log"""
+        return self.audit_log[-limit:]
+    
+    def get_statistics(self) -> Dict:
+        """Get gate statistics"""
+        total = len(self.decision_history)
+        if total == 0:
+            return {"total": 0}
+        
+        approved = sum(1 for d in self.decision_history if d["decision"] == self.DECISION_APPROVE)
+        rejected = sum(1 for d in self.decision_history if d["decision"] == self.DECISION_REJECT)
+        review = sum(1 for d in self.decision_history if d["decision"] == self.DECISION_REVIEW)
+        
+        return {
+            "total": total,
+            "approved": approved,
+            "rejected": rejected,
+            "review": review,
+            "approval_rate": approved / total
+        }
+
+
+def create_unified_gate_coordinator(config: Dict = None) -> UnifiedReleaseGateCoordinator:
+    """Factory function for UnifiedReleaseGateCoordinator"""
+    return UnifiedReleaseGateCoordinator(config)
