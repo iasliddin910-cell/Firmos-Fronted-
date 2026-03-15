@@ -956,6 +956,8 @@ def create_benchmark_suite(agent) -> MasterBenchmarkSuite:
 
 # ==================== REAL SELF-IMPROVEMENT GATE ====================
 
+# DEPRECATED: Use UnifiedReleaseGateManager from self_improvement.py
+# This class is kept for backward compatibility only
 class SelfImprovementGate:
     """
     REAL Central gate for self-improvement patches.
