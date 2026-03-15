@@ -1878,8 +1878,9 @@ class AdvancedPatchEngine:
                     try:
                         with open(error_file, 'r') as f:
                             error_content = f.read()
-                    except:
-                        pass
+                    except (IOError, OSError, FileNotFoundError) as e:
+                        logger.debug(f"Could not read error file: {e}")
+                        error_content = ""
                     
                     file_filename = file_path.split('/')[-1]
                     if file_filename and file_filename in error_content:
@@ -1940,7 +1941,8 @@ class AdvancedPatchEngine:
                 import ast
                 ast.parse(patch.get("fixed_code", ""))
                 scores["correctness"] = 1.0
-            except:
+            except (SyntaxError, ValueError) as e:
+                logger.debug(f"AST parse error: {e}")
                 scores["correctness"] = 0.0
         else:
             # For runtime errors, check if fix addresses the specific error
@@ -2044,8 +2046,8 @@ class AdvancedPatchEngine:
                     if changed_file in content or changed_file.split('/')[-1] in content:
                         related_tests.append(test_file)
                         break
-            except:
-                pass
+            except (IOError, OSError) as e:
+                logger.debug(f"Could not read test file: {e}")
         
         results["affected_tests"] = related_tests
         
@@ -2109,8 +2111,8 @@ class AdvancedPatchEngine:
         try:
             exec_globals = {}
             exec(original_code, exec_globals)
-        except:
-            pass
+        except (SyntaxError, ValueError, TypeError) as e:
+            logger.debug(f"Original code execution error: {e}")
         
         original_time = time.time() - start
         _, original_peak = tracemalloc.get_traced_memory()
@@ -2123,8 +2125,8 @@ class AdvancedPatchEngine:
         try:
             exec_globals = {}
             exec(patched_code, exec_globals)
-        except:
-            pass
+        except (SyntaxError, ValueError, TypeError) as e:
+            logger.debug(f"Patched code execution error: {e}")
         
         patched_time = time.time() - start
         _, patched_peak = tracemalloc.get_traced_memory()
