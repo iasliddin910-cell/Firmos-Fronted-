@@ -7,10 +7,12 @@ import os
 import json
 import logging
 import hashlib
+import time
+import uuid
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -955,4 +957,418 @@ class MemoryGovernance:
 
 def create_memory_system(data_dir=None):
     return UnifiedMemory(data_dir=data_dir)
+
+
+# ==================== PROCEDURAL LEARNING MEMORY ====================
+# Specialized memory for self-improvement learning
+
+class ProceduralLearningMemory:
+    """
+    Procedural Learning Memory for Self-Improvement
+    
+    Tracks:
+    - Which patches were accepted
+    - Which patches were rejected
+    - Which recoveries worked
+    - Which tools crashed frequently
+    - Which benchmarks dropped
+    
+    This is the "No1 learning memory" for autonomous improvement.
+    """
+    
+    def __init__(self, data_dir: str = "data/procedural_memory"):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Core learning data
+        self.patch_history: List[Dict] = []
+        self.recovery_history: List[Dict] = []
+        self.tool_failures: Dict[str, Dict] = {}
+        self.benchmark_history: List[Dict] = []
+        
+        # Learning indices
+        self._build_indices()
+        
+        # Statistics
+        self.stats = {
+            "total_patches": 0,
+            "accepted_patches": 0,
+            "rejected_patches": 0,
+            "total_recoveries": 0,
+            "successful_recoveries": 0,
+            "total_benchmarks": 0,
+            "failed_benchmarks": 0
+        }
+        
+        logger.info("🧠 Procedural Learning Memory initialized")
+    
+    def _build_indices(self):
+        """Build indices for fast lookup"""
+        self.patch_by_type: Dict[str, List[Dict]] = defaultdict(list)
+        self.patch_by_error: Dict[str, List[Dict]] = defaultdict(list)
+        self.recovery_by_type: Dict[str, List[Dict]] = defaultdict(list)
+        self.tool_by_category: Dict[str, List[Dict]] = defaultdict(list)
+    
+    # ==================== PATCH LEARNING ====================
+    
+    def record_patch(self, patch_info: Dict):
+        """
+        Record a patch attempt for learning.
+        
+        Stores:
+        - patch_id, file_path, error_type
+        - root_cause, fix_strategy
+        - result: accepted/rejected
+        - execution_time, iterations
+        """
+        patch_info["timestamp"] = time.time()
+        patch_info["id"] = patch_info.get("id", str(uuid.uuid4())[:8])
+        
+        self.patch_history.append(patch_info)
+        
+        # Update indices
+        error_type = patch_info.get("error_type", "unknown")
+        self.patch_by_type[patch_info.get("result", "unknown")].append(patch_info)
+        self.patch_by_error[error_type].append(patch_info)
+        
+        # Update stats
+        self.stats["total_patches"] += 1
+        if patch_info.get("result") == "accepted":
+            self.stats["accepted_patches"] += 1
+        else:
+            self.stats["rejected_patches"] += 1
+        
+        self._save_patch_history()
+        
+        logger.info(f"🩹 Recorded patch: {patch_info['id']} - {patch_info.get('result')}")
+    
+    def get_successful_patches(self, error_type: str = None) -> List[Dict]:
+        """Get patches that were accepted, optionally filtered by error type"""
+        if error_type:
+            return [p for p in self.patch_by_error.get(error_type, []) 
+                   if p.get("result") == "accepted"]
+        return [p for p in self.patch_history if p.get("result") == "accepted"]
+    
+    def get_rejected_patches(self, error_type: str = None) -> List[Dict]:
+        """Get patches that were rejected"""
+        if error_type:
+            return [p for p in self.patch_by_error.get(error_type, []) 
+                   if p.get("result") == "rejected"]
+        return [p for p in self.patch_history if p.get("result") == "rejected"]
+    
+    def get_best_fix_strategy(self, error_type: str) -> Optional[Dict]:
+        """Get the best fix strategy for an error type based on history"""
+        successful = self.get_successful_patches(error_type)
+        
+        if not successful:
+            return None
+        
+        # Find strategy with highest success rate
+        strategies = {}
+        for patch in successful:
+            strategy = patch.get("fix_strategy", "unknown")
+            if strategy not in strategies:
+                strategies[strategy] = {"success": 0, "total": 0}
+            strategies[strategy]["success"] += 1
+            strategies[strategy]["total"] += 1
+        
+        # Return best strategy
+        best = max(strategies.items(), key=lambda x: x[1]["success"] / max(1, x[1]["total"]))
+        
+        return {
+            "strategy": best[0],
+            "success_rate": best[1]["success"] / max(1, best[1]["total"]),
+            "sample_count": best[1]["total"]
+        }
+    
+    # ==================== RECOVERY LEARNING ====================
+    
+    def record_recovery(self, recovery_info: Dict):
+        """
+        Record a recovery attempt.
+        
+        Stores:
+        - recovery_type, trigger_event
+        - strategy_used, result
+        - time_to_recover
+        """
+        recovery_info["timestamp"] = time.time()
+        recovery_info["id"] = recovery_info.get("id", str(uuid.uuid4())[:8])
+        
+        self.recovery_history.append(recovery_info)
+        
+        # Update index
+        recovery_type = recovery_info.get("recovery_type", "unknown")
+        self.recovery_by_type[recovery_type].append(recovery_info)
+        
+        # Update stats
+        self.stats["total_recoveries"] += 1
+        if recovery_info.get("result") == "success":
+            self.stats["successful_recoveries"] += 1
+        
+        self._save_recovery_history()
+        
+        logger.info(f"🔧 Recorded recovery: {recovery_info['id']} - {recovery_info.get('result')}")
+    
+    def get_successful_recoveries(self, recovery_type: str = None) -> List[Dict]:
+        """Get recoveries that succeeded"""
+        if recovery_type:
+            return [r for r in self.recovery_by_type.get(recovery_type, [])
+                   if r.get("result") == "success"]
+        return [r for r in self.recovery_history if r.get("result") == "success"]
+    
+    def get_best_recovery_strategy(self, trigger_event: str) -> Optional[Dict]:
+        """Get the best recovery strategy for a trigger event"""
+        successful = [r for r in self.recovery_history 
+                     if r.get("trigger_event") == trigger_event 
+                     and r.get("result") == "success"]
+        
+        if not successful:
+            return None
+        
+        strategies = {}
+        for recovery in successful:
+            strategy = recovery.get("strategy_used", "unknown")
+            if strategy not in strategies:
+                strategies[strategy] = 0
+            strategies[strategy] += 1
+        
+        best = max(strategies.items(), key=lambda x: x[1])
+        
+        return {
+            "strategy": best[0],
+            "uses": best[1],
+            "trigger": trigger_event
+        }
+    
+    # ==================== TOOL FAILURE LEARNING ====================
+    
+    def record_tool_failure(self, tool_name: str, failure_info: Dict):
+        """
+        Record a tool failure.
+        
+        Tracks:
+        - tool_name, error_type, error_message
+        - frequency, last_failure
+        - recovery_action
+        """
+        if tool_name not in self.tool_failures:
+            self.tool_failures[tool_name] = {
+                "tool_name": tool_name,
+                "failure_count": 0,
+                "failures": [],
+                "last_failure": None,
+                "recovery_actions": []
+            }
+        
+        failure_info["timestamp"] = time.time()
+        self.tool_failures[tool_name]["failure_count"] += 1
+        self.tool_failures[tool_name]["failures"].append(failure_info)
+        self.tool_failures[tool_name]["last_failure"] = failure_info["timestamp"]
+        
+        if failure_info.get("recovery_action"):
+            self.tool_failures[tool_name]["recovery_actions"].append(
+                failure_info["recovery_action"]
+            )
+        
+        self._save_tool_failures()
+        
+        logger.warning(f"🔴 Tool failure recorded: {tool_name} (total: {self.tool_failures[tool_name]['failure_count']})")
+    
+    def get_failing_tools(self, min_failures: int = 3) -> List[Dict]:
+        """Get tools that fail frequently"""
+        failing = []
+        
+        for tool_name, data in self.tool_failures.items():
+            if data["failure_count"] >= min_failures:
+                failing.append({
+                    "tool_name": tool_name,
+                    "failure_count": data["failure_count"],
+                    "last_failure": data["last_failure"],
+                    "recovery_actions": data.get("recovery_actions", [])
+                })
+        
+        # Sort by failure count
+        failing.sort(key=lambda x: x["failure_count"], reverse=True)
+        
+        return failing
+    
+    def get_tool_patterns(self, tool_name: str) -> Dict:
+        """Get failure patterns for a specific tool"""
+        if tool_name not in self.tool_failures:
+            return {}
+        
+        data = self.tool_failures[tool_name]
+        
+        # Analyze error types
+        error_types = {}
+        for failure in data.get("failures", []):
+            error = failure.get("error_type", "unknown")
+            error_types[error] = error_types.get(error, 0) + 1
+        
+        return {
+            "total_failures": data["failure_count"],
+            "error_types": error_types,
+            "common_recovery": self._most_common(data.get("recovery_actions", []))
+        }
+    
+    def _most_common(self, items: List) -> Optional[Any]:
+        """Get most common item in list"""
+        if not items:
+            return None
+        counts = Counter(items)
+        return counts.most_common(1)[0][0] if counts else None
+    
+    # ==================== BENCHMARK LEARNING ====================
+    
+    def record_benchmark(self, benchmark_info: Dict):
+        """
+        Record a benchmark result.
+        
+        Tracks:
+        - benchmark_name, score
+        - delta_from_baseline
+        - passed/failed
+        """
+        benchmark_info["timestamp"] = time.time()
+        
+        self.benchmark_history.append(benchmark_info)
+        
+        # Update stats
+        self.stats["total_benchmarks"] += 1
+        if not benchmark_info.get("passed", True):
+            self.stats["failed_benchmarks"] += 1
+        
+        self._save_benchmark_history()
+        
+        status = "✅" if benchmark_info.get("passed") else "❌"
+        logger.info(f"{status} Benchmark recorded: {benchmark_info.get('name')} - {benchmark_info.get('score')}")
+    
+    def get_dropping_benchmarks(self, threshold_percent: float = 10.0) -> List[Dict]:
+        """Get benchmarks that are dropping below threshold"""
+        dropping = []
+        
+        # Group by benchmark name
+        by_name = defaultdict(list)
+        for b in self.benchmark_history:
+            by_name[b.get("name", "unknown")].append(b)
+        
+        for name, benchmarks in by_name.items():
+            if len(benchmarks) < 2:
+                continue
+            
+            # Get recent and baseline
+            recent = benchmarks[-1]
+            baseline = benchmarks[0]
+            
+            recent_score = recent.get("score", 0)
+            baseline_score = baseline.get("score", 0)
+            
+            if baseline_score > 0:
+                delta_percent = ((recent_score - baseline_score) / baseline_score) * 100
+                
+                if delta_percent < -threshold_percent:
+                    dropping.append({
+                        "benchmark": name,
+                        "recent_score": recent_score,
+                        "baseline_score": baseline_score,
+                        "delta_percent": delta_percent,
+                        "sample_count": len(benchmarks)
+                    })
+        
+        return dropping
+    
+    def get_benchmark_trend(self, benchmark_name: str) -> Dict:
+        """Get trend for a specific benchmark"""
+        benchmarks = [b for b in self.benchmark_history if b.get("name") == benchmark_name]
+        
+        if not benchmarks:
+            return {}
+        
+        scores = [b.get("score", 0) for b in benchmarks]
+        
+        return {
+            "name": benchmark_name,
+            "sample_count": len(scores),
+            "avg_score": sum(scores) / len(scores),
+            "min_score": min(scores),
+            "max_score": max(scores),
+            "trend": "improving" if scores[-1] > scores[0] else "declining" if scores[-1] < scores[0] else "stable"
+        }
+    
+    # ==================== PERSISTENCE ====================
+    
+    def _save_patch_history(self):
+        """Save patch history to disk"""
+        try:
+            with open(self.data_dir / "patches.json", 'w') as f:
+                json.dump(self.patch_history, f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"Failed to save patch history: {e}")
+    
+    def _save_recovery_history(self):
+        """Save recovery history to disk"""
+        try:
+            with open(self.data_dir / "recoveries.json", 'w') as f:
+                json.dump(self.recovery_history, f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"Failed to save recovery history: {e}")
+    
+    def _save_tool_failures(self):
+        """Save tool failures to disk"""
+        try:
+            with open(self.data_dir / "tool_failures.json", 'w') as f:
+                json.dump(self.tool_failures, f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"Failed to save tool failures: {e}")
+    
+    def _save_benchmark_history(self):
+        """Save benchmark history to disk"""
+        try:
+            with open(self.data_dir / "benchmarks.json", 'w') as f:
+                json.dump(self.benchmark_history, f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"Failed to save benchmark history: {e}")
+    
+    # ==================== QUERY METHODS ====================
+    
+    def get_learning_summary(self) -> Dict:
+        """Get comprehensive learning summary"""
+        return {
+            "patch_stats": {
+                "total": self.stats["total_patches"],
+                "accepted": self.stats["accepted_patches"],
+                "rejected": self.stats["rejected_patches"],
+                "success_rate": self.stats["accepted_patches"] / max(1, self.stats["total_patches"])
+            },
+            "recovery_stats": {
+                "total": self.stats["total_recoveries"],
+                "successful": self.stats["successful_recoveries"],
+                "success_rate": self.stats["successful_recoveries"] / max(1, self.stats["total_recoveries"])
+            },
+            "tool_stats": {
+                "total_tools": len(self.tool_failures),
+                "failing_tools": len(self.get_failing_tools())
+            },
+            "benchmark_stats": {
+                "total": self.stats["total_benchmarks"],
+                "failed": self.stats["failed_benchmarks"],
+                "dropping": len(self.get_dropping_benchmarks())
+            }
+        }
+    
+    def export_learnings(self) -> Dict:
+        """Export all learnings for analysis"""
+        return {
+            "patches": self.patch_history[-100:],  # Last 100
+            "recoveries": self.recovery_history[-100:],
+            "tool_failures": self.tool_failures,
+            "benchmarks": self.benchmark_history[-100:],
+            "summary": self.get_learning_summary()
+        }
+
+
+def create_procedural_memory(data_dir: str = None) -> ProceduralLearningMemory:
+    """Factory function for ProceduralLearningMemory"""
+    return ProceduralLearningMemory(data_dir=data_dir)
 
