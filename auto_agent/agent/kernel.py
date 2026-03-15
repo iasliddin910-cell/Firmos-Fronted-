@@ -351,6 +351,122 @@ class TaskCheckpoint:
     rollback_snapshots: List[RollbackSnapshot] = field(default_factory=list)
 
 
+# ==================== TASK SPEC CONTRACTS ====================
+# FIX: Task contract - canonical task specification
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """
+    FIX: Typed retry policy - replaces int/dict ambiguity.
+    
+    Previously max_retries could be int or dict from planner,
+    causing runtime comparison errors.
+    """
+    max_retries: int = 3
+    backoff_strategy: str = "exponential"  # exponential, linear, fixed
+    initial_delay_sec: int = 1
+    max_delay_sec: int = 30
+
+
+@dataclass(frozen=True)
+class ApprovalSpec:
+    """
+    FIX: Typed approval specification.
+    
+    Previously approval_policy was a string that could be in
+    either task field or input_data dict.
+    """
+    policy: str = "auto"  # auto, manual, never
+    required_for_dangerous: bool = True
+    timeout_sec: int = 300
+
+
+@dataclass(frozen=True)
+class SandboxSpec:
+    """
+    FIX: Typed sandbox specification.
+    
+    Previously sandbox_mode could be in task field or input_data dict.
+    """
+    mode: str = "normal"  # safe, normal, advanced
+    allow_network: bool = True
+    allow_file_write: bool = True
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """
+    FIX: Typed tool specification.
+    
+    Previously required_tools was just a list of strings.
+    Now it's a structured contract with capabilities.
+    """
+    required_tools: List[str] = field(default_factory=list)
+    preferred_tool: Optional[str] = None
+    alternate_tool: Optional[str] = None
+    destructive: bool = False
+
+
+@dataclass(frozen=True)
+class SuccessCriterion:
+    """
+    FIX: Structured success criteria - not string DSL.
+    
+    Previously success_criteria was a string like "contains:X exit_code:0"
+    Now it's structured assertions for deterministic verification.
+    """
+    kind: str  # contains, regex, exit_code, artifact_exists, url_equals, etc.
+    value: Any
+    optional: bool = False
+
+
+@dataclass(frozen=True)
+class VerificationSpec:
+    """
+    FIX: Typed verification specification.
+    
+    Previously verification was just a type string in input_data.
+    Now it's a full specification with criteria.
+    """
+    type: str  # browser, screenshot, code, file, etc.
+    params: Dict[str, Any] = field(default_factory=dict)
+    criteria: List[SuccessCriterion] = field(default_factory=list)
+    required: bool = True
+    evidence_required: bool = True
+
+
+@dataclass(frozen=True)
+class TaskSpec:
+    """
+    FIX: Canonical TaskSpec - the contract for task execution.
+    
+    This replaces the fragmented task + input_data model.
+    All policy, verification, and execution details are in one place.
+    """
+    description: str
+    priority: str = "normal"
+    dependencies: List[str] = field(default_factory=list)
+    
+    # Tool routing
+    tool_spec: ToolSpec = field(default_factory=ToolSpec)
+    
+    # Verification
+    verification: VerificationSpec = field(default_factory=VerificationSpec)
+    
+    # Success criteria
+    success_criteria: List[SuccessCriterion] = field(default_factory=list)
+    expected_artifacts: List[str] = field(default_factory=list)
+    
+    # Policy
+    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    approval: ApprovalSpec = field(default_factory=ApprovalSpec)
+    sandbox: SandboxSpec = field(default_factory=SandboxSpec)
+    
+    # Execution
+    timeout_sec: int = 30
+    rollback: Optional[Dict[str, Any]] = None
+
+
 # ==================== ENUMS ====================
 
 class KernelState(Enum):
@@ -3943,6 +4059,137 @@ Return JSON with tasks array containing: id, description, priority, dependencies
         
         return None
 
+    def _compile_task_spec(self, task_dict: Dict) -> TaskSpec:
+        """
+        FIX #2: Compile TaskSpec from planner dict.
+        
+        This is the planner compiler - transforms planner JSON output
+        into a typed TaskSpec contract.
+        
+        This ensures:
+        - retry_policy is always a RetryPolicy (not int or dict)
+        - approval is always an ApprovalSpec
+        - sandbox is always a SandboxSpec
+        - verification is always a VerificationSpec
+        - success_criteria is always a list of SuccessCriterion
+        """
+        # Compile RetryPolicy - handles int/dict ambiguity
+        retry_dict = task_dict.get('retry_policy', {})
+        if isinstance(retry_dict, int):
+            retry_policy = RetryPolicy(max_retries=retry_dict)
+        elif isinstance(retry_dict, dict):
+            retry_policy = RetryPolicy(
+                max_retries=retry_dict.get('max_retries', 3),
+                backoff_strategy=retry_dict.get('backoff_strategy', 'exponential'),
+                initial_delay_sec=retry_dict.get('initial_delay_sec', 1),
+                max_delay_sec=retry_dict.get('max_delay_sec', 30)
+            )
+        else:
+            retry_policy = RetryPolicy()
+        
+        # Compile ApprovalSpec
+        approval_dict = task_dict.get('approval_policy', 'auto')
+        if isinstance(approval_dict, str):
+            approval = ApprovalSpec(policy=approval_dict)
+        elif isinstance(approval_dict, dict):
+            approval = ApprovalSpec(
+                policy=approval_dict.get('policy', 'auto'),
+                required_for_dangerous=approval_dict.get('required_for_dangerous', True),
+                timeout_sec=approval_dict.get('timeout_sec', 300)
+            )
+        else:
+            approval = ApprovalSpec()
+        
+        # Compile SandboxSpec
+        sandbox_dict = task_dict.get('sandbox_mode', 'normal')
+        if isinstance(sandbox_dict, str):
+            sandbox = SandboxSpec(mode=sandbox_dict)
+        elif isinstance(sandbox_dict, dict):
+            sandbox = SandboxSpec(
+                mode=sandbox_dict.get('mode', 'normal'),
+                allow_network=sandbox_dict.get('allow_network', True),
+                allow_file_write=sandbox_dict.get('allow_file_write', True)
+            )
+        else:
+            sandbox = SandboxSpec()
+        
+        # Compile ToolSpec
+        tools = task_dict.get('required_tools', [])
+        tool_spec = ToolSpec(
+            required_tools=tools if isinstance(tools, list) else [],
+            preferred_tool=task_dict.get('preferred_tool'),
+            alternate_tool=task_dict.get('alternate_tool'),
+            destructive=task_dict.get('destructive', False)
+        )
+        
+        # Compile VerificationSpec
+        verification_type = task_dict.get('verification_type')
+        verification_params = task_dict.get('verification_params', {})
+        verification = VerificationSpec(
+            type=verification_type or 'none',
+            params=verification_params if isinstance(verification_params, dict) else {},
+            required=verification_type is not None
+        )
+        
+        # Compile success_criteria - from string DSL to structured
+        success_criteria_raw = task_dict.get('success_criteria', [])
+        success_criteria = []
+        
+        if isinstance(success_criteria_raw, str):
+            # Parse string DSL like "contains:X exit_code:0"
+            for part in success_criteria_raw.split():
+                if ':' in part:
+                    kind, value = part.split(':', 1)
+                    try:
+                        # Try to parse as int
+                        value = int(value)
+                    except ValueError:
+                        try:
+                            # Try to parse as float
+                            value = float(value)
+                        except ValueError:
+                            pass  # Keep as string
+                    success_criteria.append(SuccessCriterion(kind=kind, value=value))
+        elif isinstance(success_criteria_raw, list):
+            # Already structured
+            for criterion in success_criteria_raw:
+                if isinstance(criterion, dict):
+                    success_criteria.append(SuccessCriterion(
+                        kind=criterion.get('kind', 'unknown'),
+                        value=criterion.get('value'),
+                        optional=criterion.get('optional', False)
+                    ))
+                elif isinstance(criterion, tuple):
+                    success_criteria.append(SuccessCriterion(kind=criterion[0], value=criterion[1]))
+        
+        # Expected artifacts
+        expected_artifacts = task_dict.get('expected_artifacts', [])
+        if not isinstance(expected_artifacts, list):
+            expected_artifacts = []
+        
+        # Timeout
+        timeout = task_dict.get('timeout', 30)
+        if not isinstance(timeout, int):
+            timeout = 30
+        
+        # Rollback
+        rollback = task_dict.get('rollback_point')
+        
+        # Create TaskSpec
+        return TaskSpec(
+            description=task_dict.get('description', 'Unknown task'),
+            priority=task_dict.get('priority', 'normal'),
+            dependencies=task_dict.get('dependencies', []) if isinstance(task_dict.get('dependencies'), list) else [],
+            tool_spec=tool_spec,
+            verification=verification,
+            success_criteria=success_criteria,
+            expected_artifacts=expected_artifacts,
+            retry_policy=retry_policy,
+            approval=approval,
+            sandbox=sandbox,
+            timeout_sec=timeout,
+            rollback=rollback
+        )
 
     def _validate_plan_schema(self, data: Any) -> Dict:
         """
@@ -4179,38 +4426,61 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                 elif t.get('priority', '').upper() == 'LOW':
                     priority = TaskPriority.LOW
                 
+                # FIX #2: Compile TaskSpec from dict - this is the canonical contract
+                task_spec = self._compile_task_spec(t)
+                
+                # Create task with spec
                 task = Task(
                     id=t.get('id', f"task_{int(time.time()*1000)}_{i}"),
                     description=t.get('description', 'Unknown task'),
                     priority=priority,
                     dependencies=t.get('dependencies', []),
-                    timeout=t.get('timeout', 30),
-                    max_retries=t.get('retry_policy', 3),
-                    approval_policy=t.get('approval_policy', 'auto'),
-                    sandbox_mode=t.get('sandbox_mode', 'normal'),
+                    timeout=task_spec.timeout_sec,
+                    max_retries=task_spec.retry_policy.max_retries,
+                    approval_policy=task_spec.approval.policy,
+                    sandbox_mode=task_spec.sandbox.mode,
                 )
                 
-                # Set rich metadata
+                # FIX #2: Policy fields now come from TaskSpec, NOT from input_data
+                # input_data should ONLY contain execution payload (tool args)
                 task.input_data = {
-                    'required_tools': t.get('required_tools', []),
-                    'verification_type': t.get('verification_type'),  # FIX #2: No default to 'manual'!
-                    'success_criteria': t.get('success_criteria', ''),
-                    'fallback_strategy': t.get('fallback_strategy', ''),
+                    # Tool arguments - ONLY execution payload
                     'file_path': t.get('file_path', ''),
-                    'expected_elements': t.get('expected_elements', []),
-                    'process_name': t.get('process_name', ''),
+                    'file_content': t.get('file_content', ''),
                     'url': t.get('url', ''),
-                    'port': t.get('port', 80),
-                    'host': t.get('host', 'localhost'),
+                    'command': t.get('command', ''),
                     'code': t.get('code', ''),
                     'language': t.get('language', 'python'),
-                    'risk_level': t.get('risk_level', 'medium'),
-                    'expected_artifacts': t.get('expected_artifacts', []),
-                    'rollback_point': t.get('rollback_point'),
+                    'process_name': t.get('process_name', ''),
+                    'port': t.get('port', 80),
+                    'host': t.get('host', 'localhost'),
+                    
+                    # Tool routing from spec (not hardcoded)
+                    'preferred_tool': task_spec.tool_spec.preferred_tool,
+                    'alternate_tool': task_spec.tool_spec.alternate_tool,
+                    'destructive': task_spec.tool_spec.destructive,
+                    
+                    # FIX #2: success_criteria from TaskSpec as structured
+                    'success_criteria': [(c.kind, c.value) for c in task_spec.success_criteria],
                 }
                 
-                # Set artifact expectations
-                task.artifact_expectations = t.get('expected_artifacts', [])
+                # Set artifact expectations from spec
+                task.artifact_expectations = task_spec.expected_artifacts
+                
+                # Store spec in metadata for access by other components
+                task.metadata['_task_spec'] = {
+                    'verification_type': task_spec.verification.type,
+                    'verification_params': task_spec.verification.params,
+                    'retry_policy': {
+                        'max_retries': task_spec.retry_policy.max_retries,
+                        'backoff': task_spec.retry_policy.backoff_strategy,
+                    },
+                    'sandbox': {
+                        'mode': task_spec.sandbox.mode,
+                        'allow_network': task_spec.sandbox.allow_network,
+                        'allow_file_write': task_spec.sandbox.allow_file_write,
+                    },
+                }
                 
                 tasks.append(task)
                 
