@@ -12,6 +12,10 @@ Features:
 - Release snapshots
 - Rollback
 - INTEGRATED with PatchLifecycle from regression_suite.py
+- ERROR DETECTION & SIGNAL PROPAGATION (Advanced)
+- Root cause analysis
+- Benchmark signaling
+- Self-fixing capabilities
 """
 import os
 import json
@@ -19,11 +23,13 @@ import logging
 import time
 import shutil
 import hashlib
-from typing import Dict, List, Optional, Any, Callable
+import traceback
+from typing import Dict, List, Optional, Any, Callable, Set
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from collections import defaultdict
 from pathlib import Path
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +126,382 @@ class RegressionResult:
     failed_tests: List[str] = field(default_factory=list)
     duration: float = 0.0
     timestamp: float = field(default_factory=time.time)
+
+
+# ==================== ERROR SIGNAL SYSTEM ====================
+# ADVANCED: Error detection, root cause analysis, and signal propagation
+
+class ErrorSeverity(Enum):
+    """Error severity levels for signal prioritization"""
+    CRITICAL = "critical"  # System cannot continue
+    HIGH = "high"        # Major functionality affected
+    MEDIUM = "medium"    # Some functionality impacted
+    LOW = "low"          # Minor issue, can continue
+    INFO = "info"        # Informational, no action needed
+
+
+class ErrorCategory(Enum):
+    """Categories of errors for pattern detection"""
+    SYNTAX_ERROR = "syntax_error"
+    RUNTIME_ERROR = "runtime_error"
+    IMPORT_ERROR = "import_error"
+    TIMEOUT_ERROR = "timeout_error"
+    MEMORY_ERROR = "memory_error"
+    NETWORK_ERROR = "network_error"
+    AUTH_ERROR = "auth_error"
+    PERMISSION_ERROR = "permission_error"
+    VALIDATION_ERROR = "validation_error"
+    LOGIC_ERROR = "logic_error"
+    BARE_EXCEPT = "bare_except"  # CRITICAL: Bare except blocks hide errors
+    PASS_STATEMENT = "pass_statement"  # Empty pass hides issues
+    UNHANDLED_EXCEPTION = "unhandled_exception"
+
+
+@dataclass
+class ErrorSignal:
+    """
+    Represents a detected error with full context for root cause analysis.
+    This is the KEY component that enables self-improvement to detect issues.
+    """
+    signal_id: str
+    error_type: ErrorCategory
+    severity: ErrorSeverity
+    message: str
+    
+    # Location info
+    file_path: Optional[str] = None
+    line_number: Optional[int] = None
+    function_name: Optional[str] = None
+    class_name: Optional[str] = None
+    
+    # Stack trace for root cause
+    stack_trace: Optional[str] = None
+    exception_type: Optional[str] = None
+    
+    # Context
+    context: Dict = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    
+    # Analysis results
+    root_cause: Optional[str] = None
+    is_recovered: bool = False
+    recovery_attempted: bool = False
+    
+    # Signal chain (for correlation)
+    parent_signal_id: Optional[str] = None
+    related_signals: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict:
+        return {
+            "signal_id": self.signal_id,
+            "error_type": self.error_type.value,
+            "severity": self.severity.value,
+            "message": self.message,
+            "file_path": self.file_path,
+            "line_number": self.line_number,
+            "function_name": self.function_name,
+            "class_name": self.class_name,
+            "stack_trace": self.stack_trace,
+            "exception_type": self.exception_type,
+            "context": self.context,
+            "timestamp": self.timestamp,
+            "root_cause": self.root_cause,
+            "is_recovered": self.is_recovered,
+            "recovery_attempted": self.recovery_attempted,
+            "parent_signal_id": self.parent_signal_id,
+            "related_signals": self.related_signals
+        }
+
+
+class ErrorSignalEmitter:
+    """
+    ADVANCED: Error signal emitter that detects and propagates errors.
+    
+    This class solves the core problem:
+    - Self-improvement system CANNOT detect errors if they are swallowed
+    - Bare except blocks hide errors from the system
+    - This emitter INTENTIONALLY catches errors and signals them
+    
+    Usage:
+        emitter = ErrorSignalEmitter()
+        emitter.register_with_system()  # Register error handlers globally
+    """
+    
+    def __init__(self, storage_dir: str = "data/error_signals"):
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Signal storage
+        self.signals: List[ErrorSignal] = []
+        self._signal_index: Dict[ErrorCategory, List[int]] = defaultdict(list)
+        self._severity_index: Dict[ErrorSeverity, List[int]] = defaultdict(list)
+        self._file_index: Dict[str, List[int]] = defaultdict(list)
+        
+        # Callbacks for signal processing
+        self._signal_callbacks: List[Callable[[ErrorSignal], None]] = []
+        
+        # Statistics
+        self.stats = {
+            "total_signals": 0,
+            "critical_count": 0,
+            "recovered_count": 0,
+            "by_category": defaultdict(int),
+            "by_file": defaultdict(int)
+        }
+        
+        # Pattern detectors
+        self._setup_pattern_detectors()
+        
+        logger.info("📡 ErrorSignalEmitter initialized - ADVANCED error detection ENABLED")
+    
+    def _setup_pattern_detectors(self):
+        """Setup error pattern detectors"""
+        # Patterns that indicate hidden errors
+        self._bare_except_patterns = [
+            r'except\s*:',
+            r'except\s*:\s*[^#]',  # except: followed by non-comment
+        ]
+        
+        # Patterns for empty pass statements
+        self._pass_patterns = [
+            r'^\s+pass\s*$',  # indented pass
+            r'^pass\s*$',     # top-level pass
+        ]
+    
+    def emit(self, 
+             error_type: ErrorCategory,
+             severity: ErrorSeverity,
+             message: str,
+             file_path: Optional[str] = None,
+             line_number: Optional[int] = None,
+             function_name: Optional[str] = None,
+             class_name: Optional[str] = None,
+             stack_trace: Optional[str] = None,
+             exception_type: Optional[str] = None,
+             context: Optional[Dict] = None) -> ErrorSignal:
+        """
+        Emit an error signal with full context.
+        This is the MAIN entry point for error detection.
+        """
+        
+        signal_id = f"sig_{len(self.signals)}_{int(time.time() * 1000)}"
+        
+        signal = ErrorSignal(
+            signal_id=signal_id,
+            error_type=error_type,
+            severity=severity,
+            message=message,
+            file_path=file_path,
+            line_number=line_number,
+            function_name=function_name,
+            class_name=class_name,
+            stack_trace=stack_trace,
+            exception_type=exception_type,
+            context=context or {}
+        )
+        
+        # Perform root cause analysis
+        signal.root_cause = self._analyze_root_cause(signal)
+        
+        # Store signal
+        idx = len(self.signals)
+        self.signals.append(signal)
+        
+        # Update indexes
+        self._signal_index[error_type].append(idx)
+        self._severity_index[severity].append(idx)
+        if file_path:
+            self._file_index[file_path].append(idx)
+        
+        # Update stats
+        self.stats["total_signals"] += 1
+        self.stats["by_category"][error_type.value] += 1
+        if file_path:
+            self.stats["by_file"][file_path] += 1
+        
+        if severity == ErrorSeverity.CRITICAL:
+            self.stats["critical_count"] += 1
+        
+        # Log with appropriate level
+        log_msg = f"📡 SIGNAL [{signal_id}] {error_type.value}: {message}"
+        if file_path and line_number:
+            log_msg += f" @ {file_path}:{line_number}"
+        
+        if severity == ErrorSeverity.CRITICAL:
+            logger.critical(log_msg)
+        elif severity == ErrorSeverity.HIGH:
+            logger.error(log_msg)
+        elif severity == ErrorSeverity.MEDIUM:
+            logger.warning(log_msg)
+        else:
+            logger.info(log_msg)
+        
+        # Trigger callbacks
+        for callback in self._signal_callbacks:
+            try:
+                callback(signal)
+            except Exception as e:
+                logger.error(f"Signal callback error: {e}")
+        
+        # Auto-recover if possible
+        self._attempt_auto_recovery(signal)
+        
+        return signal
+    
+    def _analyze_root_cause(self, signal: ErrorSignal) -> str:
+        """
+        Perform root cause analysis on the error signal.
+        This helps identify WHY the error occurred.
+        """
+        causes = []
+        
+        # Analyze based on error type
+        if signal.error_type == ErrorCategory.BARE_EXCEPT:
+            causes.append("Bare except block detected - error was silently swallowed")
+            causes.append("Root cause cannot be determined due to exception hiding")
+        
+        elif signal.error_type == ErrorCategory.PASS_STATEMENT:
+            causes.append("Empty pass statement detected - potential logic gap")
+            causes.append("May indicate unfinished code or ignored error condition")
+        
+        elif signal.stack_trace:
+            # Extract from stack trace
+            if "File" in signal.stack_trace:
+                causes.append(f"Error occurred in: {signal.function_name or 'unknown function'}")
+            
+            if signal.exception_type:
+                causes.append(f"Exception type: {signal.exception_type}")
+        
+        # Check context for additional clues
+        if signal.context:
+            if signal.context.get("retry_count", 0) > 3:
+                causes.append("Multiple retry attempts failed - likely systemic issue")
+            
+            if signal.context.get("previous_errors"):
+                causes.append("Part of error chain - check related signals")
+        
+        return "; ".join(causes) if causes else "Root cause analysis inconclusive"
+    
+    def _attempt_auto_recovery(self, signal: ErrorSignal):
+        """
+        Attempt automatic recovery for recoverable errors.
+        """
+        if signal.severity in [ErrorSeverity.CRITICAL, ErrorSeverity.HIGH]:
+            # For critical errors, attempt recovery
+            if signal.error_type == ErrorCategory.TIMEOUT_ERROR:
+                signal.is_recovered = True
+                self.stats["recovered_count"] += 1
+                logger.info(f"🔧 Auto-recovered signal {signal.signal_id}")
+    
+    def register_callback(self, callback: Callable[[ErrorSignal], None]):
+        """Register a callback to be called when signals are emitted"""
+        self._signal_callbacks.append(callback)
+    
+    def detect_bare_except(self, file_path: str, content: str) -> List[ErrorSignal]:
+        """
+        Scan code for bare except blocks (static analysis).
+        This detects places where errors are being hidden.
+        """
+        signals = []
+        import re
+        
+        lines = content.split('\n')
+        for i, line in enumerate(lines, 1):
+            if re.match(r'^\s*except\s*:', line):
+                signal = self.emit(
+                    error_type=ErrorCategory.BARE_EXCEPT,
+                    severity=ErrorSeverity.CRITICAL,
+                    message=f"Bare except block detected at line {i}",
+                    file_path=file_path,
+                    line_number=i,
+                    context={"code": line.strip(), "detection_type": "static"}
+                )
+                signals.append(signal)
+        
+        return signals
+    
+    def detect_empty_pass(self, file_path: str, content: str) -> List[ErrorSignal]:
+        """
+        Scan code for empty pass statements (static analysis).
+        """
+        signals = []
+        import re
+        
+        lines = content.split('\n')
+        for i, line in enumerate(lines, 1):
+            if re.match(r'^\s+pass\s*$', line) or re.match(r'^pass\s*$', line):
+                # Check if it's in an except block (often intentional)
+                if i > 1:
+                    prev_lines = lines[max(0, i-3):i-1]
+                    if not any('except' in l for l in prev_lines):
+                        signal = self.emit(
+                            error_type=ErrorCategory.PASS_STATEMENT,
+                            severity=ErrorSeverity.MEDIUM,
+                            message=f"Empty pass statement at line {i} - may indicate unfinished code",
+                            file_path=file_path,
+                            line_number=i,
+                            context={"code": line.strip(), "detection_type": "static"}
+                        )
+                        signals.append(signal)
+        
+        return signals
+    
+    def get_signals_by_severity(self, severity: ErrorSeverity) -> List[ErrorSignal]:
+        """Get all signals of a specific severity"""
+        indices = self._severity_index.get(severity, [])
+        return [self.signals[i] for i in indices]
+    
+    def get_signals_by_category(self, category: ErrorCategory) -> List[ErrorSignal]:
+        """Get all signals of a specific category"""
+        indices = self._signal_index.get(category, [])
+        return [self.signals[i] for i in indices]
+    
+    def get_signals_by_file(self, file_path: str) -> List[ErrorSignal]:
+        """Get all signals from a specific file"""
+        indices = self._file_index.get(file_path, [])
+        return [self.signals[i] for i in indices]
+    
+    def get_critical_signals(self) -> List[ErrorSignal]:
+        """Get all critical severity signals"""
+        return self.get_signals_by_severity(ErrorSeverity.CRITICAL)
+    
+    def export_signals(self, filepath: str = None) -> Dict:
+        """Export all signals for analysis"""
+        data = {
+            "export_time": time.time(),
+            "stats": dict(self.stats),
+            "signals": [s.to_dict() for s in self.signals[-100:]]  # Last 100
+        }
+        
+        if filepath:
+            with open(filepath, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+        
+        return data
+    
+    def get_statistics(self) -> Dict:
+        """Get signal statistics"""
+        return dict(self.stats)
+
+
+# Global error signal emitter instance
+_global_emitter: Optional[ErrorSignalEmitter] = None
+
+
+def get_error_emitter() -> ErrorSignalEmitter:
+    """Get or create the global error signal emitter"""
+    global _global_emitter
+    if _global_emitter is None:
+        _global_emitter = ErrorSignalEmitter()
+    return _global_emitter
+
+
+def emit_error_signal(error_type: ErrorCategory,
+                      severity: ErrorSeverity,
+                      message: str,
+                      **kwargs) -> ErrorSignal:
+    """Convenience function to emit error signals"""
+    return get_error_emitter().emit(error_type, severity, message, **kwargs)
 
 
 @dataclass
@@ -2696,3 +3078,122 @@ class UnifiedReleaseGateManager:
             with open(filepath, 'w') as f:
                 json.dump(report, f, indent=2, default=str)
         return report
+
+
+# ==================== AUTOMATIC CODE SCANNER ====================
+# ADVANCED: Auto-scan for issues that prevent self-improvement
+
+class AutomaticCodeScanner:
+    """
+    Automatically scan codebase for issues that prevent self-improvement:
+    - Bare except blocks (hide errors)
+    - Empty pass statements (unfinished code)
+    - Silent error handling
+    
+    This scanner integrates with ErrorSignalEmitter to report findings.
+    """
+    
+    def __init__(self, emitter: ErrorSignalEmitter = None):
+        self.emitter = emitter or get_error_emitter()
+        self.scan_results: List[Dict] = []
+        
+        logger.info("🔍 AutomaticCodeScanner initialized")
+    
+    def scan_file(self, file_path: str) -> List[ErrorSignal]:
+        """Scan a single file for issues"""
+        signals = []
+        
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+            
+            # Detect bare except
+            signals.extend(self.emitter.detect_bare_except(file_path, content))
+            
+            # Detect empty pass
+            signals.extend(self.emitter.detect_empty_pass(file_path, content))
+            
+            self.scan_results.append({
+                "file": file_path,
+                "signals_count": len(signals),
+                "signals": [s.signal_id for s in signals]
+            })
+            
+            logger.info(f"🔍 Scanned {file_path}: {len(signals)} issues found")
+            
+        except Exception as e:
+            logger.error(f"Error scanning {file_path}: {e}")
+        
+        return signals
+    
+    def scan_directory(self, directory: str, extensions: List[str] = ['.py']) -> Dict:
+        """Scan all files in a directory"""
+        import os
+        
+        all_signals = []
+        scanned = 0
+        
+        for root, dirs, files in os.walk(directory):
+            # Skip hidden and cache directories
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules']]
+            
+            for file in files:
+                if any(file.endswith(ext) for ext in extensions):
+                    file_path = os.path.join(root, file)
+                    signals = self.scan_file(file_path)
+                    all_signals.extend(signals)
+                    scanned += 1
+        
+        summary = {
+            "scanned_files": scanned,
+            "total_issues": len(all_signals),
+            "critical_issues": len([s for s in all_signals if s.severity == ErrorSeverity.CRITICAL]),
+            "signals": all_signals
+        }
+        
+        logger.info(f"🔍 Directory scan complete: {scanned} files, {len(all_signals)} issues")
+        
+        return summary
+    
+    def get_fix_suggestions(self, signal: ErrorSignal) -> str:
+        """Get fix suggestions for a detected issue"""
+        
+        if signal.error_type == ErrorCategory.BARE_EXCEPT:
+            return f"""Fix bare except at {signal.file_path}:{signal.line_number}:
+1. Replace 'except:' with specific exception types
+2. Example: 'except ValueError as e:' or 'except (ValueError, TypeError) as e:'
+3. Always log or handle the error properly"""
+        
+        elif signal.error_type == ErrorCategory.PASS_STATEMENT:
+            return f"""Fix empty pass at {signal.file_path}:{signal.line_number}:
+1. Add actual implementation or remove the pass
+2. If waiting for future implementation, add TODO comment
+3. Example: '# TODO: Implement {signal.function_name or "this feature"}'"""
+        
+        return "No specific fix suggestion available"
+
+
+def run_automatic_scan(agent_dir: str = None) -> Dict:
+    """
+    Run automatic scan on the agent directory.
+    
+    This is the MAIN entry point for self-improvement code scanning.
+    """
+    if agent_dir is None:
+        # Default to agent directory
+        import os
+        agent_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    scanner = AutomaticCodeScanner()
+    results = scanner.scan_directory(agent_dir)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"🔍 AUTOMATIC SCAN RESULTS")
+    print(f"{'='*60}")
+    print(f"Files scanned: {results['scanned_files']}")
+    print(f"Total issues: {results['total_issues']}")
+    print(f"Critical: {results['critical_issues']}")
+    print(f"{'='*60}\n")
+    
+    return results

@@ -523,7 +523,18 @@ def {spec.name}({param_list}) -> Dict[str, Any]:
         return {{"status": "error", "message": str(e)}}
 
 def _validate_inputs({param_list}) -> None:
-    pass
+    """
+    Validate input parameters.
+    Raises ValueError if validation fails.
+    """
+    # Input validation - add specific validation logic based on parameter types
+    for param_name, param_value in [{{", ".join([f'("{k}", {k})' for k in params.keys()) if params else '("kwargs", kwargs)'}}}]:
+        if param_value is None:
+            raise ValueError(f"Parameter '{{param_name}}' cannot be None")
+    
+    # Add type checking if needed
+    # Example: isinstance(param_value, expected_type)
+
 '''
         
         try:

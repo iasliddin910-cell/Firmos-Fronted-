@@ -1435,3 +1435,76 @@ def create_regression_runner(test_command: str = "pytest", test_dir: str = "test
     Create a real regression runner for standalone use.
     """
     return RealRegressionRunner(test_command=test_command, test_dir=test_dir)
+
+
+# ==================== BENCHMARK SIGNAL INTEGRATION ====================
+# ADVANCED: Connect benchmark results to self-improvement error signals
+
+def integrate_benchmark_with_error_signals(benchmark_result: Dict) -> Dict:
+    """
+    Integrate benchmark results with error signal system.
+    
+    This enables:
+    - Benchmark failures to trigger error signals
+    - Automatic root cause analysis of benchmark failures
+    - Self-improvement system to respond to benchmarks
+    
+    Args:
+        benchmark_result: Result from benchmark run
+        
+    Returns:
+        Dict with integration results
+    """
+    try:
+        from self_improvement import (
+            ErrorSignalEmitter, 
+            ErrorCategory, 
+            ErrorSeverity,
+            get_error_emitter
+        )
+        
+        emitter = get_error_emitter()
+        signals_created = []
+        
+        # Check for benchmark failures
+        if not benchmark_result.get("passed", True):
+            # Benchmark failed - emit critical signal
+            signal = emitter.emit(
+                error_type=ErrorCategory.RUNTIME_ERROR,
+                severity=ErrorSeverity.HIGH,
+                message=f"Benchmark failed: {benchmark_result.get('status', 'unknown')}",
+                context={
+                    "benchmark_result": benchmark_result,
+                    "detection_type": "benchmark_integration"
+                }
+            )
+            signals_created.append(signal.signal_id)
+        
+        # Check for performance degradation
+        score = benchmark_result.get("score", 1.0)
+        if score < 0.7:
+            signal = emitter.emit(
+                error_type=ErrorCategory.LOGIC_ERROR,
+                severity=ErrorSeverity.MEDIUM,
+                message=f"Benchmark score below threshold: {score}",
+                context={
+                    "score": score,
+                    "threshold": 0.7,
+                    "detection_type": "benchmark_integration"
+                }
+            )
+            signals_created.append(signal.signal_id)
+        
+        return {
+            "success": True,
+            "signals_created": signals_created,
+            "benchmark_passed": benchmark_result.get("passed", True),
+            "score": benchmark_result.get("score", 1.0)
+        }
+        
+    except ImportError:
+        logger.warning("self_improvement module not available for integration")
+        return {"success": False, "error": "Module not available"}
+    except Exception as e:
+        logger.error(f"Benchmark signal integration error: {e}")
+        return {"success": False, "error": str(e)}
