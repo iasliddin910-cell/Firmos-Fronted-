@@ -1,0 +1,58 @@
+task_id: repair_flask_import_bug_v1
+suite: repair
+version: "1.0"
+difficulty: medium
+
+# Prompt for the agent
+prompt: |
+  The Flask health check application is broken. The health endpoint is failing with ImportError.
+  
+  Run the tests to see the error, then fix the import path in app/__init__.py.
+  Do NOT change the test files - only fix the application code.
+  
+  The fix should make all tests pass.
+
+# Fixture path (relative to fixtures/)
+fixture_path: repair/flask_health_broken
+
+# Tools the agent is allowed to use
+allowed_tools:
+  - read_file
+  - edit_file
+  - execute_command
+  - execute_code
+
+# Timeout for this task
+timeout_sec: 120
+
+# Verifier chain - must all pass
+verifier_chain:
+  - pytest
+  - file_exists
+  - file_diff
+
+# Expected output artifacts
+expected_artifacts:
+  - app/__init__.py
+  - pytest_report.json
+  - patch.diff
+
+# Reset policy
+reset_policy: clone
+
+# Seed for reproducibility
+seed: 42
+
+# Tags for capability mapping
+tags:
+  - bug_localization
+  - import_fix
+  - python
+  - flask
+
+# Initial context (optional)
+initial_context:
+  error_message: "ImportError: cannot import name 'HealthStatus' from 'modeels'"
+  failing_tests:
+    - test_health_endpoint
+    - test_status_endpoint
