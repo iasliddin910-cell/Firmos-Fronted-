@@ -290,6 +290,47 @@ class TaskEvent:
     checkpoint_id: Optional[str] = None
 
 
+# ==================== EXECUTION CURSOR ====================
+# FIX #3: Execution cursor for step-level resume
+
+@dataclass
+class ExecutionCursor:
+    """
+    FIX #3: Execution cursor for step-level resume.
+    
+    Tracks exactly where in the execution flow the task is.
+    This enables precise crash recovery.
+    """
+    phase: str                           # prepare, execute, verify, commit
+    step_id: Optional[str] = None        # Current step ID
+    tool_name: Optional[str] = None      # Current tool being executed
+    tool_args_hash: Optional[str] = None # Hash of tool arguments
+    verification_phase: Optional[str] = None  # verifying, validating
+    approval_request_id: Optional[str] = None  # Pending approval
+    scheduler_wake_at: Optional[float] = None  # Scheduled resume time
+    side_effect_committed: bool = False  # Has side effect been committed?
+    artifacts_created: List[str] = field(default_factory=list)
+
+
+# ==================== ROLLBACK SNAPSHOT ====================
+# FIX #6: Typed rollback snapshots
+
+@dataclass
+class RollbackSnapshot:
+    """
+    FIX #6: Typed rollback snapshot - not just metadata dict.
+    
+    Each rollback type has a structured payload for reliable restore.
+    """
+    kind: str                             # file_mutation, browser_state, env_change, etc.
+    restore_handler: str                  # Which handler to use for restore
+    payload: Dict[str, Any]              # Structured data for restore
+    created_at: float = field(default_factory=time.time)
+    checksum: Optional[str] = None        # For integrity verification
+
+
+# ==================== CHECKPOINT SPEC ====================
+
 @dataclass
 class TaskCheckpoint:
     """
@@ -300,9 +341,14 @@ class TaskCheckpoint:
     task_id: str
     checkpoint_id: str
     last_safe_status: str
-    execution_cursor: Dict[str, Any] = field(default_factory=dict)
+    execution_cursor: ExecutionCursor = None
+    rollback_data: Dict[str, Any] = field(default_factory=dict)
     artifacts: List[str] = field(default_factory=list)
+    evidence: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
+    
+    # FIX #6: Add typed rollback snapshots
+    rollback_snapshots: List[RollbackSnapshot] = field(default_factory=list)
 
 
 # ==================== ENUMS ====================
@@ -2377,7 +2423,18 @@ class TaskManager:
             approval_policy=data.get('approval_policy', 'auto'),
             sandbox_mode=data.get('sandbox_mode', 'normal'),
             artifact_expectations=data.get('artifact_expectations', []),
+            # FIX #1: Restore rollback_point - previously was missing!
+            rollback_point=data.get('rollback_point'),
         )
+        
+        # FIX #1: Restore task lineage fields
+        task.parent_task_id = data.get('parent_task_id')
+        task.superseded_by = data.get('superseded_by')
+        task.replacement_for = data.get('replacement_for')
+        
+        # FIX #1: Restore checkpoint fields
+        task.checkpoint_id = data.get('checkpoint_id')
+        task.last_safe_status = data.get('last_safe_status')
         
         # Restore status
         if 'status' in data:
@@ -2442,15 +2499,15 @@ class TaskManager:
                 self.background_queue.put(task)
             
             # Get approval waiting tasks
-            for task_id, task in self.approval_waiting_tasks.items():
-                approval_tasks[task_id] = self._task_to_dict(task)
+            # FIX #2: Save as list of task dicts, not dict
+            approval_tasks_list = [self._task_to_dict(task) for task in self.approval_waiting_tasks.values()]
             
             state = {
                 'version': self.state_version,
                 'tasks': [self._task_to_dict(t) for t in self.tasks.values()],
                 'pending_tasks': pending_tasks,
                 'background_tasks': background_tasks,
-                'approval_waiting_tasks': approval_tasks,
+                'approval_waiting_tasks': approval_tasks_list,  # FIX #2: Save as list
                 'running_tasks': list(self.running_tasks),
                 'completed_tasks': list(self.completed_tasks),
                 'failed_tasks': list(self.failed_tasks),
@@ -3150,6 +3207,277 @@ class CentralKernel:
     def get_task_checkpoint(self, task_id: str) -> Optional[TaskCheckpoint]:
         """FIX #5: Get checkpoint for a task"""
         return self._task_checkpoints.get(task_id)
+    
+    async def save_checkpoint(
+        self, 
+        task: 'Task', 
+        cursor: Optional[ExecutionCursor] = None,
+        extra: Optional[Dict] = None
+    ) -> str:
+        """
+        FIX #4: Save checkpoint with execution cursor.
+        
+        This is the kernel-level checkpoint API that enables:
+        - Step-level resume after crash
+        - Side-effect reconciliation
+        - Verification checkpointing
+        
+        Args:
+            task: The task to checkpoint
+            cursor: Current execution cursor (optional)
+            extra: Any additional checkpoint data
+            
+        Returns:
+            checkpoint_id
+        """
+        checkpoint_id = str(uuid.uuid4())
+        
+        # Build execution cursor if not provided
+        if cursor is None:
+            cursor = ExecutionCursor(
+                phase='unknown',
+                tool_name=task.metadata.get('current_tool'),
+                artifacts_created=task.artifacts or []
+            )
+        
+        # Create checkpoint
+        checkpoint = TaskCheckpoint(
+            task_id=task.id,
+            checkpoint_id=checkpoint_id,
+            last_safe_status=task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
+            execution_cursor=cursor,
+            artifacts=task.artifacts or [],
+            evidence=extra or {}
+        )
+        
+        # Store checkpoint
+        self._task_checkpoints[task.id] = checkpoint
+        task.checkpoint_id = checkpoint_id
+        task.last_safe_status = checkpoint.last_safe_status
+        
+        # Also save to disk for durability
+        self._persist_checkpoint(checkpoint)
+        
+        logger.info(f"💾 Checkpoint saved for {task.id}: {checkpoint_id} (phase: {cursor.phase})")
+        return checkpoint_id
+    
+    async def restore_from_checkpoint(self, checkpoint_id: str) -> Dict:
+        """
+        FIX #5: Restore task from checkpoint.
+        
+        This performs crash reconciliation:
+        - If task was RUNNING with uncommitted side effects -> RECOVERING
+        - If verification was in progress -> resume from VERIFYING
+        - If approval was pending -> check if still valid
+        
+        Args:
+            checkpoint_id: The checkpoint to restore from
+            
+        Returns:
+            dict with 'task', 'cursor', 'reconciliation_action'
+        """
+        # Find checkpoint by ID
+        checkpoint = None
+        for cp in self._task_checkpoints.values():
+            if cp.checkpoint_id == checkpoint_id:
+                checkpoint = cp
+                break
+        
+        if not checkpoint:
+            # Try to load from disk
+            checkpoint = self._load_checkpoint(checkpoint_id)
+        
+        if not checkpoint:
+            return {
+                'success': False,
+                'error': f'Checkpoint not found: {checkpoint_id}'
+            }
+        
+        # Get task
+        task = self.task_manager.get_task(checkpoint.task_id)
+        if not task:
+            return {
+                'success': False,
+                'error': f'Task not found: {checkpoint.task_id}'
+            }
+        
+        # Perform reconciliation based on cursor
+        reconciliation_action = 'unknown'
+        
+        if checkpoint.execution_cursor:
+            cursor = checkpoint.execution_cursor
+            
+            # Case 1: Side effect was committed but verification not complete
+            if cursor.side_effect_committed and cursor.verification_phase:
+                task.status = TaskStatus.VERIFYING
+                reconciliation_action = 'resume_verification'
+            
+            # Case 2: Tool was executing, check if it completed
+            elif cursor.tool_name and not cursor.side_effect_committed:
+                task.status = TaskStatus.RECOVERING
+                reconciliation_action = 'recover_execution'
+            
+            # Case 3: Approval was pending
+            elif cursor.approval_request_id:
+                # Check if approval is still valid
+                if cursor.approval_request_id in self.pending_approvals:
+                    task.status = TaskStatus.WAITING_APPROVAL
+                    reconciliation_action = 'resume_approval'
+                else:
+                    task.status = TaskStatus.RECOVERING
+                    reconciliation_action = 'approval_expired'
+            
+            # Case 4: Just a pause, resume to READY
+            else:
+                task.status = TaskStatus.READY
+                reconciliation_action = 'resume_from_pause'
+        
+        # Restore checkpoint info
+        task.checkpoint_id = checkpoint.checkpoint_id
+        task.last_safe_status = checkpoint.last_safe_status
+        
+        logger.info(f"🔄 Restored {task.id} from checkpoint {checkpoint_id}, action: {reconciliation_action}")
+        
+        return {
+            'success': True,
+            'task': task,
+            'cursor': checkpoint.execution_cursor,
+            'reconciliation_action': reconciliation_action,
+            'artifacts': checkpoint.artifacts,
+            'evidence': checkpoint.evidence
+        }
+    
+    async def resume_task(self, task_id: str) -> Dict:
+        """
+        FIX #4: Resume task from where it left off.
+        
+        This is the main resume API that telegram_bot.py expects.
+        
+        Args:
+            task_id: The task to resume
+            
+        Returns:
+            dict with resume result
+        """
+        task = self.task_manager.get_task(task_id)
+        if not task:
+            return {
+                'success': False,
+                'error': f'Task not found: {task_id}'
+            }
+        
+        # Check if there's a checkpoint
+        if task.checkpoint_id:
+            return await self.restore_from_checkpoint(task.checkpoint_id)
+        
+        # No checkpoint, determine resume action based on status
+        current_status = task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+        
+        if current_status in [TaskStatus.PAUSED.value, TaskStatus.WAITING_APPROVAL.value]:
+            # Resume from pause/approval
+            task.status = TaskStatus.READY
+            logger.info(f"▶️ Resumed task {task_id} from {current_status}")
+            return {
+                'success': True,
+                'task': task,
+                'action': 'resume_ready'
+            }
+        
+        elif current_status == TaskStatus.RECOVERING.value:
+            # Resume from recovery
+            task.status = TaskStatus.RETRYING
+            logger.info(f"🔄 Resumed task {task_id} from RECOVERING")
+            return {
+                'success': True,
+                'task': task,
+                'action': 'resume_retrying'
+            }
+        
+        elif current_status == TaskStatus.RETRYING.value:
+            # Resume retry
+            task.status = TaskStatus.RUNNING
+            logger.info(f"🔁 Resumed task {task_id} for retry")
+            return {
+                'success': True,
+                'task': task,
+                'action': 'retry'
+            }
+        
+        else:
+            return {
+                'success': False,
+                'error': f'Cannot resume from status: {current_status}'
+            }
+    
+    def _persist_checkpoint(self, checkpoint: TaskCheckpoint):
+        """FIX #5: Persist checkpoint to disk"""
+        import json
+        import os
+        
+        checkpoint_dir = Path("data/checkpoints")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        checkpoint_path = checkpoint_dir / f"{checkpoint.checkpoint_id}.json"
+        
+        # Serialize checkpoint
+        data = {
+            'task_id': checkpoint.task_id,
+            'checkpoint_id': checkpoint.checkpoint_id,
+            'last_safe_status': checkpoint.last_safe_status,
+            'execution_cursor': {
+                'phase': checkpoint.execution_cursor.phase if checkpoint.execution_cursor else 'unknown',
+                'step_id': checkpoint.execution_cursor.step_id if checkpoint.execution_cursor else None,
+                'tool_name': checkpoint.execution_cursor.tool_name if checkpoint.execution_cursor else None,
+                'verification_phase': checkpoint.execution_cursor.verification_phase if checkpoint.execution_cursor else None,
+                'approval_request_id': checkpoint.execution_cursor.approval_request_id if checkpoint.execution_cursor else None,
+                'side_effect_committed': checkpoint.execution_cursor.side_effect_committed if checkpoint.execution_cursor else False,
+            },
+            'artifacts': checkpoint.artifacts,
+            'evidence': checkpoint.evidence,
+            'created_at': checkpoint.created_at
+        }
+        
+        try:
+            with open(checkpoint_path, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning(f"Failed to persist checkpoint: {e}")
+    
+    def _load_checkpoint(self, checkpoint_id: str) -> Optional[TaskCheckpoint]:
+        """FIX #5: Load checkpoint from disk"""
+        import json
+        
+        checkpoint_dir = Path("data/checkpoints")
+        checkpoint_path = checkpoint_dir / f"{checkpoint_id}.json"
+        
+        if not checkpoint_path.exists():
+            return None
+        
+        try:
+            with open(checkpoint_path, 'r') as f:
+                data = json.load(f)
+            
+            cursor = ExecutionCursor(
+                phase=data.get('execution_cursor', {}).get('phase', 'unknown'),
+                step_id=data.get('execution_cursor', {}).get('step_id'),
+                tool_name=data.get('execution_cursor', {}).get('tool_name'),
+                verification_phase=data.get('execution_cursor', {}).get('verification_phase'),
+                approval_request_id=data.get('execution_cursor', {}).get('approval_request_id'),
+                side_effect_committed=data.get('execution_cursor', {}).get('side_effect_committed', False),
+            )
+            
+            return TaskCheckpoint(
+                task_id=data['task_id'],
+                checkpoint_id=data['checkpoint_id'],
+                last_safe_status=data['last_safe_status'],
+                execution_cursor=cursor,
+                artifacts=data.get('artifacts', []),
+                evidence=data.get('evidence', {}),
+                created_at=data.get('created_at', time.time())
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint {checkpoint_id}: {e}")
+            return None
     
     async def process(self, user_message: str) -> str:
         """
