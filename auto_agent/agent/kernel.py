@@ -68,6 +68,93 @@ from agent.multi_agent_coordinator import MultiAgentCoordinator as NewMultiAgent
 logger = logging.getLogger(__name__)
 
 
+# ==================== TRANSACTION MODELS ====================
+# FIX: Commit / side-effect transaction boundary canonical
+
+class TransactionPhase(str, Enum):
+    """
+    Side-effect transaction lifecycle phases.
+    
+    FIX: Side-effect action must go through canonical phases:
+    - PREPARED: Intent recorded, resources allocated
+    - APPLIED: Action executed, side effects applied
+    - OBSERVED: Effects observed and recorded
+    - VERIFIED: Verification passed (evidence collected)
+    - COMMITTED: State change finalized (cannot be rolled back)
+    - ROLLED_BACK: Effects reverted to snapshot
+    
+    CRITICAL: APPLIED != COMMITTED
+    An action can be applied but not committed until verification passes!
+    """
+    PREPARED = "prepared"
+    APPLIED = "applied"
+    OBSERVED = "observed"
+    VERIFIED = "verified"
+    COMMITTED = "committed"
+    ROLLBACK_PENDING = "rollback_pending"
+    ROLLING_BACK = "rolling_back"
+    ROLLED_BACK = "rolled_back"
+    FAILED = "failed"
+
+
+class IdempotencyClass(str, Enum):
+    """
+    Idempotency classification for tools/actions.
+    
+    FIX: Must know replay safety for retry/resume logic.
+    
+    Common examples:
+    - read_file: IDEMPOTENT
+    - write_file: CONDITIONALLY_IDEMPOTENT (safe if same content)
+    - delete_file: CONDITIONALLY_IDEMPOTENT (safe if already deleted)
+    - browser_click: NON_IDEMPOTENT
+    - append_file: NON_IDEMPOTENT
+    - execute_command: CONDITIONALLY_IDEMPOTENT (depends on command)
+    """
+    # Same result no matter how many times executed
+    IDEMPOTENT = "idempotent"
+    
+    # Safe only if precondition/state checked before execution
+    CONDITIONALLY_IDEMPOTENT = "conditionally_idempotent"
+    
+    # Different result each time, unsafe to replay
+    NON_IDEMPOTENT = "non_idempotent"
+
+
+# Idempotency defaults for common tools
+TOOL_IDEMPOTENCY: Dict[str, IdempotencyClass] = {
+    # Read operations - always idempotent
+    "read_file": IdempotencyClass.IDEMPOTENT,
+    "read_directory": IdempotencyClass.IDEMPOTENT,
+    "grep": IdempotencyClass.IDEMPOTENT,
+    "get_env": IdempotencyClass.IDEMPOTENT,
+    "get_system_info": IdempotencyClass.IDEMPOTENT,
+    
+    # Write operations - conditionally idempotent
+    "write_file": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    "create_directory": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    "copy_file": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    
+    # Delete operations - conditionally idempotent
+    "delete_file": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    "remove_directory": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    
+    # Execute operations - conditionally idempotent
+    "execute_command": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    "run_script": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    "install_package": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    
+    # Browser operations - non-idempotent
+    "browser_click": IdempotencyClass.NON_IDEMPOTENT,
+    "browser_type": IdempotencyClass.NON_IDEMPOTENT,
+    "browser_navigate": IdempotencyClass.NON_IDEMPOTENT,
+    
+    # Network operations - conditionally idempotent
+    "http_request": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+    "api_call": IdempotencyClass.CONDITIONALLY_IDEMPOTENT,
+}
+
+
 # ==================== CANONICAL VERIFICATION TYPES ====================
 # NEW: Single source of truth for verification types (FIX #19)
 
@@ -1314,6 +1401,139 @@ class TaskStatus(Enum):
             'failed': cls.FAILED,
         }
         return aliases.get(old_name, cls.PENDING)
+
+
+# ==================== TRANSACTION DATA CLASSES ====================
+# FIX: Side-effect transaction models
+
+@dataclass
+class WorldStateDelta:
+    """
+    Represents the delta/changes to world state from a side-effect action.
+    
+    FIX: Tool execution must return what actually changed, not just output.
+    """
+    artifacts_created: List[str] = field(default_factory=list)
+    files_modified: List[str] = field(default_factory=list)
+    files_deleted: List[str] = field(default_factory=list)
+    resources_touched: List[str] = field(default_factory=list)
+    external_effects: List[str] = field(default_factory=list)
+    environment_changes: Dict[str, Any] = field(default_factory=dict)
+    
+    def is_empty(self) -> bool:
+        return (
+            not self.artifacts_created 
+            and not self.files_modified 
+            and not self.files_deleted 
+            and not self.resources_touched
+            and not self.external_effects
+            and not self.environment_changes
+        )
+
+
+@dataclass
+class SideEffectTransaction:
+    """
+    Represents a side-effect transaction with full lifecycle tracking.
+    
+    FIX: Side-effecting tasks MUST use this model for tracking.
+    
+    CRITICAL: An action is NOT committed until:
+    1. It has been APPLIED (executed)
+    2. It has been OBSERVED (effects recorded)
+    3. It has been VERIFIED (evidence collected)
+    4. It has been COMMITTED (state change finalized)
+    """
+    tx_id: str
+    task_id: str
+    tool_name: str
+    phase: TransactionPhase = TransactionPhase.PREPARED
+    
+    # Intent - what was planned
+    intended_changes: Dict[str, Any] = field(default_factory=dict)
+    arguments: Dict[str, Any] = field(default_factory=dict)
+    
+    # Actual - what actually happened
+    observed_delta: "WorldStateDelta" = field(default_factory=lambda: WorldStateDelta())
+    output: Any = None
+    
+    # Evidence and verification
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    verification_passed: bool = False
+    verification_details: str = ""
+    
+    # Rollback support
+    rollback_snapshot_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    
+    # Timing
+    created_at: float = field(default_factory=time.time)
+    applied_at: Optional[float] = None
+    observed_at: Optional[float] = None
+    verified_at: Optional[float] = None
+    committed_at: Optional[float] = None
+    
+    # Metadata
+    retry_count: int = 0
+    failure: Optional["FailureRecord"] = None
+    
+    def is_committed(self) -> bool:
+        """Check if transaction is committed"""
+        return self.phase == TransactionPhase.COMMITTED
+    
+    def can_retry(self) -> bool:
+        """Check if transaction can be retried"""
+        if self.phase in [TransactionPhase.COMMITTED, TransactionPhase.ROLLED_BACK]:
+            return False
+        
+        idempotency = TOOL_IDEMPOTENCY.get(self.tool_name, IdempotencyClass.NON_IDEMPOTENT)
+        
+        if idempotency == IdempotencyClass.IDEMPOTENT:
+            return True
+        elif idempotency == IdempotencyClass.CONDITIONALLY_IDEMPOTENT:
+            return self.phase in [TransactionPhase.PREPARED, TransactionPhase.VERIFIED]
+        else:
+            return self.phase == TransactionPhase.PREPARED
+    
+    def needs_verification(self) -> bool:
+        """Check if transaction needs verification"""
+        return self.phase in [TransactionPhase.APPLIED, TransactionPhase.OBSERVED]
+    
+    def can_commit(self) -> bool:
+        """
+        Check if transaction can be committed.
+        
+        CRITICAL: Verification must pass before commit!
+        """
+        return (
+            self.phase in [TransactionPhase.OBSERVED, TransactionPhase.VERIFIED]
+            and self.verification_passed
+            and self.evidence
+        )
+
+
+@dataclass
+class CommitDecision:
+    """
+    Typed commit decision from the commit gate.
+    
+    FIX: Commit must be a deliberate decision, not automatic success.
+    """
+    allowed: bool
+    reason: str
+    phase_before: TransactionPhase
+    phase_after: TransactionPhase
+    
+    # Evidence checks
+    evidence_present: bool
+    verification_passed: bool
+    
+    # Rollback availability
+    rollback_available: bool
+    rollback_snapshot_id: Optional[str] = None
+    
+    # If commit not allowed, what to do
+    action: str = "proceed"  # proceed, rollback, retry, escalate
 
 
 # ==================== DATA CLASSES ====================
