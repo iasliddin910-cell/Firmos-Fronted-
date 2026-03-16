@@ -229,6 +229,10 @@ class HumanReviewSpec:
 # ==================== RECOVERY CONTRACTS ====================
 # FIX #2: Typed recovery contracts
 
+# Forward reference to avoid circular dependency
+_RecoveryStrategyType = "RecoveryStrategy"
+
+
 @dataclass
 class RecoveryDecision:
     """
@@ -237,7 +241,7 @@ class RecoveryDecision:
     This is the contract that recovery engine produces when deciding
     how to handle a failure.
     """
-    strategy: RecoveryStrategy
+    strategy: _RecoveryStrategyType
     confidence: float
     reason: str
     retry_allowed: bool = False
@@ -256,7 +260,7 @@ class RecoveryOutcome:
     a recovery strategy.
     """
     success: bool
-    strategy: RecoveryStrategy
+    strategy: _RecoveryStrategyType
     next_status: str  # TaskStatus as string to avoid circular import
     action_taken: str
     evidence: Dict[str, Any] = field(default_factory=dict)
@@ -515,8 +519,537 @@ class AgentRole(Enum):
     TOOL_BUILDER = "tool_builder"
 
 
+class FailureCategory(str, Enum):
+    """
+    Canonical failure categories - SINGLE source of truth for error classification.
+    
+    This replaces fragmented error strings with a typed, machine-usable taxonomy.
+    
+    FIX: Error taxonomy / failure classification canonical
+    
+    Key distinctions:
+    - Tool vs Verification vs Approval vs Policy vs Resource vs Network vs Internal
+    - Execution failure vs Verification failure - strictly separated
+    - Retryable vs Non-retryable - first-class classification
+    - Timeout subtypes - explicitly typed
+    """
+    # ===== TOOL ERRORS =====
+    TOOL_NOT_FOUND = "tool_not_found"
+    TOOL_ARGS_INVALID = "tool_args_invalid"
+    TOOL_EXECUTION_FAILED = "tool_execution_failed"
+    TOOL_EXECUTION_TIMEOUT = "tool_execution_timeout"
+    TOOL_EXECUTION_CRASHED = "tool_execution_crashed"
+    TOOL_PERMISSION_DENIED = "tool_permission_denied"
+    TOOL_DEPENDENCY_MISSING = "tool_dependency_missing"
+    TOOL_OUTPUT_PARSE_ERROR = "tool_output_parse_error"
+    
+    # ===== VERIFICATION ERRORS =====
+    # CRITICAL: Strictly separated from execution errors!
+    VERIFICATION_FAILED = "verification_failed"
+    VERIFICATION_FAILED_ARTIFACT_MISSING = "verification_failed_artifact_missing"
+    VERIFICATION_FAILED_ASSERTION = "verification_failed_assertion"
+    VERIFICATION_FAILED_PATTERN = "verification_failed_pattern"
+    VERIFICATION_FAILED_STATE = "verification_failed_state"
+    VERIFICATION_TIMEOUT = "verification_timeout"
+    VERIFICATION_EVIDENCE_MISSING = "verification_evidence_missing"
+    
+    # ===== APPROVAL / GOVERNANCE ERRORS =====
+    # CRITICAL: These are governance outcomes, NOT tool errors!
+    APPROVAL_DENIED = "approval_denied"
+    APPROVAL_EXPIRED = "approval_expired"
+    APPROVAL_PENDING = "approval_pending"
+    APPROVAL_WITHDRAWN = "approval_withdrawn"
+    
+    # ===== POLICY / SAFETY ERRORS =====
+    # CRITICAL: Policy failures are NOT recoverable by retry!
+    POLICY_BLOCKED = "policy_blocked"
+    POLICY_VIOLATION = "policy_violation"
+    SANDBOX_REJECTED = "sandbox_rejected"
+    WORKSPACE_BOUNDARY_VIOLATION = "workspace_boundary_violation"
+    COMMAND_BLOCKED = "command_blocked"
+    SENSITIVE_OPERATION = "sensitive_operation"
+    
+    # ===== RESOURCE ERRORS =====
+    RESOURCE_NOT_FOUND = "resource_not_found"
+    RESOURCE_BUSY = "resource_busy"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+    RESOURCE_LOCK_CONFLICT = "resource_lock_conflict"
+    RESOURCE_DEADLOCK = "resource_deadlock"
+    
+    # ===== DEPENDENCY ERRORS =====
+    DEPENDENCY_BLOCKED = "dependency_blocked"
+    DEPENDENCY_CYCLE = "dependency_cycle"
+    DEPENDENCY_MISSING = "dependency_missing"
+    DEPENDENCY_VERSION_CONFLICT = "dependency_version_conflict"
+    
+    # ===== SCHEDULER ERRORS =====
+    SCHEDULER_TIMEOUT = "scheduler_timeout"
+    SCHEDULER_STARVATION = "scheduler_starvation"
+    SCHEDULER_QUEUE_FULL = "scheduler_queue_full"
+    TASK_QUEUE_TIMEOUT = "task_queue_timeout"
+    
+    # ===== CHECKPOINT / ROLLBACK ERRORS =====
+    CHECKPOINT_NOT_FOUND = "checkpoint_not_found"
+    CHECKPOINT_RESTORE_FAILED = "checkpoint_restore_failed"
+    CHECKPOINT_CORRUPTED = "checkpoint_corrupted"
+    ROLLBACK_FAILED = "rollback_failed"
+    STATE_MISMATCH = "state_mismatch"
+    
+    # ===== NETWORK ERRORS =====
+    NETWORK_TIMEOUT = "network_timeout"
+    NETWORK_ERROR = "network_error"
+    NETWORK_UNREACHABLE = "network_unreachable"
+    NETWORK_CONNECTION_RESET = "network_connection_reset"
+    NETWORK_DNS_FAILED = "network_dns_failed"
+    
+    # ===== INTERNAL KERNEL ERRORS =====
+    INTERNAL_KERNEL_ERROR = "internal_kernel_error"
+    KERNEL_PANIC = "kernel_panic"
+    STATE_CORRUPTED = "state_corrupted"
+    SERIALIZATION_ERROR = "serialization_error"
+    
+    # ===== UNKNOWN / FALLBACK =====
+    UNKNOWN = "unknown"
+    UNPARSEABLE_ERROR = "unparseable_error"
+
+
+class FailureSeverity(str, Enum):
+    """
+    Failure severity levels for ownership and escalation decisions.
+    """
+    # User can fix with input
+    USER_FIXABLE = "user_fixable"
+    
+    # System can fix automatically
+    SYSTEM_FIXABLE = "system_fixable"
+    
+    # Infrastructure team needs to fix
+    INFRA_FIXABLE = "infra_fixable"
+    
+    # Policy decision required
+    POLICY_FINAL = "policy_final"
+    
+    # Cannot be fixed, requires escalation
+    CRITICAL = "critical"
+
+
+class FailureOwnership(str, Enum):
+    """
+    Failure ownership for routing to correct handler.
+    """
+    # User needs to provide input or decision
+    USER = "user"
+    
+    # Agent can handle with retry/recovery
+    AGENT = "agent"
+    
+    # Operator/admin needs to intervene
+    OPERATOR = "operator"
+    
+    # Infrastructure team
+    INFRASTRUCTURE = "infrastructure"
+    
+    # Policy governance
+    GOVERNANCE = "governance"
+
+
+# ==================== FAILURE MAPPER ====================
+# FIX: Exception to FailureRecord mapping layer
+
+class FailureMapper:
+    """
+    Maps various exception types to canonical FailureRecord.
+    
+    This is the bridge between raw exceptions and typed failure taxonomy.
+    
+    FIX: Error taxonomy / failure classification canonical
+    
+    Key features:
+    - Maps exceptions to FailureCategory
+    - Extracts provenance (stage, subsystem, tool)
+    - Determines retryability
+    - Sets ownership and severity
+    """
+    
+    def __init__(self):
+        # Exception type to category mapping
+        self._exception_map: Dict[type, "FailureCategory"] = {
+            # Tool errors
+            FileNotFoundError: FailureCategory.TOOL_NOT_FOUND,
+            PermissionError: FailureCategory.TOOL_PERMISSION_DENIED,
+            ImportError: FailureCategory.TOOL_DEPENDENCY_MISSING,
+            ModuleNotFoundError: FailureCategory.TOOL_DEPENDENCY_MISSING,
+            
+            # Network errors
+            ConnectionError: FailureCategory.NETWORK_ERROR,
+            TimeoutError: FailureCategory.NETWORK_TIMEOUT,
+            asyncio.TimeoutError: FailureCategory.NETWORK_TIMEOUT,
+            
+            # Resource errors
+            FileExistsError: FailureCategory.RESOURCE_EXHAUSTED,
+            IsADirectoryError: FailureCategory.TOOL_ARGS_INVALID,
+            NotADirectoryError: FailureCategory.TOOL_ARGS_INVALID,
+            
+            # Value errors
+            ValueError: FailureCategory.TOOL_ARGS_INVALID,
+            TypeError: FailureCategory.TOOL_ARGS_INVALID,
+            KeyError: FailureCategory.TOOL_ARGS_INVALID,
+            
+            # JSON/Syntax errors
+            json.JSONDecodeError: FailureCategory.TOOL_OUTPUT_PARSE_ERROR,
+            SyntaxError: FailureCategory.TOOL_OUTPUT_PARSE_ERROR,
+            
+            # Memory errors
+            MemoryError: FailureCategory.RESOURCE_EXHAUSTED,
+            OSError: FailureCategory.RESOURCE_EXHAUSTED,
+        }
+    
+    def map_exception(
+        self,
+        exc: Exception,
+        stage: str = "",
+        subsystem: str = "",
+        tool_name: Optional[str] = None,
+        **kwargs
+    ) -> "FailureRecord":
+        """
+        Map an exception to a FailureRecord.
+        
+        Args:
+            exc: The exception to map
+            stage: Current execution stage
+            subsystem: Current subsystem
+            tool_name: Tool that was being executed
+            **kwargs: Additional fields for FailureRecord
+            
+        Returns:
+            FailureRecord with typed category and recovery info
+        """
+        # Get category from exception type or walk MRO
+        category = FailureCategory.UNKNOWN
+        for exc_type in type(exc).__mro__:
+            if exc_type in self._exception_map:
+                category = self._exception_map[exc_type]
+                break
+        
+        # Get recovery strategy from map
+        _init_recovery_strategy_map()  # Ensure map is initialized
+        recovery_info = RECOVERY_STRATEGY_MAP.get(category, 
+            (RecoveryStrategy.ABORT, False, False))
+        strategy, retryable, replan = recovery_info
+        
+        # Determine severity and ownership
+        severity = self._determine_severity(category, exc)
+        ownership = self._determine_ownership(category, severity)
+        
+        # Build the failure record
+        failure = FailureRecord(
+            category=category,
+            message=str(exc),
+            stage=stage,
+            subsystem=subsystem,
+            provider=tool_name,
+            tool_name=tool_name,
+            retryable=retryable,
+            recoverable=replan,
+            replan_recommended=replan,
+            escalate_recommended=(strategy == RecoveryStrategy.ESCALATE_TO_HUMAN),
+            severity=severity,
+            ownership=ownership,
+            raw_error=str(exc),
+            stack_trace=traceback.format_exc(),
+            **kwargs
+        )
+        
+        # Apply category-specific overrides
+        self._apply_category_overrides(failure, exc)
+        
+        return failure
+    
+    def map_error_message(
+        self,
+        error_msg: str,
+        stage: str = "",
+        subsystem: str = "",
+        tool_name: Optional[str] = None,
+        **kwargs
+    ) -> "FailureRecord":
+        """
+        Map an error message string to a FailureRecord.
+        
+        Used when errors come as strings rather than exceptions.
+        """
+        error_lower = error_msg.lower()
+        
+        # String pattern matching for common errors
+        category = FailureCategory.UNKNOWN
+        
+        # Network patterns
+        if any(p in error_lower for p in ["timeout", "timed out"]):
+            category = FailureCategory.NETWORK_TIMEOUT
+        elif any(p in error_lower for p in ["connection refused", "connection error", "connect failed"]):
+            category = FailureCategory.NETWORK_ERROR
+        elif any(p in error_lower for p in ["dns", "name or service not known"]):
+            category = FailureCategory.NETWORK_DNS_FAILED
+        elif any(p in error_lower for p in ["unreachable", "no route"]):
+            category = FailureCategory.NETWORK_UNREACHABLE
+        
+        # Tool patterns
+        elif any(p in error_lower for p in ["not found", "no such file", "doesn't exist"]):
+            category = FailureCategory.TOOL_NOT_FOUND
+        elif any(p in error_lower for p in ["permission denied", "access denied", "not permitted"]):
+            category = FailureCategory.TOOL_PERMISSION_DENIED
+        elif any(p in error_lower for p in ["invalid argument", "invalid args", "wrong type"]):
+            category = FailureCategory.TOOL_ARGS_INVALID
+        elif any(p in error_lower for p in ["command not found", "not recognized"]):
+            category = FailureCategory.TOOL_NOT_FOUND
+        
+        # Verification patterns
+        elif any(p in error_lower for p in ["verification failed", "assertion failed", "expected"]):
+            category = FailureCategory.VERIFICATION_FAILED
+        elif any(p in error_lower for p in ["artifact missing", "file not created", "output not found"]):
+            category = FailureCategory.VERIFICATION_FAILED_ARTIFACT_MISSING
+        
+        # Approval/Policy patterns
+        elif any(p in error_lower for p in ["approval denied", "denied", "rejected"]):
+            category = FailureCategory.APPROVAL_DENIED
+        elif any(p in error_lower for p in ["policy", "blocked", "forbidden"]):
+            category = FailureCategory.POLICY_BLOCKED
+        elif any(p in error_lower for p in ["sandbox", "restricted"]):
+            category = FailureCategory.SANDBOX_REJECTED
+        
+        # Resource patterns
+        elif any(p in error_lower for p in ["busy", "locked", "in use"]):
+            category = FailureCategory.RESOURCE_LOCK_CONFLICT
+        elif any(p in error_lower for p in ["out of memory", "resource exhausted"]):
+            category = FailureCategory.RESOURCE_EXHAUSTED
+        
+        # Get recovery strategy
+        _init_recovery_strategy_map()  # Ensure map is initialized
+        recovery_info = RECOVERY_STRATEGY_MAP.get(category,
+            (RecoveryStrategy.ABORT, False, False))
+        strategy, retryable, replan = recovery_info
+        
+        # Determine severity and ownership
+        severity = self._determine_severity(category, error_msg)
+        ownership = self._determine_ownership(category, severity)
+        
+        return FailureRecord(
+            category=category,
+            message=error_msg,
+            stage=stage,
+            subsystem=subsystem,
+            provider=tool_name,
+            tool_name=tool_name,
+            retryable=retryable,
+            recoverable=replan,
+            replan_recommended=replan,
+            escalate_recommended=(strategy == RecoveryStrategy.ESCALATE_TO_HUMAN),
+            severity=severity,
+            ownership=ownership,
+            raw_error=error_msg,
+            **kwargs
+        )
+    
+    def _determine_severity(self, category: FailureCategory, error: Any) -> FailureSeverity:
+        """Determine failure severity based on category"""
+        # Critical categories
+        if category in [
+            FailureCategory.KERNEL_PANIC,
+            FailureCategory.STATE_CORRUPTED,
+            FailureCategory.CHECKPOINT_CORRUPTED,
+        ]:
+            return FailureSeverity.CRITICAL
+        
+        # Policy final
+        if category in [
+            FailureCategory.APPROVAL_DENIED,
+            FailureCategory.POLICY_BLOCKED,
+            FailureCategory.POLICY_VIOLATION,
+            FailureCategory.WORKSPACE_BOUNDARY_VIOLATION,
+        ]:
+            return FailureSeverity.POLICY_FINAL
+        
+        # Infrastructure
+        if category in [
+            FailureCategory.CHECKPOINT_RESTORE_FAILED,
+            FailureCategory.ROLLBACK_FAILED,
+            FailureCategory.RESOURCE_EXHAUSTED,
+            FailureCategory.DEPENDENCY_VERSION_CONFLICT,
+        ]:
+            return FailureSeverity.INFRA_FIXABLE
+        
+        # User fixable
+        if category in [
+            FailureCategory.TOOL_ARGS_INVALID,
+            FailureCategory.WORKSPACE_BOUNDARY_VIOLATION,
+        ]:
+            return FailureSeverity.USER_FIXABLE
+        
+        return FailureSeverity.SYSTEM_FIXABLE
+    
+    def _determine_ownership(self, category: FailureCategory, severity: FailureSeverity) -> FailureOwnership:
+        """Determine failure ownership based on category and severity"""
+        # Governance
+        if category in [
+            FailureCategory.APPROVAL_DENIED,
+            FailureCategory.APPROVAL_EXPIRED,
+            FailureCategory.POLICY_BLOCKED,
+            FailureCategory.POLICY_VIOLATION,
+            FailureCategory.SANDBOX_REJECTED,
+            FailureCategory.SENSITIVE_OPERATION,
+        ]:
+            return FailureOwnership.GOVERNANCE
+        
+        # User
+        if severity == FailureSeverity.USER_FIXABLE:
+            return FailureOwnership.USER
+        
+        # Operator
+        if severity in [FailureSeverity.CRITICAL, FailureSeverity.INFRA_FIXABLE]:
+            return FailureOwnership.OPERATOR
+        
+        # Infrastructure
+        if category in [
+            FailureCategory.CHECKPOINT_RESTORE_FAILED,
+            FailureCategory.CHECKPOINT_CORRUPTED,
+            FailureCategory.ROLLBACK_FAILED,
+            FailureCategory.NETWORK_UNREACHABLE,
+        ]:
+            return FailureOwnership.INFRASTRUCTURE
+        
+        return FailureOwnership.AGENT
+    
+    def _apply_category_overrides(self, failure: "FailureRecord", exc: Exception):
+        """Apply category-specific overrides to failure record"""
+        # Check for specific exception messages that indicate more specific category
+        msg = str(exc).lower()
+        
+        # More specific tool errors
+        if failure.category == FailureCategory.TOOL_EXECUTION_FAILED:
+            if "killed" in msg or "signal" in msg:
+                failure.category = FailureCategory.TOOL_EXECUTION_CRASHED
+            elif "permission" in msg:
+                failure.category = FailureCategory.TOOL_PERMISSION_DENIED
+        
+        # More specific verification errors
+        elif failure.category == FailureCategory.VERIFICATION_FAILED:
+            if "missing" in msg or "not found" in msg or "doesn't exist" in msg:
+                failure.category = FailureCategory.VERIFICATION_FAILED_ARTIFACT_MISSING
+            elif "assertion" in msg or "assert" in msg:
+                failure.category = FailureCategory.VERIFICATION_FAILED_ASSERTION
+
+
+# Global mapper instance
+_failure_mapper: Optional[FailureMapper] = None
+
+
+def get_failure_mapper() -> FailureMapper:
+    """Get global FailureMapper instance"""
+    global _failure_mapper
+    if _failure_mapper is None:
+        _failure_mapper = FailureMapper()
+    return _failure_mapper
+
+
+# ==================== RECOVERY STRATEGY MAP ====================
+# Recovery Strategy Mapping - Based on FailureCategory
+# Using lazy initialization to avoid forward reference issues
+
+RECOVERY_STRATEGY_MAP: Dict["FailureCategory", Tuple["RecoveryStrategy", bool, bool]] = {}  # Will be initialized lazily
+
+
+def _init_recovery_strategy_map():
+    """Initialize RECOVERY_STRATEGY_MAP after all enums are defined"""
+    global RECOVERY_STRATEGY_MAP
+    if RECOVERY_STRATEGY_MAP:  # Already initialized
+        return
+        
+    RECOVERY_STRATEGY_MAP = {
+    # Tool errors - mostly retryable with backoff
+    FailureCategory.TOOL_NOT_FOUND: (RecoveryStrategy.ALTERNATE_TOOL, True, False),
+    FailureCategory.TOOL_ARGS_INVALID: (RecoveryStrategy.RECOVER_STATE, False, True),
+    FailureCategory.TOOL_EXECUTION_FAILED: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.TOOL_EXECUTION_TIMEOUT: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.TOOL_EXECUTION_CRASHED: (RecoveryStrategy.RETRY_SAME_TOOL, True, False),
+    FailureCategory.TOOL_PERMISSION_DENIED: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.TOOL_DEPENDENCY_MISSING: (RecoveryStrategy.RECOVER_STATE, False, False),
+    FailureCategory.TOOL_OUTPUT_PARSE_ERROR: (RecoveryStrategy.RETRY_SAME_TOOL, True, False),
+
+    # Verification errors - CRITICAL: execution succeeded but result is wrong
+    FailureCategory.VERIFICATION_FAILED: (RecoveryStrategy.REPLAN, False, True),
+    FailureCategory.VERIFICATION_FAILED_ARTIFACT_MISSING: (RecoveryStrategy.ALTERNATE_TOOL, False, True),
+    FailureCategory.VERIFICATION_FAILED_ASSERTION: (RecoveryStrategy.REPLAN, False, True),
+    FailureCategory.VERIFICATION_FAILED_PATTERN: (RecoveryStrategy.REPLAN, False, True),
+    FailureCategory.VERIFICATION_FAILED_STATE: (RecoveryStrategy.RECOVER_STATE, False, True),
+    FailureCategory.VERIFICATION_TIMEOUT: (RecoveryStrategy.RETRY_SAME_TOOL, True, False),
+    FailureCategory.VERIFICATION_EVIDENCE_MISSING: (RecoveryStrategy.ALTERNATE_TOOL, False, True),
+
+    # Approval errors - governance outcomes, NOT retryable!
+    FailureCategory.APPROVAL_DENIED: (RecoveryStrategy.ABORT, False, False),
+    FailureCategory.APPROVAL_EXPIRED: (RecoveryStrategy.RETRY_SAME_TASK, True, False),
+    FailureCategory.APPROVAL_PENDING: (RecoveryStrategy.RETRY_SAME_TASK, True, False),
+    FailureCategory.APPROVAL_WITHDRAWN: (RecoveryStrategy.ABORT, False, False),
+
+    # Policy errors - NEVER retry without replan!
+    FailureCategory.POLICY_BLOCKED: (RecoveryStrategy.ABORT, False, False),
+    FailureCategory.POLICY_VIOLATION: (RecoveryStrategy.ABORT, False, False),
+    FailureCategory.SANDBOX_REJECTED: (RecoveryStrategy.REPLAN, False, True),
+    FailureCategory.WORKSPACE_BOUNDARY_VIOLATION: (RecoveryStrategy.REPLAN, False, True),
+    FailureCategory.COMMAND_BLOCKED: (RecoveryStrategy.ALTERNATE_TOOL, False, True),
+    FailureCategory.SENSITIVE_OPERATION: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+
+    # Resource errors
+    FailureCategory.RESOURCE_NOT_FOUND: (RecoveryStrategy.RECOVER_STATE, False, True),
+    FailureCategory.RESOURCE_BUSY: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.RESOURCE_EXHAUSTED: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.RESOURCE_LOCK_CONFLICT: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.RESOURCE_DEADLOCK: (RecoveryStrategy.ROLLBACK, False, False),
+
+    # Dependency errors
+    FailureCategory.DEPENDENCY_BLOCKED: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.DEPENDENCY_CYCLE: (RecoveryStrategy.REPLAN, False, True),
+    FailureCategory.DEPENDENCY_MISSING: (RecoveryStrategy.RECOVER_STATE, False, True),
+    FailureCategory.DEPENDENCY_VERSION_CONFLICT: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+
+    # Scheduler errors
+    FailureCategory.SCHEDULER_TIMEOUT: (RecoveryStrategy.RETRY_SAME_TASK, True, False),
+    FailureCategory.SCHEDULER_STARVATION: (RecoveryStrategy.RETRY_SAME_TASK, True, False),
+    FailureCategory.SCHEDULER_QUEUE_FULL: (RecoveryStrategy.RETRY_SAME_TASK, True, False),
+    FailureCategory.TASK_QUEUE_TIMEOUT: (RecoveryStrategy.RETRY_SAME_TASK, True, False),
+
+    # Checkpoint errors
+    FailureCategory.CHECKPOINT_NOT_FOUND: (RecoveryStrategy.ABORT, False, False),
+    FailureCategory.CHECKPOINT_RESTORE_FAILED: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.CHECKPOINT_CORRUPTED: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.ROLLBACK_FAILED: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.STATE_MISMATCH: (RecoveryStrategy.RECOVER_STATE, False, True),
+
+    # Network errors - retryable with backoff
+    FailureCategory.NETWORK_TIMEOUT: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.NETWORK_ERROR: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.NETWORK_UNREACHABLE: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.NETWORK_CONNECTION_RESET: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+    FailureCategory.NETWORK_DNS_FAILED: (RecoveryStrategy.RETRY_WITH_BACKOFF, True, False),
+
+    # Internal errors
+    FailureCategory.INTERNAL_KERNEL_ERROR: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.KERNEL_PANIC: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.STATE_CORRUPTED: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    FailureCategory.SERIALIZATION_ERROR: (RecoveryStrategy.RECOVER_STATE, False, True),
+
+    # Unknown
+    FailureCategory.UNKNOWN: (RecoveryStrategy.ABORT, False, False),
+    FailureCategory.UNPARSEABLE_ERROR: (RecoveryStrategy.ESCALATE_TO_HUMAN, False, False),
+    }
+
+
+# Initialize lazily - call this function before using RECOVERY_STRATEGY_MAP
+# _init_recovery_strategy_map()  # Commented out - called lazily
+
+
 class ErrorType(Enum):
-    """Error classification for recovery"""
+    """Legacy error classification - DEPRECATED, use FailureCategory"""
     # Execution errors
     EXECUTION_FAILED = "execution_failed"
     EXECUTION_TIMEOUT = "execution_timeout"
@@ -562,6 +1095,7 @@ class RecoveryStrategy(Enum):
     ALTERNATE_TOOL = "alternate_tool"
     ALTERNATE_APPROACH = "alternate_approach"
     SIMPLIFY_TASK = "simplify_task"
+    REPLAN = "replan"  # Add REPLAN strategy
     
     # Recovery
     RECOVER_STATE = "recover_state"
@@ -829,8 +1363,102 @@ class Task:
 
 
 @dataclass
+class FailureRecord:
+    """
+    Canonical failure record - SINGLE source of truth for all errors.
+    
+    This replaces fragmented error strings with a typed, machine-usable object.
+    
+    FIX: Error taxonomy / failure classification canonical
+    
+    Key features:
+    - Human-readable message
+    - Kernel-usable typed category
+    - Recovery-actionable flags
+    - Provenance tracking (stage, subsystem, source)
+    - Analytics-ready structure
+    """
+    # Core classification
+    category: FailureCategory
+    message: str
+    
+    # Provenance
+    stage: str = ""  # execution, verification, approval, etc.
+    subsystem: str = ""  # kernel, tools, sandbox, etc.
+    provider: Optional[str] = None  # tool name or provider
+    tool_name: Optional[str] = None
+    
+    # Recovery semantics
+    retryable: bool = False
+    recoverable: bool = False
+    replan_recommended: bool = False
+    escalate_recommended: bool = False
+    
+    # Ownership
+    severity: FailureSeverity = FailureSeverity.SYSTEM_FIXABLE
+    ownership: FailureOwnership = FailureOwnership.AGENT
+    
+    # References
+    artifact_ref: Optional[str] = None
+    checkpoint_id: Optional[str] = None
+    approval_request_id: Optional[str] = None
+    task_id: Optional[str] = None
+    
+    # Raw error for debugging
+    raw_error: Optional[str] = None
+    stack_trace: Optional[str] = None
+    
+    # Additional metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # Timestamps
+    occurred_at: float = field(default_factory=time.time)
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for serialization"""
+        return {
+            "category": self.category.value,
+            "message": self.message,
+            "stage": self.stage,
+            "subsystem": self.subsystem,
+            "provider": self.provider,
+            "tool_name": self.tool_name,
+            "retryable": self.retryable,
+            "recoverable": self.recoverable,
+            "replan_recommended": self.replan_recommended,
+            "escalate_recommended": self.escalate_recommended,
+            "severity": self.severity.value,
+            "ownership": self.ownership.value,
+            "artifact_ref": self.artifact_ref,
+            "checkpoint_id": self.checkpoint_id,
+            "approval_request_id": self.approval_request_id,
+            "task_id": self.task_id,
+            "raw_error": self.raw_error,
+            "stack_trace": self.stack_trace,
+            "metadata": self.metadata,
+            "occurred_at": self.occurred_at,
+        }
+    
+    @classmethod
+    def from_exception(cls, exc: Exception, stage: str, subsystem: str, **kwargs) -> "FailureRecord":
+        """Create FailureRecord from exception"""
+        return cls(
+            category=FailureCategory.UNKNOWN,
+            message=str(exc),
+            stage=stage,
+            subsystem=subsystem,
+            raw_error=str(exc),
+            stack_trace=traceback.format_exc(),
+            **kwargs
+        )
+
+
 class ExecutionResult:
-    """Structured result of tool execution"""
+    """
+    Structured result of tool execution.
+    
+    FIX: Now includes FailureRecord instead of generic error string.
+    """
     success: bool
     stdout: str = ""
     stderr: str = ""
@@ -838,8 +1466,11 @@ class ExecutionResult:
     artifacts: List[str] = field(default_factory=list)
     tool_used: str = ""
     execution_time: float = 0.0
-    error: Optional[str] = None
-    error_type: Optional[ErrorType] = None
+    
+    # CRITICAL: Now uses FailureRecord instead of generic error
+    failure: Optional[FailureRecord] = None
+    error: Optional[str] = None  # Legacy, for backward compat
+    error_type: Optional[ErrorType] = None  # Legacy
     
     # Verification info
     verified: bool = False
@@ -854,6 +1485,7 @@ class ExecutionResult:
             "artifacts": self.artifacts,
             "tool_used": self.tool_used,
             "execution_time": self.execution_time,
+            "failure": self.failure.to_dict() if self.failure else None,
             "error": self.error,
             "error_type": self.error_type.value if self.error_type else None,
             "verified": self.verified,
@@ -911,11 +1543,19 @@ class KernelEvent:
 
 @dataclass
 class VerificationResult:
-    """Result of verification"""
+    """
+    Result of verification.
+    
+    FIX: Now includes FailureRecord instead of generic error.
+    CRITICAL: Verification failure is different from execution failure!
+    """
     passed: bool
     details: str
     evidence: Dict = field(default_factory=dict)
     severity: str = "info"  # info, warning, error
+    
+    # CRITICAL: Now uses FailureRecord - strictly separates from execution failure!
+    failure: Optional[FailureRecord] = None
 
 
 # ==================== VERIFICATION ENGINE ====================
