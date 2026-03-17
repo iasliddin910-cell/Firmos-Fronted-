@@ -2121,6 +2121,229 @@ DEFAULT_BUDGETS = {
 }
 
 
+# ==================== GOAL TERMINATION / STOP CONDITIONS ====================
+
+class StopKind(str, Enum):
+    """Types of stop conditions"""
+    GOAL_SATISFIED = "goal_satisfied"
+    PARTIAL_SUCCESS = "partial_success"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    NO_PROGRESS = "no_progress"
+    POLICY_STOP = "policy_stop"
+    APPROVAL_DENIED = "approval_denied"
+    TERMINAL_FAILURE = "terminal_failure"
+    ESCALATION_REQUIRED = "escalation_required"
+
+
+@dataclass(frozen=True)
+class GoalSpec:
+    """Goal specification - user intent at task level"""
+    goal_id: str
+    user_intent: str
+    success_conditions: List[Dict[str, Any]]
+    minimum_acceptable_conditions: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StopCondition:
+    """Stop condition specification"""
+    kind: StopKind
+    threshold: Optional[float] = None
+    required: bool = True
+
+
+@dataclass
+class TerminationDecision:
+    """Termination decision at goal level"""
+    stop: bool
+    terminal_state: str
+    reason: str
+    confidence: float
+    partial_acceptable: bool = False
+    
+    def is_success(self) -> bool:
+        return self.stop and self.terminal_state in ["goal_satisfied", "partial_success"]
+
+
+@dataclass(frozen=True)
+class PartialOutcomePolicy:
+    """Policy for handling partial outcomes"""
+    allowed: bool
+    minimum_completion_ratio: float = 1.0
+    require_explicit_label: bool = True
+
+
+class SatisfactionEvaluator:
+    """
+    SATISFACTION EVALUATOR - Evaluates goal completion
+    
+    Different from verifier: verifier checks step evidence,
+    satisfaction checks if goal is actually achieved.
+    """
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.logger = logging.getLogger(__name__)
+    
+    async def evaluate(self, goal: GoalSpec, task_results: List[Dict]) -> TerminationDecision:
+        """Evaluate if goal is satisfied"""
+        
+        # Check success conditions
+        satisfied_conditions = []
+        for cond in goal.success_conditions:
+            if self._check_condition(cond, task_results):
+                satisfied_conditions.append(cond)
+        
+        # Calculate completion ratio
+        if goal.success_conditions:
+            ratio = len(satisfied_conditions) / len(goal.success_conditions)
+        else:
+            ratio = 0.0
+        
+        # Check if goal is satisfied
+        if ratio >= 1.0:
+            return TerminationDecision(
+                stop=True,
+                terminal_state="goal_satisfied",
+                reason="all_conditions_met",
+                confidence=1.0,
+                partial_acceptable=False
+            )
+        
+        # Check minimum acceptable
+        if goal.minimum_acceptable_conditions:
+            min_satisfied = []
+            for cond in goal.minimum_acceptable_conditions:
+                if self._check_condition(cond, task_results):
+                    min_satisfied.append(cond)
+            
+            min_ratio = len(min_satisfied) / len(goal.minimum_acceptable_conditions)
+            
+            if min_ratio >= 1.0:
+                return TerminationDecision(
+                    stop=True,
+                    terminal_state="partial_success",
+                    reason="minimum_acceptable_met",
+                    confidence=0.8,
+                    partial_acceptable=True
+                )
+        
+        # Not satisfied
+        return TerminationDecision(
+            stop=False,
+            terminal_state="in_progress",
+            reason=f"{len(satisfied_conditions)}/{len(goal.success_conditions)} conditions met",
+            confidence=ratio,
+            partial_acceptable=False
+        )
+    
+    def _check_condition(self, condition: Dict, results: List[Dict]) -> bool:
+        """Check if a single condition is met"""
+        cond_type = condition.get("type")
+        
+        if cond_type == "all_tasks_completed":
+            return all(r.get("status") == "completed" for r in results)
+        
+        if cond_type == "artifact_exists":
+            artifact = condition.get("artifact")
+            return any(artifact in r.get("artifacts", []) for r in results)
+        
+        if cond_type == "no_errors":
+            return not any(r.get("status") == "failed" for r in results)
+        
+        return False
+
+
+class NoProgressDetector:
+    """
+    NO PROGRESS DETECTOR - Detects when task is stuck in loop
+    """
+    
+    def __init__(self):
+        self._progress_history: Dict[str, List[Dict]] = {}
+        self._no_progress_threshold = 3
+    
+    def record_progress(self, task_id: str, progress: Dict):
+        """Record progress for a task"""
+        if task_id not in self._progress_history:
+            self._progress_history[task_id] = []
+        self._progress_history[task_id].append(progress)
+    
+    def detect_no_progress(self, task_id: str) -> bool:
+        """Detect if no progress is being made"""
+        if task_id not in self._progress_history:
+            return False
+        
+        history = self._progress_history[task_id][-self._no_progress_threshold:]
+        
+        if len(history) < self._no_progress_threshold:
+            return False
+        
+        # Check if last N attempts have same outcome
+        outcomes = [h.get("outcome") for h in history]
+        if len(set(outcomes)) == 1:
+            return True
+        
+        # Check if no new artifacts
+        artifacts = [h.get("artifacts", []) for h in history]
+        if all(a == artifacts[0] for a in artifacts):
+            return True
+        
+        return False
+    
+    def clear_history(self, task_id: str):
+        """Clear progress history for a task"""
+        if task_id in self._progress_history:
+            del self._progress_history[task_id]
+
+
+class TerminationManager:
+    """
+    TERMINATION MANAGER - Manages goal termination
+    """
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.satisfaction = SatisfactionEvaluator(kernel)
+        self.no_progress = NoProgressDetector()
+        self._goals: Dict[str, GoalSpec] = {}
+    
+    def register_goal(self, goal: GoalSpec):
+        """Register a goal"""
+        self._goals[goal.goal_id] = goal
+    
+    async def check_termination(self, goal_id: str, task_results: List[Dict]) -> TerminationDecision:
+        """Check if should terminate"""
+        
+        if goal_id not in self._goals:
+            return TerminationDecision(
+                stop=False,
+                terminal_state="unknown",
+                reason="goal_not_registered",
+                confidence=0.0
+            )
+        
+        goal = self._goals[goal_id]
+        
+        # Check goal satisfaction
+        decision = await self.satisfaction.evaluate(goal, task_results)
+        
+        if decision.stop:
+            return decision
+        
+        # Check no progress
+        if self.no_progress.detect_no_progress(goal_id):
+            return TerminationDecision(
+                stop=True,
+                terminal_state="no_progress",
+                reason="no_progress_after_threshold",
+                confidence=0.9,
+                partial_acceptable=True
+            )
+        
+        return decision
+
+
 class ContextAssembler:
     """
     ASSEMBLES context from multiple sources deterministically.
@@ -5175,6 +5398,10 @@ class CentralKernel:
         # FIX: Budget Ledger - Cost enforcement
         logger.info("💰 Initializing Budget Ledger...")
         self.budget_ledger = BudgetLedger(self)
+        
+        # FIX: Termination Manager - Goal termination
+        logger.info("🛑 Initializing Termination Manager...")
+        self.termination_manager = TerminationManager(self)
         
         # FIX: Mode Selector - The capability negotiation boundary
         logger.info("🎯 Initializing Mode Selector...")
