@@ -1821,6 +1821,205 @@ class ContextPolicy:
         return cls.DEFAULT_POLICIES.get(target, cls.DEFAULT_POLICIES["executor"])
 
 
+# ==================== CAPABILITY NEGOTIATION MODELS ====================
+
+class ReasoningDepth(str, Enum):
+    SHALLOW = "shallow"
+    STANDARD = "standard"
+    DEEP = "deep"
+
+
+class ExecutionMode(str, Enum):
+    DIRECT = "direct"
+    TOOL_STRICT = "tool_strict"
+    BROWSER_GROUNDED = "browser_grounded"
+    CODE_INTERPRET = "code_interpret"
+
+
+class VerificationMode(str, Enum):
+    MINIMAL = "minimal"
+    STRICT = "strict"
+    EVIDENCE_HEAVY = "evidence_heavy"
+
+
+class RecoveryMode(str, Enum):
+    RETRY_FIRST = "retry_first"
+    CONSERVATIVE = "conservative"
+    REPLAN_FIRST = "replan_first"
+
+
+class SafetyPosture(str, Enum):
+    PERMISSIVE = "permissive"
+    BALANCED = "balanced"
+    STRICT = "strict"
+
+
+@dataclass(frozen=True)
+class CapabilityProfile:
+    reasoning_depth: ReasoningDepth
+    execution_mode: ExecutionMode
+    verification_mode: VerificationMode
+    recovery_mode: RecoveryMode
+    safety_posture: SafetyPosture
+    latency_budget_ms: int = 0
+    allows_degradation: bool = True
+    allowed_fallback_profiles: List[str] = field(default_factory=list)
+
+
+@dataclass
+class EngineSelectionDecision:
+    profile_name: str
+    confidence: float
+    reason_codes: List[str] = field(default_factory=list)
+    degradation_chain: List[str] = field(default_factory=list)
+    selected_profile: Optional[CapabilityProfile] = None
+
+
+CAPABILITY_PROFILES = {
+    "simple_read": CapabilityProfile(
+        reasoning_depth=ReasoningDepth.SHALLOW,
+        execution_mode=ExecutionMode.DIRECT,
+        verification_mode=VerificationMode.MINIMAL,
+        recovery_mode=RecoveryMode.RETRY_FIRST,
+        safety_posture=SafetyPosture.PERMISSIVE,
+        latency_budget_ms=5000,
+        allows_degradation=False
+    ),
+    "file_write": CapabilityProfile(
+        reasoning_depth=ReasoningDepth.STANDARD,
+        execution_mode=ExecutionMode.TOOL_STRICT,
+        verification_mode=VerificationMode.STRICT,
+        recovery_mode=RecoveryMode.CONSERVATIVE,
+        safety_posture=SafetyPosture.BALANCED,
+        latency_budget_ms=30000,
+        allows_degradation=True
+    ),
+    "code_execution": CapabilityProfile(
+        reasoning_depth=ReasoningDepth.DEEP,
+        execution_mode=ExecutionMode.CODE_INTERPRET,
+        verification_mode=VerificationMode.EVIDENCE_HEAVY,
+        recovery_mode=RecoveryMode.CONSERVATIVE,
+        safety_posture=SafetyPosture.STRICT,
+        latency_budget_ms=120000,
+        allows_degradation=True
+    ),
+    "browser_automation": CapabilityProfile(
+        reasoning_depth=ReasoningDepth.STANDARD,
+        execution_mode=ExecutionMode.BROWSER_GROUNDED,
+        verification_mode=VerificationMode.EVIDENCE_HEAVY,
+        recovery_mode=RecoveryMode.RETRY_FIRST,
+        safety_posture=SafetyPosture.BALANCED,
+        latency_budget_ms=60000,
+        allows_degradation=True
+    ),
+    "dangerous_operation": CapabilityProfile(
+        reasoning_depth=ReasoningDepth.STANDARD,
+        execution_mode=ExecutionMode.TOOL_STRICT,
+        verification_mode=VerificationMode.EVIDENCE_HEAVY,
+        recovery_mode=RecoveryMode.CONSERVATIVE,
+        safety_posture=SafetyPosture.STRICT,
+        latency_budget_ms=60000,
+        allows_degradation=False
+    ),
+}
+
+
+class ModeSelector:
+    """MODE SELECTOR - Determines capability profile for a task."""
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.logger = logging.getLogger(__name__)
+        self._health_status: Dict[str, bool] = {
+            "browser_available": True,
+            "code_executor_available": True,
+            "sandbox_available": True
+        }
+    
+    async def select(
+        self,
+        task_id: str,
+        task_description: str,
+        tool_name: Optional[str] = None,
+        risk_level: str = "normal",
+        is_side_effecting: bool = False,
+        prior_failure: bool = False
+    ) -> EngineSelectionDecision:
+        """Select appropriate capability profile."""
+        base_profile, reasons = self._analyze_task(
+            task_description, tool_name, risk_level, is_side_effecting, prior_failure
+        )
+        selected_profile, degradation = self._apply_degradation(base_profile)
+        
+        return EngineSelectionDecision(
+            profile_name=self._get_profile_name(selected_profile),
+            confidence=0.85 if not degradation else 0.7,
+            reason_codes=reasons,
+            degradation_chain=degradation,
+            selected_profile=selected_profile
+        )
+    
+    def _analyze_task(self, task_description: str, tool_name: Optional[str], risk_level: str,
+                     is_side_effecting: bool, prior_failure: bool) -> tuple:
+        reasons = []
+        
+        if tool_name in ["read_file", "grep", "web_search"]:
+            return CAPABILITY_PROFILES["simple_read"], ["read_tool"]
+        
+        if tool_name in ["write_file", "create_directory"]:
+            if risk_level == "high" or is_side_effecting:
+                return CAPABILITY_PROFILES["dangerous_operation"], ["write_risk"]
+            return CAPABILITY_PROFILES["file_write"], ["write_tool"]
+        
+        if tool_name in ["execute_command", "execute_code"]:
+            return CAPABILITY_PROFILES["code_execution"], ["code_tool"]
+        
+        if tool_name in ["browser_click", "browser_navigate"]:
+            return CAPABILITY_PROFILES["browser_automation"], ["browser_tool"]
+        
+        if prior_failure:
+            return CapabilityProfile(
+                reasoning_depth=ReasoningDepth.DEEP,
+                execution_mode=ExecutionMode.TOOL_STRICT,
+                verification_mode=VerificationMode.EVIDENCE_HEAVY,
+                recovery_mode=RecoveryMode.CONSERVATIVE,
+                safety_posture=SafetyPosture.STRICT,
+                latency_budget_ms=60000
+            ), ["prior_failure"]
+        
+        if risk_level == "high":
+            return CAPABILITY_PROFILES["dangerous_operation"], ["high_risk"]
+        
+        return CapabilityProfile(
+            reasoning_depth=ReasoningDepth.STANDARD,
+            execution_mode=ExecutionMode.TOOL_STRICT,
+            verification_mode=VerificationMode.STRICT,
+            recovery_mode=RecoveryMode.RETRY_FIRST,
+            safety_posture=SafetyPosture.BALANCED,
+            latency_budget_ms=30000
+        ), ["default"]
+    
+    def _apply_degradation(self, profile: CapabilityProfile) -> tuple:
+        degradation = []
+        if not profile.allows_degradation:
+            return profile, []
+        
+        if profile.execution_mode == ExecutionMode.BROWSER_GROUNDED:
+            if not self._health_status.get("browser_available"):
+                degradation.append("browser_unavailable")
+        
+        return profile, degradation
+    
+    def _get_profile_name(self, profile: CapabilityProfile) -> str:
+        for name, p in CAPABILITY_PROFILES.items():
+            if p == profile:
+                return name
+        return "custom"
+    
+    def update_health(self, component: str, available: bool):
+        self._health_status[component] = available
+
+
 class ContextAssembler:
     """
     ASSEMBLES context from multiple sources deterministically.
@@ -4871,6 +5070,10 @@ class CentralKernel:
         # FIX: Context Assembler - The context injection boundary
         logger.info("📦 Initializing Context Assembler...")
         self.context_assembler = ContextAssembler(self)
+        
+        # FIX: Mode Selector - The capability negotiation boundary
+        logger.info("🎯 Initializing Mode Selector...")
+        self.mode_selector = ModeSelector(self)
         
         # Compiled graph cache for execution
         self._compiled_graphs: Dict[str, ExecutableGraph] = {}
