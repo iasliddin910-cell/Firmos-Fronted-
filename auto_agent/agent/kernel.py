@@ -2020,6 +2020,107 @@ class ModeSelector:
         self._health_status[component] = available
 
 
+# ==================== BUDGET / COST ENFORCEMENT ====================
+
+@dataclass(frozen=True)
+class BudgetSpec:
+    wall_clock_sec: int = 300
+    max_tool_calls: int = 10
+    max_verifications: int = 5
+    max_replans: int = 3
+    max_retries: int = 3
+    max_recoveries: int = 2
+    approval_wait_sec: int = 0
+    token_budget: Optional[int] = None
+
+
+@dataclass
+class CostForecast:
+    estimated_wall_clock_sec: int
+    estimated_tool_calls: int
+    estimated_verifications: int
+    estimated_risk: str
+    confidence: float
+
+
+@dataclass
+class SpendRecord:
+    task_id: str
+    category: str
+    amount: float
+    timestamp: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BudgetDecision:
+    allowed: bool
+    reason: str
+    remaining_wall_clock_sec: int
+    remaining_tool_calls: int
+    remaining_replans: int
+    remaining_retries: int
+
+
+class BudgetLedger:
+    """BUDGET LEDGER - Tracks all spending"""
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.logger = logging.getLogger(__name__)
+        self._spend_records: List[SpendRecord] = []
+        self._task_budgets: Dict[str, BudgetSpec] = {}
+    
+    def set_task_budget(self, task_id: str, budget: BudgetSpec):
+        self._task_budgets[task_id] = budget
+    
+    def record_spend(self, task_id: str, category: str, amount: float, metadata: Dict = None):
+        record = SpendRecord(
+            task_id=task_id,
+            category=category,
+            amount=amount,
+            timestamp=time.time(),
+            metadata=metadata or {}
+        )
+        self._spend_records.append(record)
+    
+    def check_budget(self, task_id: str) -> BudgetDecision:
+        budget = self._task_budgets.get(task_id)
+        if not budget:
+            return BudgetDecision(True, "no_budget_set", 999, 99, 99, 99)
+        
+        task_spends = [s for s in self._spend_records if s.task_id == task_id]
+        tool_calls = sum(1 for s in task_spends if s.category == "tool_call")
+        verifications = sum(1 for s in task_spends if s.category == "verification")
+        replans = sum(1 for s in task_spends if s.category in ["replan", "replan_retry"])
+        
+        if tool_calls >= budget.max_tool_calls:
+            return BudgetDecision(False, "tool_calls_exhausted", 0, 0, replans, 0)
+        if verifications >= budget.max_verifications:
+            return BudgetDecision(False, "verifications_exhausted", 0, tool_calls, replans, 0)
+        if replans >= budget.max_replans:
+            return BudgetDecision(False, "replans_exhausted", 0, tool_calls, 0, 0)
+        
+        return BudgetDecision(
+            True, "ok",
+            remaining_wall_clock_sec=budget.wall_clock_sec,
+            remaining_tool_calls=budget.max_tool_calls - tool_calls,
+            remaining_replans=budget.max_replans - replans,
+            remaining_retries=budget.max_retries
+        )
+    
+    def is_budget_exhausted(self, task_id: str) -> bool:
+        return not self.check_budget(task_id).allowed
+
+
+DEFAULT_BUDGETS = {
+    "simple": BudgetSpec(wall_clock_sec=60, max_tool_calls=3, max_verifications=1),
+    "standard": BudgetSpec(wall_clock_sec=300, max_tool_calls=10, max_verifications=5),
+    "heavy": BudgetSpec(wall_clock_sec=600, max_tool_calls=20, max_verifications=10),
+    "dangerous": BudgetSpec(wall_clock_sec=300, max_tool_calls=5, max_verifications=3),
+}
+
+
 class ContextAssembler:
     """
     ASSEMBLES context from multiple sources deterministically.
@@ -5070,6 +5171,10 @@ class CentralKernel:
         # FIX: Context Assembler - The context injection boundary
         logger.info("📦 Initializing Context Assembler...")
         self.context_assembler = ContextAssembler(self)
+        
+        # FIX: Budget Ledger - Cost enforcement
+        logger.info("💰 Initializing Budget Ledger...")
+        self.budget_ledger = BudgetLedger(self)
         
         # FIX: Mode Selector - The capability negotiation boundary
         logger.info("🎯 Initializing Mode Selector...")
