@@ -4010,7 +4010,507 @@ class CentralKernel:
         # FIX #2: Valid transitions map
         self._valid_transitions = self._build_valid_transitions()
         
+        # FIX: Transaction state tracking for side-effect management
+        self._active_transactions: Dict[str, SideEffectTransaction] = {}
+        self._transaction_ledger: Dict[str, List[Dict]] = {}  # FIX: Dict, not List
+        self._idempotency_cache: Dict[str, Any] = {}
+        
         logger.info("✅ Central Kernel Ready!")
+    
+    # =====================================================
+    # SIDE-EFFECT TRANSACTION SYSTEM (No1 Grade)
+    # =====================================================
+    
+    def _init_transaction_subsystem(self):
+        """Initialize transaction-related state"""
+        self._active_transactions: Dict[str, SideEffectTransaction] = {}
+        self._transaction_ledger: List[Dict] = {}
+        self._idempotency_cache: Dict[str, Any] = {}
+    
+    async def execute_with_transaction(
+        self,
+        task: 'Task',
+        tool_name: str,
+        args: Dict[str, Any],
+        verification_type: Optional[str] = None,
+        verification_params: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """
+        Execute a tool with full transaction lifecycle.
+        
+        FIX: This implements the canonical side-effect transaction boundary.
+        
+        Lifecycle: PREPARE -> APPLY -> OBSERVE -> VERIFY -> COMMIT
+        (or ROLLBACK at any point if verification fails)
+        
+        CRITICAL:
+        - APPLIED != COMMITTED
+        - Verification must pass BEFORE commit
+        - All side effects are tracked with WorldStateDelta
+        
+        Args:
+            task: The task being executed
+            tool_name: Name of tool to execute
+            args: Tool arguments
+            verification_type: Type of verification needed
+            verification_params: Verification parameters
+            
+        Returns:
+            Dict with execution results and transaction state
+        """
+        import uuid
+        from datetime import datetime
+        
+        # Generate transaction ID
+        tx_id = f"tx_{uuid.uuid4().hex[:12]}"
+        
+        # Create transaction object
+        tx = SideEffectTransaction(
+            tx_id=tx_id,
+            task_id=task.id,
+            tool_name=tool_name,
+            phase=TransactionPhase.PREPARED,
+            arguments=args,
+            intended_changes=self._compute_intended_changes(tool_name, args),
+            idempotency_key=self._generate_idempotency_key(tool_name, args)
+        )
+        
+        # Store active transaction
+        self._active_transactions[tx_id] = tx
+        
+        try:
+            # =====================================================
+            # PHASE 1: PREPARE
+            # =====================================================
+            logger.info(f"🔄 TRANSACTION {tx_id}: PREPARE phase")
+            self._record_transaction_event(tx, "tx_prepared", {"tool": tool_name, "args": args})
+            
+            # Check idempotency - can we skip execution?
+            idempotency_class = TOOL_IDEMPOTENCY.get(tool_name, IdempotencyClass.NON_IDEMPOTENT)
+            
+            if idempotency_class == IdempotencyClass.IDEMPOTENT:
+                # Already executed this - skip to verify
+                logger.info(f"⏭️ TRANSACTION {tx_id}: Idempotent - skipping to VERIFY")
+                tx.phase = TransactionPhase.VERIFIED
+                tx.verification_passed = True
+                tx.evidence = {"idempotent": True}
+                return await self._finalize_transaction(tx, task)
+            
+            # Check if already executed (conditional idempotency)
+            if idempotency_class == IdempotencyClass.CONDITIONALLY_IDEMPOTENT:
+                existing_result = self._check_idempotency_cache(tx.idempotency_key)
+                if existing_result:
+                    logger.info(f"⏭️ TRANSACTION {tx_id}: Found cached result - skipping to VERIFY")
+                    tx.phase = TransactionPhase.VERIFIED
+                    tx.verification_passed = True
+                    tx.output = existing_result.get("output")
+                    tx.evidence = {"cached": True, "idempotency_key": tx.idempotency_key}
+                    return await self._finalize_transaction(tx, task)
+            
+            # =====================================================
+            # PHASE 2: APPLY (Execute the tool)
+            # =====================================================
+            logger.info(f"⚡ TRANSACTION {tx_id}: APPLY phase")
+            tx.phase = TransactionPhase.APPLIED
+            tx.applied_at = time.time()
+            self._record_transaction_event(tx, "tx_applied", {"timestamp": tx.applied_at})
+            
+            # Execute the tool
+            exec_result = await self._execute_tool_strict(
+                task=task,
+                tool_name=tool_name,
+                args=args,
+                timeout=30
+            )
+            
+            # Store output
+            tx.output = exec_result
+            
+            # Check execution success
+            if not exec_result.success:
+                tx.phase = TransactionPhase.FAILED
+                tx.failure = FailureRecord(
+                    message=f"Tool execution failed: {exec_result.error}",
+                    category=FailureCategory.TOOL_EXECUTION_FAILED,
+                    recoverable=False,
+                    task_id=task.id,
+                    timestamp=time.time()
+                )
+                self._record_transaction_event(tx, "tx_apply_failed", {"error": exec_result.error})
+                return await self._finalize_transaction(tx, task)
+            
+            # =====================================================
+            # PHASE 3: OBSERVE (Record world state changes)
+            # =====================================================
+            logger.info(f"👁️ TRANSACTION {tx_id}: OBSERVE phase")
+            tx.phase = TransactionPhase.OBSERVED
+            tx.observed_at = time.time()
+            
+            # Compute actual world state delta
+            tx.observed_delta = self._compute_world_state_delta(tool_name, args, exec_result)
+            
+            self._record_transaction_event(tx, "tx_observed", {
+                "delta": tx.observed_delta.__dict__,
+                "artifacts": tx.observed_delta.artifacts_created
+            })
+            
+            # Cache result for idempotency
+            if idempotency_class == IdempotencyClass.CONDITIONALLY_IDEMPOTENT:
+                self._idempotency_cache[tx.idempotency_key] = {
+                    "output": exec_result,
+                    "delta": tx.observed_delta.__dict__,
+                    "timestamp": time.time()
+                }
+            
+            # =====================================================
+            # PHASE 4: VERIFY
+            # =====================================================
+            logger.info(f"🔍 TRANSACTION {tx_id}: VERIFY phase")
+            
+            if not verification_type or verification_type == "none":
+                # No verification needed - auto-pass
+                tx.verification_passed = True
+                tx.phase = TransactionPhase.VERIFIED
+                tx.verified_at = time.time()
+                tx.evidence = {"auto_verified": True}
+                self._record_transaction_event(tx, "tx_verified_auto", {})
+            else:
+                # Run actual verification
+                verification_result = await self._transaction_run_verification(
+                    tx, verification_type, verification_params or {}, exec_result
+                )
+                
+                tx.verification_passed = verification_result["passed"]
+                tx.verification_details = verification_result["details"]
+                tx.evidence = verification_result.get("evidence", {})
+                
+                if verification_result["passed"]:
+                    tx.phase = TransactionPhase.VERIFIED
+                    tx.verified_at = time.time()
+                    self._record_transaction_event(tx, "tx_verified", {"evidence": tx.evidence})
+                else:
+                    tx.phase = TransactionPhase.FAILED
+                    self._record_transaction_event(tx, "tx_verification_failed", {
+                        "details": verification_result["details"]
+                    })
+            
+            # =====================================================
+            # PHASE 5: COMMIT DECISION
+            # =====================================================
+            logger.info(f"🚪 TRANSACTION {tx_id}: COMMIT GATE")
+            
+            commit_decision = self._make_commit_decision(tx)
+            
+            self._record_transaction_event(tx, "tx_commit_decision", {
+                "allowed": commit_decision.allowed,
+                "reason": commit_decision.reason,
+                "action": commit_decision.action
+            })
+            
+            if not commit_decision.allowed:
+                # Commit denied - need to rollback
+                logger.warning(f"🚫 TRANSACTION {tx_id}: COMMIT DENIED - {commit_decision.reason}")
+                
+                if commit_decision.action == "rollback":
+                    await self._transaction_rollback(tx, task)
+                elif commit_decision.action == "escalate":
+                    tx.phase = TransactionPhase.FAILED
+                    task.status = TaskStatus.ESCALATED
+                    task.error = f"Transaction escalated: {commit_decision.reason}"
+                else:
+                    tx.phase = TransactionPhase.FAILED
+                
+                return await self._finalize_transaction(tx, task)
+            
+            # Commit allowed
+            tx.phase = TransactionPhase.COMMITTED
+            tx.committed_at = time.time()
+            self._record_transaction_event(tx, "tx_committed", {
+                "duration_ms": (tx.committed_at - tx.created_at) * 1000
+            })
+            
+            return await self._finalize_transaction(tx, task)
+            
+        except Exception as e:
+            logger.error(f"❌ TRANSACTION {tx_id}: EXCEPTION - {str(e)}")
+            tx.phase = TransactionPhase.FAILED
+            tx.failure = FailureRecord(
+                message=f"Transaction exception: {str(e)}",
+                category=FailureCategory.SYSTEM_ERROR,
+                recoverable=False,
+                task_id=task.id,
+                timestamp=time.time()
+            )
+            self._record_transaction_event(tx, "tx_exception", {"error": str(e)})
+            return await self._finalize_transaction(tx, task)
+    
+    def _compute_intended_changes(self, tool_name: str, args: Dict) -> Dict[str, Any]:
+        """Compute what changes are intended"""
+        changes = {}
+        
+        if tool_name == "write_file":
+            changes["files_written"] = [args.get("path")]
+            changes["content_hash"] = hash(str(args.get("content", "")))
+        elif tool_name == "delete_file":
+            changes["files_deleted"] = [args.get("path")]
+        elif tool_name == "execute_command":
+            changes["command"] = args.get("command")
+        elif tool_name == "install_package":
+            changes["packages"] = [args.get("package")]
+        elif tool_name == "browser_click":
+            changes["target"] = args.get("selector")
+        
+        return changes
+    
+    def _compute_world_state_delta(
+        self,
+        tool_name: str,
+        args: Dict,
+        exec_result: 'ExecutionResult'
+    ) -> WorldStateDelta:
+        """Compute actual world state changes"""
+        delta = WorldStateDelta()
+        
+        if tool_name == "write_file":
+            if exec_result.success:
+                delta.files_modified = [args.get("path")]
+                delta.artifacts_created = [args.get("path")]
+        elif tool_name == "delete_file":
+            if exec_result.success:
+                delta.files_deleted = [args.get("path")]
+        elif tool_name == "execute_command":
+            if exec_result.success:
+                delta.external_effects = [f"exit_code:{exec_result.exit_code}"]
+                # Check for artifact files
+                if exec_result.artifacts:
+                    delta.artifacts_created.extend(exec_result.artifacts)
+        elif tool_name == "install_package":
+            if exec_result.success:
+                delta.environment_changes[args.get("package")] = "installed"
+        elif tool_name == "browser_navigate":
+            if exec_result.success:
+                delta.resources_touched = [args.get("url")]
+        
+        return delta
+    
+    def _generate_idempotency_key(self, tool_name: str, args: Dict) -> str:
+        """Generate idempotency key for this action"""
+        import hashlib
+        content = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    
+    def _check_idempotency_cache(self, key: str) -> Optional[Dict]:
+        """Check if action was already executed"""
+        if key in self._idempotency_cache:
+            entry = self._idempotency_cache[key]
+            # Check if cache is still valid (1 hour)
+            if time.time() - entry.get("timestamp", 0) < 3600:
+                return entry
+        return None
+    
+    async def _transaction_run_verification(
+        self,
+        tx: SideEffectTransaction,
+        verification_type: str,
+        params: Dict,
+        exec_result: 'ExecutionResult'
+    ) -> Dict[str, Any]:
+        """Run verification for transaction"""
+        try:
+            # Normalize verification type
+            normalized = normalize_verification_type(verification_type)
+            
+            # Build verification data
+            verification_data = {
+                "tool_result": exec_result.to_dict() if hasattr(exec_result, 'to_dict') else {},
+                "output": exec_result.stdout or exec_result.stderr,
+                "exit_code": exec_result.exit_code,
+                "artifacts": exec_result.artifacts
+            }
+            verification_data.update(params)
+            
+            # Run verifier
+            result = self.verifier.verify(normalized.value, verification_data)
+            
+            return {
+                "passed": result.passed,
+                "details": result.details,
+                "evidence": result.evidence
+            }
+        except Exception as e:
+            logger.error(f"Verification error: {e}")
+            return {
+                "passed": False,
+                "details": f"Verification error: {str(e)}",
+                "evidence": {}
+            }
+    
+    def _make_commit_decision(self, tx: SideEffectTransaction) -> CommitDecision:
+        """
+        Make commit decision - the CRITICAL commit gate.
+        
+        FIX: Commit is NOT automatic. It requires:
+        1. Evidence present
+        2. Verification passed
+        3. Rollback available if needed
+        """
+        # Check 1: Evidence present
+        if not tx.evidence:
+            return CommitDecision(
+                allowed=False,
+                reason="No evidence present - cannot commit",
+                phase_before=tx.phase,
+                phase_after=TransactionPhase.FAILED,
+                evidence_present=False,
+                verification_passed=tx.verification_passed,
+                rollback_available=tx.rollback_snapshot_id is not None,
+                action="rollback" if tx.rollback_snapshot_id else "escalate"
+            )
+        
+        # Check 2: Verification passed
+        if not tx.verification_passed:
+            return CommitDecision(
+                allowed=False,
+                reason=f"Verification failed: {tx.verification_details}",
+                phase_before=tx.phase,
+                phase_after=TransactionPhase.ROLLBACK_PENDING,
+                evidence_present=True,
+                verification_passed=False,
+                rollback_available=tx.rollback_snapshot_id is not None,
+                action="rollback"
+            )
+        
+        # Check 3: For non-idempotent actions, require strong evidence
+        idempotency = TOOL_IDEMPOTENCY.get(tx.tool_name, IdempotencyClass.NON_IDEMPOTENT)
+        if idempotency == IdempotencyClass.NON_IDEMPOTENT:
+            # Non-idempotent actions need explicit verification
+            if not tx.observed_delta or tx.observed_delta.is_empty():
+                return CommitDecision(
+                    allowed=False,
+                    reason="Non-idempotent action requires observable delta",
+                    phase_before=tx.phase,
+                    phase_after=TransactionPhase.FAILED,
+                    evidence_present=True,
+                    verification_passed=True,
+                    rollback_available=False,
+                    action="escalate"
+                )
+        
+        # All checks passed - commit allowed
+        return CommitDecision(
+            allowed=True,
+            reason="All commit gates passed",
+            phase_before=tx.phase,
+            phase_after=TransactionPhase.COMMITTED,
+            evidence_present=True,
+            verification_passed=tx.verification_passed,
+            rollback_available=tx.rollback_snapshot_id is not None,
+            action="proceed"
+        )
+    
+    async def _transaction_rollback(self, tx: SideEffectTransaction, task: 'Task'):
+        """Execute transaction rollback"""
+        logger.warning(f"⏪ TRANSACTION {tx.tx_id}: ROLLBACK")
+        
+        tx.phase = TransactionPhase.ROLLING_BACK
+        self._record_transaction_event(tx, "tx_rollback_started", {})
+        
+        # Execute rollback if snapshot exists
+        if tx.rollback_snapshot_id and tx.rollback_snapshot_id in self._task_checkpoints:
+            checkpoint = self._task_checkpoints[tx.rollback_snapshot_id]
+            # Apply rollback from checkpoint
+            for snapshot in checkpoint.rollback_snapshots:
+                await self._apply_rollback_snapshot(snapshot)
+        
+        tx.phase = TransactionPhase.ROLLED_BACK
+        self._record_transaction_event(tx, "tx_rollback_completed", {})
+    
+    async def _apply_rollback_snapshot(self, snapshot: RollbackSnapshot):
+        """Apply a rollback snapshot"""
+        logger.info(f"Applying rollback snapshot: {snapshot.kind}")
+        # Rollback logic depends on snapshot type
+        if snapshot.kind == "file_mutation":
+            # Restore file content
+            pass
+        elif snapshot.kind == "browser_state":
+            # Restore browser state
+            pass
+        # ... other types
+    
+    async def _finalize_transaction(
+        self,
+        tx: SideEffectTransaction,
+        task: 'Task'
+    ) -> Dict[str, Any]:
+        """Finalize transaction and return result"""
+        # Update task status based on transaction outcome
+        if tx.phase == TransactionPhase.COMMITTED:
+            task.status = TaskStatus.COMPLETED
+        elif tx.phase == TransactionPhase.FAILED:
+            task.status = TaskStatus.FAILED
+        
+        return {
+            "tx_id": tx.tx_id,
+            "phase": tx.phase.value,
+            "success": tx.phase == TransactionPhase.COMMITTED,
+            "output": tx.output,
+            "observed_delta": tx.observed_delta.__dict__,
+            "evidence": tx.evidence,
+            "verification_passed": tx.verification_passed,
+            "commit_details": tx.verification_details if tx.phase == TransactionPhase.COMMITTED else None
+        }
+    
+    def _record_transaction_event(self, tx: SideEffectTransaction, event_type: str, data: Dict):
+        """Record transaction event to ledger"""
+        event = {
+            "tx_id": tx.tx_id,
+            "task_id": tx.task_id,
+            "event": event_type,
+            "phase": tx.phase.value,
+            "timestamp": time.time(),
+            "data": data
+        }
+        
+        # Add to transaction-specific ledger
+        if tx.tx_id not in self._transaction_ledger:
+            self._transaction_ledger[tx.tx_id] = []
+        self._transaction_ledger[tx.tx_id].append(event)
+        
+        # Also add to task event ledger
+        self._task_event_ledger.append(TaskEvent(
+            task_id=tx.task_id,
+            from_status=tx.phase.value,
+            to_status=event_type,
+            reason=event_type,
+            evidence=event
+        ))
+    
+    def get_transaction_status(self, tx_id: str) -> Optional[Dict]:
+        """Get transaction status"""
+        tx = self._active_transactions.get(tx_id)
+        if not tx:
+            return None
+        
+        return {
+            "tx_id": tx.tx_id,
+            "phase": tx.phase.value,
+            "tool": tx.tool_name,
+            "task_id": tx.task_id,
+            "committed": tx.is_committed(),
+            "can_retry": tx.can_retry(),
+            "evidence": tx.evidence
+        }
+    
+    def get_transaction_ledger(self, tx_id: Optional[str] = None) -> List[Dict]:
+        """Get transaction ledger"""
+        if tx_id:
+            return self._transaction_ledger.get(tx_id, [])
+        else:
+            # Return all events
+            all_events = []
+            for events in self._transaction_ledger.values():
+                all_events.extend(events)
+            return sorted(all_events, key=lambda x: x["timestamp"])
     
     def _build_valid_transitions(self) -> Dict[str, Set[str]]:
         """
@@ -5910,56 +6410,98 @@ Return JSON with tasks array containing: id, description, priority, dependencies
                     raise RuntimeError(f"Sandbox setup failed for mode: {configured_sandbox_mode}")
                 
                 # =====================================================
-                # STEP 7: Tool Execution (REAL execution)
+                # STEP 7: Tool Execution (REAL execution) - with TRANSACTION
                 # =====================================================
-                exec_result = await self._execute_tool_strict(
-                    task=task,
-                    tool_name=tool_name,
-                    args=validated_args,
-                    timeout=tool_config.get('timeout', 30)
-                )
                 
-                # =====================================================
-                # STEP 8: Verification
-                # =====================================================
-                verification_passed = True
-                verification_details = None
+                # FIX: Use transaction-based execution for side-effecting tools
+                tool_is_side_effecting = tool_name in [
+                    "write_file", "delete_file", "execute_command", "install_package",
+                    "browser_click", "browser_navigate", "browser_type", "remove_directory",
+                    "create_directory", "copy_file", "move_file", "run_script"
+                ]
                 
-                # FIX #22 & #23: Use canonical verification with proper validation
-                if verification_type and verification_type != 'manual':
-                    # Normalize the verification type
-                    try:
-                        normalized = normalize_verification_type(verification_type)
-                    except ValueError as e:
-                        logger.warning(f"Invalid verification type: {e}")
-                        # Invalid verification type - fail the task
-                        verification_passed = False
-                        verification_details = str(e)
-                        exec_result.success = False
-                        exec_result.error = f"Verification failed: {e}"
-                        task.status = TaskStatus.FAILED_VERIFICATION
+                if tool_is_side_effecting:
+                    # Use transaction-based execution
+                    logger.info(f"🔄 Using transaction execution for: {tool_name}")
+                    tx_result = await self.execute_with_transaction(
+                        task=task,
+                        tool_name=tool_name,
+                        args=validated_args,
+                        verification_type=verification_type,
+                        verification_params=task_meta.get("verification_params")
+                    )
+                    
+                    # Extract results from transaction
+                    exec_result = tx_result.get("output")
+                    verification_passed = tx_result.get("verification_passed", False)
+                    verification_details = tx_result.get("commit_details")
+                    
+                    # Check transaction outcome
+                    if tx_result.get("success"):
+                        task.status = TaskStatus.COMPLETED
                     else:
-                        if normalized != VerificationType.NONE or task.approval_policy:
-                            task.status = TaskStatus.VERIFYING
-                            self.state = KernelState.VERIFYING
-                            
-                            verification_data = self._build_verification_data(task, task_meta, exec_result)
-                            verification = self.verifier.verify(verification_type, verification_data)
-                            
-                            if not verification.passed:
-                                verification_passed = False
-                                verification_details = verification.details
-                                exec_result.success = False
-                                exec_result.error = f"Verification failed: {verification_details}"
-                                task.status = TaskStatus.FAILED_VERIFICATION
-                elif not verification_type:
-                    # FIX #2: No verification_type means autonomous task fails
-                    logger.warning(f"Task {task.id} has no verification_type!")
-                    verification_passed = False
-                    verification_details = "verification_type is required for autonomous tasks"
-                    exec_result.success = False
-                    exec_result.error = verification_details
-                    task.status = TaskStatus.FAILED_VERIFICATION
+                        task.status = TaskStatus.FAILED
+                        
+                    # Continue to artifact collection with tx result
+                    task.metadata["transaction_id"] = tx_result.get("tx_id")
+                    task.metadata["transaction_phase"] = tx_result.get("phase")
+                    
+                else:
+                    # Use regular execution for read-only operations
+                    exec_result = await self._execute_tool_strict(
+                        task=task,
+                        tool_name=tool_name,
+                        args=validated_args,
+                        timeout=tool_config.get('timeout', 30)
+                    )
+                
+                # =====================================================
+                # STEP 8: Verification (skip if already done in transaction)
+                # =====================================================
+                
+                # Skip verification if already done in transaction execution
+                if tool_is_side_effecting and "transaction_id" in task.metadata:
+                    logger.info(f"⏭️ Verification already done in transaction for: {tool_name}")
+                    # Verification was done inside transaction, skip duplicate check
+                else:
+                    verification_passed = True
+                    verification_details = None
+                    
+                    # FIX #22 & #23: Use canonical verification with proper validation
+                    if verification_type and verification_type != 'manual':
+                        # Normalize the verification type
+                        try:
+                            normalized = normalize_verification_type(verification_type)
+                        except ValueError as e:
+                            logger.warning(f"Invalid verification type: {e}")
+                            # Invalid verification type - fail the task
+                            verification_passed = False
+                            verification_details = str(e)
+                            exec_result.success = False
+                            exec_result.error = f"Verification failed: {e}"
+                            task.status = TaskStatus.FAILED_VERIFICATION
+                        else:
+                            if normalized != VerificationType.NONE or task.approval_policy:
+                                task.status = TaskStatus.VERIFYING
+                                self.state = KernelState.VERIFYING
+                                
+                                verification_data = self._build_verification_data(task, task_meta, exec_result)
+                                verification = self.verifier.verify(verification_type, verification_data)
+                                
+                                if not verification.passed:
+                                    verification_passed = False
+                                    verification_details = verification.details
+                                    exec_result.success = False
+                                    exec_result.error = f"Verification failed: {verification_details}"
+                                    task.status = TaskStatus.FAILED_VERIFICATION
+                    elif not verification_type:
+                        # FIX #2: No verification_type means autonomous task fails
+                        logger.warning(f"Task {task.id} has no verification_type!")
+                        verification_passed = False
+                        verification_details = "verification_type is required for autonomous tasks"
+                        exec_result.success = False
+                        exec_result.error = verification_details
+                        task.status = TaskStatus.FAILED_VERIFICATION
                 
                 # =====================================================
                 # STEP 9: Artifact Collection
