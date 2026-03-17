@@ -81,12 +81,14 @@ class SelfModTask:
     task_type: ModificationType
     description: str
     
+    # Observed failure (required - must come before optional fields)
+    observed_failure: str
+    
     # Target
     target_module: str
     target_function: Optional[str] = None
     
-    # Observed failure
-    observed_failure: str
+    # Failure context
     failure_context: Dict = field(default_factory=dict)
     
     # Constraints
@@ -135,41 +137,42 @@ class ToolCreationTask:
 @dataclass
 class ModificationResult:
     """Result of a self-modification attempt"""
+    # Required fields first (no defaults)
     task_id: str
     modification_type: ModificationType
-    
-    # Code changes
     patch_diff: str
+    status: ModificationStatus
+    
+    # Code changes (optional)
     files_modified: List[str] = field(default_factory=list)
     
-    # Status
-    status: ModificationStatus
+    # Timing (optional)
     generation_time: float = 0.0
     testing_time: float = 0.0
     
-    # Delta measurements
+    # Delta measurements (optional)
     baseline_score: Optional[float] = None
     post_score: Optional[float] = None
     delta_score: Optional[float] = None
     delta_percent: Optional[float] = None
     
-    # Regression
+    # Regression (optional)
     regression_detected: bool = False
     regression_details: List[str] = field(default_factory=list)
     
-    # Canary
+    # Canary (optional)
     canary_passed: bool = True
     canary_retention: float = 1.0
     
-    # Safety
+    # Safety (optional)
     safety_checks_passed: bool = True
     safety_violations: List[str] = field(default_factory=list)
     
-    # Lineage
+    # Lineage (optional)
     lineage: List[str] = field(default_factory=list)
     parent_patch_id: Optional[str] = None
     
-    # Metadata
+    # Metadata (optional)
     timestamp: float = field(default_factory=time.time)
     error: Optional[str] = None
 
@@ -177,47 +180,48 @@ class ModificationResult:
 @dataclass
 class ToolCreationResult:
     """Result of a tool creation attempt"""
+    # Required fields first (no defaults)
     task_id: str
     tool_type: ToolCreationType
-    
-    # Tool details
     tool_name: str
     tool_code: str
+    status: ModificationStatus
+    
+    # Tool details (optional)
     tool_schema: Dict = field(default_factory=dict)
     test_code: str = ""
     
-    # Status
-    status: ModificationStatus
+    # Timing (optional)
     generation_time: float = 0.0
     testing_time: float = 0.0
     integration_time: float = 0.0
     
-    # Quality metrics
+    # Quality metrics (optional)
     code_quality_score: float = 0.0
     test_coverage_score: float = 0.0
     design_quality_score: float = 0.0
     
-    # Delta measurements (REAL USAGE)
+    # Delta measurements (optional)
     baseline_latency: Optional[float] = None
     post_latency: Optional[float] = None
     baseline_success_rate: Optional[float] = None
     post_success_rate: Optional[float] = None
     downstream_delta: Optional[float] = None
     
-    # Integration
+    # Integration (optional)
     registry_integration: bool = False
     planner_discovered: bool = False
     executor_used: bool = False
     telemetry_visible: bool = False
     
-    # Reuse
+    # Reuse (optional)
     tool_reuse_count: int = 0
     
-    # Safety
+    # Safety (optional)
     safety_checks_passed: bool = True
     safety_violations: List[str] = field(default_factory=list)
     
-    # Metadata
+    # Metadata (optional)
     timestamp: float = field(default_factory=time.time)
     error: Optional[str] = None
 

@@ -46,6 +46,32 @@ class KnowledgeType(Enum):
     CONCEPT = "concept"
     OPINION = "opinion"
     CODE = "code"
+    PREFERENCE = "preference"
+
+
+class KnowledgeStatus(Enum):
+    """Knowledge lifecycle status - canonical state machine"""
+    CANDIDATE = "candidate"       # Newly discovered, not verified
+    VERIFIED = "verified"         # Verified and trusted
+    STALE = "stale"               # Outdated, needs re-verification
+    DISPUTED = "disputed"         # Contradiction detected
+    QUARANTINED = "quarantined"   # Flagged for review
+    RETIRED = "retired"           # No longer relevant
+
+
+class LearningEventType(Enum):
+    """Learning event types - history-rich system"""
+    KNOWLEDGE_ADDED = "knowledge_added"
+    KNOWLEDGE_VERIFIED = "knowledge_verified"
+    KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
+    KNOWLEDGE_SELECTED = "knowledge_selected"
+    KNOWLEDGE_EXECUTED = "knowledge_executed"
+    KNOWLEDGE_SUCCEEDED = "knowledge_succeeded"
+    KNOWLEDGE_FAILED = "knowledge_failed"
+    CONTRADICTION_DETECTED = "contradiction_detected"
+    SOURCE_QUARANTINED = "source_quarantined"
+    KNOWLEDGE_REVERIFIED = "knowledge_reverified"
+    KNOWLEDGE_RETIRED = "knowledge_retired"
 
 
 class ConfidenceLevel(Enum):
@@ -73,6 +99,8 @@ class Source:
 
 @dataclass
 class KnowledgeEntry:
+    """Canonical Knowledge Record - single source of truth for all knowledge"""
+    # Required fields (no defaults)
     entry_id: str
     content: str
     knowledge_type: KnowledgeType
@@ -81,14 +109,72 @@ class KnowledgeEntry:
     collected_at: float
     last_verified: float
     confidence: float
+    
+    # Lifecycle status - canonical state machine
+    status: KnowledgeStatus = KnowledgeStatus.CANDIDATE
+    
+    # Learning signals - separated concerns
+    retrieval_count: int = 0        # How many times retrieved
+    selection_count: int = 0        # How many times selected from results
+    execution_count: int = 0        # How many times actually used
+    success_count: int = 0          # How many times succeeded
+    failure_count: int = 0          # How many times failed
+    
+    # Additional data
     embedding: List[float] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
     entities: List[str] = field(default_factory=list)
     relationships: List[Dict] = field(default_factory=list)
+    
+    # Governance data
     contradiction_hash: str = ""
     stale_score: float = 0.0
-    usage_count: int = 0
-    success_count: int = 0
+    
+    # Metadata and contradictions - schema-driven
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    contradictions: List[str] = field(default_factory=list)
+    
+    # Truth Ledger - history tracking
+    first_seen_at: float = field(default_factory=time.time)
+    verified_at: Optional[float] = None
+    valid_from: Optional[float] = None
+    valid_until: Optional[float] = None
+    
+    # Lineage
+    supersedes: Optional[str] = None
+    superseded_by: Optional[str] = None
+    
+    # Task domains
+    task_domains: List[str] = field(default_factory=list)
+    
+    # Evidence
+    evidence_count: int = 0
+    
+    # Invariant check
+    def __post_init__(self):
+        """Validate invariants"""
+        # success_count <= execution_count
+        if self.success_count > self.execution_count:
+            self.success_count = self.execution_count
+        # failure_count <= execution_count
+        if self.failure_count > self.execution_count:
+            self.failure_count = self.execution_count
+        # selection_count <= retrieval_count
+        if self.selection_count > self.retrieval_count:
+            self.selection_count = self.retrieval_count
+        # verified_at >= collected_at
+        if self.verified_at and self.verified_at < self.collected_at:
+            self.verified_at = self.collected_at
+    
+    @property
+    def usage_count(self) -> int:
+        """Backward compatibility - returns retrieval_count"""
+        return self.retrieval_count
+    
+    @usage_count.setter
+    def usage_count(self, value: int):
+        """Backward compatibility - sets retrieval_count"""
+        self.retrieval_count = value
 
 
 @dataclass
@@ -103,15 +189,50 @@ class Contradiction:
 
 @dataclass
 class ProceduralMemory:
+    """Canonical Procedure Record - for procedure knowledge"""
+    # Required fields
     procedure_id: str
     name: str
     steps: List[Dict]
-    prerequisites: List[str]
-    outcomes: List[str]
-    success_rate: float
-    last_used: float
-    usage_count: int
+    
+    # Goal signature - what this procedure achieves
+    goal_signature: str = ""
+    
+    # Procedure details
+    prerequisites: List[str] = field(default_factory=list)
+    outcomes: List[str] = field(default_factory=list)
+    required_tools: List[str] = field(default_factory=list)
+    expected_artifacts: List[str] = field(default_factory=list)
+    success_criteria: str = ""
+    
+    # Learning signals - REAL signals
+    success_count: int = 0        # How many times succeeded
+    failure_count: int = 0        # How many times failed
+    execution_count: int = 0       # Total executions
+    success_rate: float = 0.0
+    
+    # Performance metrics
+    median_latency: float = 0.0
+    last_used: float = 0.0
+    last_success_at: Optional[float] = None
+    
+    # Domain
+    domains: List[str] = field(default_factory=list)
+    
+    # Failure modes
+    failure_modes: List[str] = field(default_factory=list)
+    
+    # Verification
     verified_against: List[str] = field(default_factory=list)
+    verified_at: Optional[float] = None
+    
+    # Lifecycle
+    status: KnowledgeStatus = KnowledgeStatus.CANDIDATE
+    
+    def __post_init__(self):
+        """Calculate derived fields"""
+        if self.execution_count > 0:
+            self.success_rate = self.success_count / self.execution_count
 
 
 # SOURCE RANKER
@@ -281,12 +402,18 @@ class ProceduralMemoryManager:
         return None
     
     def record_execution(self, pid: str, success: bool, duration: float):
+        """Record procedure execution - FIXED: using correct fields"""
         if pid in self.procedures:
             p = self.procedures[pid]
-            p.usage_count += 1
+            p.execution_count += 1
             if success:
                 p.success_count += 1
-            p.success_rate = p.success_count / p.usage_count
+                p.last_success_at = time.time()
+            else:
+                p.failure_count += 1
+            # Recalculate success rate
+            if p.execution_count > 0:
+                p.success_rate = p.success_count / p.execution_count
             p.last_used = time.time()
 
 
@@ -387,6 +514,7 @@ class ContinuousLearningPipeline:
         return proc_id
     
     def query(self, query: str, min_confidence: float = 0.3) -> List[KnowledgeEntry]:
+        """Query knowledge - returns retrieved entries"""
         results = []
         qterms = set(query.lower().split())
         
@@ -394,9 +522,14 @@ class ContinuousLearningPipeline:
             if entry.confidence < min_confidence:
                 continue
             
+            # Skip non-active knowledge
+            if entry.status in [KnowledgeStatus.RETIRED, KnowledgeStatus.QUARANTINED]:
+                continue
+                
             eterms = set(entry.content.lower().split())
             if qterms & eterms:
-                entry.usage_count += 1
+                # FIXED: Proper signal - retrieval_count, not usage_count
+                entry.retrieval_count += 1
                 results.append(entry)
         
         results.sort(key=lambda x: x.confidence, reverse=True)
@@ -459,6 +592,21 @@ class KnowledgeGovernance:
         }
         # Feedback queue for observed-world closed loop
         self.feedback_queue: List[Dict] = []
+        
+        # FIXED: Initialize missing attributes
+        self.source_trust: Dict[str, float] = {}  # source_url -> trust_score
+        self.procedural_memory: Dict[str, Dict] = {}  # entry_id -> procedure_data
+        self.knowledge_events: List[Dict] = []  # Truth Ledger events
+        
+    def record_event(self, event_type: LearningEventType, entry_id: str, details: Dict = None):
+        """Record a learning event - history-rich system"""
+        event = {
+            "event_type": event_type.value,
+            "entry_id": entry_id,
+            "timestamp": time.time(),
+            "details": details or {}
+        }
+        self.knowledge_events.append(event)
         
     def governance_loop(self):
         """Main governance loop - run periodically"""
@@ -823,18 +971,32 @@ class UnifiedLearning:
         return self.pipeline.query(query, min_confidence)
         
     def record_success(self, entry_id: str):
-        """Record successful use of knowledge"""
+        """Record successful use of knowledge - proper signal semantics"""
         if entry_id in self.pipeline.knowledge:
             entry = self.pipeline.knowledge[entry_id]
+            # FIXED: Proper signal semantics
+            entry.execution_count += 1
             entry.success_count += 1
-            self.governance.record_feedback(entry_id, "success")
+            # Record event for Truth Ledger
+            self.governance.record_event(
+                LearningEventType.KNOWLEDGE_SUCCEEDED,
+                entry_id,
+                {"execution_count": entry.execution_count}
+            )
             
     def record_failure(self, entry_id: str):
-        """Record failed use of knowledge"""
+        """Record failed use of knowledge - proper signal semantics"""
         if entry_id in self.pipeline.knowledge:
             entry = self.pipeline.knowledge[entry_id]
-            entry.usage_count += 1
-            self.governance.record_feedback(entry_id, "failure")
+            # FIXED: Proper signal semantics
+            entry.execution_count += 1
+            entry.failure_count += 1
+            # Record event for Truth Ledger
+            self.governance.record_event(
+                LearningEventType.KNOWLEDGE_FAILED,
+                entry_id,
+                {"execution_count": entry.execution_count}
+            )
             
     def get_stats(self) -> Dict:
         """Get unified stats"""

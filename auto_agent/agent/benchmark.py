@@ -977,7 +977,7 @@ class MasterBenchmarkSuite:
 
 # ==================== FACTORY ====================
 
-def create_benchmark_suite(agent) -> MasterBenchmarkSuite:
+def create_benchmark_suite(agent=None) -> MasterBenchmarkSuite:
     """Create benchmark suite"""
     return MasterBenchmarkSuite(agent)
 
@@ -1943,8 +1943,3 @@ class AdvancedBenchmarkSuite:
         results["all_passed"] = all(b.get("passed", False) for b in results["benchmarks"].values())
         
         return results
-
-
-def create_unified_gate_coordinator(config: Dict = None) -> UnifiedReleaseGateCoordinator:
-    """Factory function for UnifiedReleaseGateCoordinator"""
-    return UnifiedReleaseGateCoordinator(config)
