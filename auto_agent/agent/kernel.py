@@ -1678,6 +1678,356 @@ class CompileResult:
     compiled_task_count: int = 0
 
 
+# ==================== CONTEXT INJECTION MODELS ====================
+# FIX: Memory / Context injection boundary canonical
+
+class ContextScope(str, Enum):
+    """Context scope levels"""
+    GLOBAL = "global"       # Policy, workspace config
+    SESSION = "session"    # Current session state
+    RUN = "run"            # Current run/task chain
+    TASK = "task"          # Current task
+    ATTEMPT = "attempt"    # Current attempt only
+
+
+class ContextTrustLevel(str, Enum):
+    """Trust level for context items"""
+    LOW = "low"       # User input, uncertain sources
+    MEDIUM = "medium" # Derived, inferred
+    HIGH = "high"     # Verified, system-generated
+
+
+class ContextSource(str, Enum):
+    """Source of context items"""
+    LEDGER = "ledger"           # Event ledger
+    CHECKPOINT = "checkpoint"   # Checkpoint state
+    MEMORY = "memory"           # Semantic memory
+    USER_INPUT = "user_input"   # User request
+    POLICY = "policy"           # Policy engine
+    TOOL_STATE = "tool_state"  # Tool execution state
+    VERIFIER = "verifier"       # Verification result
+    RECOVERY = "recovery"       # Recovery engine
+    PLANNER = "planner"         # Planner output
+    EXECUTOR = "executor"       # Execution result
+
+
+@dataclass(frozen=True)
+class ContextItem:
+    """
+    Single context item with full provenance.
+    
+    FIX: Context is not just data - it's a typed, provenance-aware packet.
+    """
+    key: str
+    value: Any
+    source: ContextSource
+    scope: ContextScope
+    freshness_ts: float
+    trust_level: ContextTrustLevel
+    
+    # Optional metadata
+    expires_at: Optional[float] = None
+    superseded: bool = False
+    superseded_by: Optional[str] = None
+    task_id: Optional[str] = None
+    run_id: Optional[str] = None
+    
+    def is_fresh(self, current_time: float, max_age: float = 3600) -> bool:
+        """Check if this context item is still fresh"""
+        if self.superseded:
+            return False
+        if self.expires_at and current_time > self.expires_at:
+            return False
+        if current_time - self.freshness_ts > max_age:
+            return False
+        return True
+    
+    def age(self, current_time: float) -> float:
+        """Get age in seconds"""
+        return current_time - self.freshness_ts
+
+
+@dataclass
+class ContextPacket:
+    """
+    A compiled context packet for a specific target.
+    
+    FIX: Each subsystem gets a tailored context packet, not a blob.
+    """
+    packet_id: str
+    target: str
+    items: List[ContextItem] = field(default_factory=list)
+    budget_tokens: int = 0
+    summary: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    
+    def get_item(self, key: str) -> Optional[ContextItem]:
+        for item in self.items:
+            if item.key == key:
+                return item
+        return None
+    
+    def get_items_by_source(self, source: ContextSource) -> List[ContextItem]:
+        return [item for item in self.items if item.source == source]
+    
+    def get_fresh_items(self, current_time: float, max_age: float = 3600) -> List[ContextItem]:
+        return [item for item in self.items if item.is_fresh(current_time, max_age)]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "packet_id": self.packet_id,
+            "target": self.target,
+            "context": {item.key: item.value for item in self.items},
+            "summary": self.summary,
+            "item_count": len(self.items)
+        }
+
+
+class ContextPolicy:
+    """
+    Policy for context selection per target.
+    """
+    
+    DEFAULT_POLICIES = {
+        "planner": {
+            "max_items": 30,
+            "trust_threshold": ContextTrustLevel.LOW,
+            "allow_stale": False,
+        },
+        "dispatcher": {
+            "max_items": 20,
+            "trust_threshold": ContextTrustLevel.MEDIUM,
+            "allow_stale": True,
+        },
+        "verifier": {
+            "max_items": 15,
+            "trust_threshold": ContextTrustLevel.HIGH,
+            "allow_stale": False,
+        },
+        "recovery": {
+            "max_items": 25,
+            "trust_threshold": ContextTrustLevel.HIGH,
+            "allow_stale": True,
+        },
+        "executor": {
+            "max_items": 10,
+            "trust_threshold": ContextTrustLevel.HIGH,
+            "allow_stale": False,
+        }
+    }
+    
+    @classmethod
+    def get_policy(cls, target: str) -> Dict[str, Any]:
+        return cls.DEFAULT_POLICIES.get(target, cls.DEFAULT_POLICIES["executor"])
+
+
+class ContextAssembler:
+    """
+    ASSEMBLES context from multiple sources deterministically.
+    """
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.logger = logging.getLogger(__name__)
+    
+    async def assemble(
+        self,
+        target: str,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        additional_items: Optional[List[ContextItem]] = None
+    ) -> ContextPacket:
+        """Assemble context packet for a target."""
+        self.logger.info(f"📦 ASSEMBLING context for: {target}")
+        
+        current_time = time.time()
+        policy = ContextPolicy.get_policy(target)
+        
+        # Collect from sources
+        raw_items = await self._collect_all_context(target, task_id, run_id)
+        
+        if additional_items:
+            raw_items.extend(additional_items)
+        
+        # Deduplicate and filter
+        items = self._deduplicate_items(raw_items)
+        items = self._filter_items(items, current_time, policy.get("allow_stale", False))
+        items = self._apply_policy(items, policy)
+        
+        # Create packet
+        packet = ContextPacket(
+            packet_id=f"ctx_{uuid.uuid4().hex[:12]}",
+            target=target,
+            items=items,
+            budget_tokens=policy.get("max_items", 20) * 100,
+            summary={"total_items": len(items), "target": target},
+            created_at=current_time
+        )
+        
+        self.logger.info(f"✅ Assembled {len(items)} context items for {target}")
+        return packet
+    
+    async def _collect_all_context(self, target: str, task_id: Optional[str], run_id: Optional[str]) -> List[ContextItem]:
+        """Collect context from all available sources"""
+        items = []
+        
+        # From task event ledger
+        if hasattr(self.kernel, '_task_event_ledger'):
+            for event in self.kernel._task_event_ledger[-50:]:
+                items.append(ContextItem(
+                    key=f"event:{event.task_id}:{event.to_status}",
+                    value={"from": event.from_status, "to": event.to_status, "reason": event.reason},
+                    source=ContextSource.LEDGER,
+                    scope=ContextScope.RUN if event.task_id == task_id else ContextScope.SESSION,
+                    freshness_ts=event.timestamp,
+                    trust_level=ContextTrustLevel.HIGH,
+                    task_id=event.task_id
+                ))
+        
+        # From checkpoints
+        if task_id and hasattr(self.kernel, '_task_checkpoints'):
+            checkpoint = self.kernel._task_checkpoints.get(task_id)
+            if checkpoint:
+                items.append(ContextItem(
+                    key=f"checkpoint:{task_id}",
+                    value={"checkpoint_id": checkpoint.checkpoint_id, "status": checkpoint.last_safe_status},
+                    source=ContextSource.CHECKPOINT,
+                    scope=ContextScope.RUN,
+                    freshness_ts=checkpoint.created_at,
+                    trust_level=ContextTrustLevel.HIGH,
+                    task_id=task_id
+                ))
+        
+        # From transactions
+        if task_id and hasattr(self.kernel, '_active_transactions'):
+            for tx_id, tx in self.kernel._active_transactions.items():
+                if tx.task_id == task_id:
+                    items.append(ContextItem(
+                        key=f"tx:{tx_id}",
+                        value={"phase": tx.phase.value, "tool": tx.tool_name, "committed": tx.is_committed()},
+                        source=ContextSource.EXECUTOR,
+                        scope=ContextScope.ATTEMPT,
+                        freshness_ts=tx.created_at,
+                        trust_level=ContextTrustLevel.HIGH,
+                        task_id=task_id
+                    ))
+        
+        # From task state
+        if task_id and hasattr(self.kernel, 'task_manager'):
+            task = self.kernel.task_manager.get_task(task_id)
+            if task:
+                items.append(ContextItem(
+                    key=f"task_state:{task_id}",
+                    value={"status": str(task.status), "retry_count": task.retry_count, "error": task.error},
+                    source=ContextSource.LEDGER,
+                    scope=ContextScope.TASK,
+                    freshness_ts=task.created_at,
+                    trust_level=ContextTrustLevel.HIGH,
+                    task_id=task_id
+                ))
+        
+        # From memory
+        if hasattr(self.kernel, 'memory') and self.kernel.memory:
+            try:
+                mem_results = self.kernel.memory.retrieve(task_id or "", limit=5)
+                for mem in mem_results:
+                    items.append(ContextItem(
+                        key=f"memory:{mem.get('id', 'unknown')}",
+                        value=mem.get('content', ''),
+                        source=ContextSource.MEMORY,
+                        scope=ContextScope.SESSION,
+                        freshness_ts=mem.get('timestamp', time.time()),
+                        trust_level=ContextTrustLevel.MEDIUM,
+                        task_id=task_id
+                    ))
+            except Exception as e:
+                self.logger.warning(f"Memory retrieve failed: {e}")
+        
+        # From approvals
+        if hasattr(self.kernel, 'pending_approvals'):
+            for approval_id, approval in self.kernel.pending_approvals.items():
+                items.append(ContextItem(
+                    key=f"approval:{approval_id}",
+                    value=approval,
+                    source=ContextSource.POLICY,
+                    scope=ContextScope.SESSION,
+                    freshness_ts=time.time(),
+                    trust_level=ContextTrustLevel.HIGH
+                ))
+        
+        # Global governance
+        items.append(ContextItem(
+            key="governance:workspace",
+            value={"sandbox_mode": "normal", "approval_policy": "auto"},
+            source=ContextSource.POLICY,
+            scope=ContextScope.GLOBAL,
+            freshness_ts=time.time(),
+            trust_level=ContextTrustLevel.HIGH
+        ))
+        
+        return items
+    
+    def _deduplicate_items(self, items: List[ContextItem]) -> List[ContextItem]:
+        """Remove duplicate context items"""
+        seen = {}
+        result = []
+        for item in items:
+            if item.key not in seen:
+                seen[item.key] = item
+                result.append(item)
+            else:
+                existing = seen[item.key]
+                if item.freshness_ts > existing.freshness_ts:
+                    result.remove(existing)
+                    result.append(item)
+                    seen[item.key] = item
+        return result
+    
+    def _filter_items(self, items: List[ContextItem], current_time: float, allow_stale: bool) -> List[ContextItem]:
+        """Filter stale and superseded items"""
+        filtered = []
+        for item in items:
+            if item.superseded:
+                continue
+            if item.expires_at and current_time > item.expires_at:
+                continue
+            if not allow_stale and not item.is_fresh(current_time, max_age=3600):
+                continue
+            filtered.append(item)
+        return filtered
+    
+    def _apply_policy(self, items: List[ContextItem], policy: Dict[str, Any]) -> List[ContextItem]:
+        """Apply policy to limit items"""
+        max_items = policy.get("max_items", 20)
+        
+        # Score and sort
+        scored = []
+        for item in items:
+            score = self._score_item(item, policy)
+            scored.append((score, item))
+        
+        scored.sort(key=lambda x: -x[0])
+        return [item for _, item in scored[:max_items]]
+    
+    def _score_item(self, item: ContextItem, policy: Dict[str, Any]) -> float:
+        """Score item based on policy"""
+        score = 0.0
+        
+        # Trust bonus
+        trust_order = [ContextTrustLevel.LOW, ContextTrustLevel.MEDIUM, ContextTrustLevel.HIGH]
+        if item.trust_level in trust_order:
+            score += trust_order.index(item.trust_level) * 2.0
+        
+        # Freshness bonus
+        age = time.time() - item.freshness_ts
+        if age < 60:
+            score += 3.0
+        elif age < 300:
+            score += 1.0
+        
+        return score
+
+
 class PlanCompiler:
     """
     PLAN COMPILER - The "compiler wall" between planner and executor.
@@ -4517,6 +4867,10 @@ class CentralKernel:
         # FIX: Plan Compiler - The "compiler wall" between planner and executor
         logger.info("📋 Initializing Plan Compiler...")
         self.plan_compiler = PlanCompiler(self)
+        
+        # FIX: Context Assembler - The context injection boundary
+        logger.info("📦 Initializing Context Assembler...")
+        self.context_assembler = ContextAssembler(self)
         
         # Compiled graph cache for execution
         self._compiled_graphs: Dict[str, ExecutableGraph] = {}
