@@ -1536,6 +1536,505 @@ class CommitDecision:
     action: str = "proceed"  # proceed, rollback, retry, escalate
 
 
+# ==================== PLAN COMPILATION MODELS ====================
+# FIX: Planner -> Compiler -> ExecutableGraph boundary
+
+@dataclass
+class PlanDraft:
+    """
+    Raw plan output from LLM planner.
+    
+    This is the initial draft that needs compilation.
+    """
+    goal: str
+    raw_tasks: List[Dict[str, Any]]  # Raw task dicts from LLM
+    planner_metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class CompiledTask:
+    """
+    Single compiled task with normalized spec and validation results.
+    """
+    task_id: str
+    description: str
+    normalized_spec: Dict[str, Any] = field(default_factory=dict)
+    
+    # Validation results
+    compile_warnings: List[str] = field(default_factory=list)
+    compile_errors: List[str] = field(default_factory=list)
+    valid: bool = True
+    
+    # Execution metadata
+    tool_name: Optional[str] = None
+    verification_type: Optional[str] = None
+    retry_policy: Dict[str, Any] = field(default_factory=dict)
+    approval_policy: str = "auto"
+    sandbox_mode: str = "normal"
+    timeout: int = 30
+    
+    # Graph position
+    dependencies: List[str] = field(default_factory=list)
+    can_parallel: bool = False
+    checkpoint_boundary: bool = False
+
+
+@dataclass
+class GraphNode:
+    """
+    Typed node in the executable task graph.
+    """
+    node_id: str
+    task_id: str
+    stage: str  # prepare, execute, verify, commit
+    retry_budget: int = 3
+    requires_approval: bool = False
+    dangerous: bool = False
+    checkpoint_boundary: bool = False
+    status: str = "pending"  # pending, ready, running, completed, failed, blocked
+
+
+@dataclass
+class GraphEdge:
+    """
+    Typed edge in the executable task graph.
+    """
+    from_node: str
+    to_node: str
+    edge_type: str  # dependency, fallback, recovery, supersede
+    condition: Optional[str] = None  # on_success, on_failure, always
+
+
+@dataclass
+class ExecutableGraph:
+    """
+    Compiled and validated execution graph.
+    
+    This is the intermediate representation between plan and execution.
+    """
+    graph_id: str
+    goal: str
+    nodes: List[GraphNode] = field(default_factory=list)
+    edges: List[GraphEdge] = field(default_factory=list)
+    
+    # Compilation results
+    valid: bool = True
+    compile_warnings: List[str] = field(default_factory=list)
+    compile_errors: List[str] = field(default_factory=list)
+    
+    # Metadata
+    created_at: float = field(default_factory=time.time)
+    compiled_from_draft: Optional[str] = None
+    
+    def get_node(self, node_id: str) -> Optional[GraphNode]:
+        """Get node by ID"""
+        for node in self.nodes:
+            if node.node_id == node_id:
+                return node
+        return None
+    
+    def get_outgoing_edges(self, node_id: str) -> List[GraphEdge]:
+        """Get outgoing edges from a node"""
+        return [e for e in self.edges if e.from_node == node_id]
+    
+    def get_incoming_edges(self, node_id: str) -> List[GraphEdge]:
+        """Get incoming edges to a node"""
+        return [e for e in self.edges if e.to_node == node_id]
+    
+    def get_ready_nodes(self) -> List[GraphNode]:
+        """Get nodes that are ready to execute (all dependencies completed)"""
+        completed = {n.node_id for n in self.nodes if n.status == "completed"}
+        ready = []
+        for node in self.nodes:
+            if node.status != "pending":
+                continue
+            # Check all dependencies are completed
+            incoming = self.get_incoming_edges(node.node_id)
+            deps = [e.from_node for e in incoming if e.edge_type == "dependency"]
+            if all(d in completed for d in deps):
+                ready.append(node)
+        return ready
+
+
+@dataclass
+class CompileResult:
+    """
+    Result of plan compilation.
+    """
+    success: bool
+    draft: PlanDraft
+    compiled_graph: Optional[ExecutableGraph] = None
+    
+    # Compilation details
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    
+    # Fixups applied
+    auto_fixups: List[str] = field(default_factory=list)
+    
+    # Statistics
+    original_task_count: int = 0
+    compiled_task_count: int = 0
+
+
+class PlanCompiler:
+    """
+    PLAN COMPILER - The "compiler wall" between planner and executor.
+    
+    CRITICAL: This is the ONLY path from plan to execution.
+    No raw planner output should ever reach execution directly!
+    
+    Responsibilities:
+    1. Normalize plan draft to canonical IR
+    2. Validate semantic correctness
+    3. Check dependency graph validity
+    4. Inject missing verifications
+    5. Apply policy constraints
+    6. Build executable graph
+    7. Generate compile warnings/errors
+    """
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.logger = logging.getLogger(__name__)
+        
+        # Tool configuration
+        self._tool_config = {
+            'write_file': {'dangerous': True, 'requires_approval': True},
+            'delete_file': {'dangerous': True, 'requires_approval': True},
+            'execute_command': {'dangerous': True, 'requires_approval': True},
+            'install_package': {'dangerous': True, 'requires_approval': True},
+            'browser_click': {'dangerous': False, 'requires_approval': False},
+            'browser_navigate': {'dangerous': False, 'requires_approval': False},
+            'read_file': {'dangerous': False, 'requires_approval': False},
+            'grep': {'dangerous': False, 'requires_approval': False},
+            'web_search': {'dangerous': False, 'requires_approval': False},
+        }
+        
+        # Default configurations
+        self._default_timeout = 30
+        self._default_retry_policy = {"max_retries": 3, "backoff": "exponential"}
+        self._default_verification = "none"
+    
+    async def compile(self, draft: PlanDraft) -> CompileResult:
+        """
+        Compile a plan draft to an executable graph.
+        
+        Pipeline: Draft -> Normalize -> Validate -> Enrich -> Graph
+        """
+        self.logger.info(f"📋 COMPILING: {draft.goal[:50]}...")
+        
+        compile_result = CompileResult(
+            success=False,
+            draft=draft,
+            original_task_count=len(draft.raw_tasks)
+        )
+        
+        try:
+            # Step 1: Normalize raw tasks to compiled tasks
+            compiled_tasks = []
+            for raw_task in draft.raw_tasks:
+                compiled = self._normalize_task(raw_task, compile_result)
+                compiled_tasks.append(compiled)
+            
+            # Step 2: Validate compiled tasks
+            self._validate_tasks(compiled_tasks, compile_result)
+            
+            # Step 3: Build dependency graph
+            valid, errors = self._build_dependency_graph(compiled_tasks)
+            if not valid:
+                compile_result.errors.extend(errors)
+                compile_result.success = False
+                return compile_result
+            
+            # Step 4: Inject missing verifications
+            self._inject_verifications(compiled_tasks, compile_result)
+            
+            # Step 5: Apply policy constraints
+            self._apply_policies(compiled_tasks, compile_result)
+            
+            # Step 6: Build executable graph
+            graph = self._build_executable_graph(draft.goal, compiled_tasks)
+            compile_result.compiled_graph = graph
+            
+            # Finalize
+            compile_result.compiled_task_count = len(compiled_tasks)
+            compile_result.success = len(compile_result.errors) == 0
+            
+            self.logger.info(f"✅ COMPILED: {len(compiled_tasks)} tasks, {len(compile_result.warnings)} warnings")
+            
+            return compile_result
+            
+        except Exception as e:
+            self.logger.error(f"Compile error: {e}")
+            compile_result.errors.append(f"Compile exception: {str(e)}")
+            compile_result.success = False
+            return compile_result
+    
+    def _normalize_task(self, raw_task: Dict, result: CompileResult) -> CompiledTask:
+        """Normalize a raw task to compiled task."""
+        
+        # Extract task ID
+        task_id = raw_task.get('id') or f"task_{uuid.uuid4().hex[:8]}"
+        
+        # Normalize description
+        description = raw_task.get('description', raw_task.get('task', ''))
+        if not description:
+            result.warnings.append(f"{task_id}: missing description")
+            description = f"Task {task_id}"
+        
+        # Build normalized spec
+        normalized = {
+            'original_id': task_id,
+            'raw_fields': raw_task
+        }
+        
+        compiled = CompiledTask(
+            task_id=task_id,
+            description=description,
+            normalized_spec=normalized
+        )
+        
+        # Normalize tool
+        tool_name = raw_task.get('tool') or raw_task.get('tool_name') or raw_task.get('required_tool')
+        if tool_name:
+            compiled.tool_name = tool_name
+        else:
+            result.warnings.append(f"{task_id}: no tool specified")
+        
+        # Normalize verification type
+        verification_type = raw_task.get('verification_type') or raw_task.get('verification')
+        if verification_type:
+            try:
+                compiled.verification_type = normalize_verification_type(verification_type).value
+            except ValueError as e:
+                result.warnings.append(f"{task_id}: invalid verification type, using none")
+                compiled.verification_type = "none"
+        else:
+            compiled.verification_type = self._default_verification
+            if compiled.tool_name in self._tool_config:
+                result.warnings.append(f"{task_id}: missing verification, defaulting to none")
+        
+        # Normalize retry policy
+        retry_raw = raw_task.get('retry_policy') or raw_task.get('retry')
+        if isinstance(retry_raw, int):
+            compiled.retry_policy = {"max_retries": retry_raw, "backoff": "exponential"}
+        elif isinstance(retry_raw, dict):
+            compiled.retry_policy = retry_raw
+        else:
+            compiled.retry_policy = self._default_retry_policy.copy()
+        
+        # Normalize approval policy
+        compiled.approval_policy = raw_task.get('approval_policy', 'auto')
+        
+        # Normalize sandbox mode
+        compiled.sandbox_mode = raw_task.get('sandbox_mode', 'normal')
+        
+        # Normalize timeout
+        compiled.timeout = raw_task.get('timeout', self._default_timeout)
+        
+        # Normalize dependencies
+        deps = raw_task.get('dependencies', [])
+        if isinstance(deps, list):
+            compiled.dependencies = deps
+        else:
+            result.warnings.append(f"{task_id}: invalid dependencies format")
+            compiled.dependencies = []
+        
+        # Check parallel eligibility
+        compiled.can_parallel = raw_task.get('can_parallel', False)
+        
+        return compiled
+    
+    def _validate_tasks(self, tasks: List[CompiledTask], result: CompileResult):
+        """Validate compiled tasks semantically."""
+        
+        # Check for duplicate IDs
+        ids = [t.task_id for t in tasks]
+        duplicates = [x for x in ids if ids.count(x) > 1]
+        if duplicates:
+            result.errors.append(f"Duplicate task IDs: {set(duplicates)}")
+        
+        # Validate each task
+        for task in tasks:
+            # Check tool exists
+            if task.tool_name and task.tool_name not in self._tool_config:
+                result.warnings.append(f"{task.task_id}: unknown tool '{task.tool_name}', will use default routing")
+            
+            # Check timeout is reasonable
+            if task.timeout < 1 or task.timeout > 3600:
+                result.warnings.append(f"{task.task_id}: timeout {task.timeout}s outside reasonable range [1, 3600], clamping")
+                task.timeout = max(1, min(3600, task.timeout))
+            
+            # Check retry policy
+            max_retries = task.retry_policy.get('max_retries', 3)
+            if max_retries < 0 or max_retries > 10:
+                result.warnings.append(f"{task.task_id}: max_retries {max_retries} outside [0, 10]")
+                task.retry_policy['max_retries'] = max(0, min(10, max_retries))
+            
+            # Check approval policy
+            if task.approval_policy not in ['auto', 'manual', 'never']:
+                result.warnings.append(f"{task.task_id}: invalid approval_policy '{task.approval_policy}', using auto")
+                task.approval_policy = "auto"
+            
+            # Mark as invalid if has errors
+            if task.compile_errors:
+                task.valid = False
+    
+    def _build_dependency_graph(self, tasks: List[CompiledTask]) -> tuple:
+        """Build and validate dependency graph."""
+        errors = []
+        
+        # Build ID map
+        task_ids = {t.task_id for t in tasks}
+        
+        # Check all dependencies exist
+        for task in tasks:
+            for dep in task.dependencies:
+                if dep not in task_ids:
+                    errors.append(f"{task.task_id}: depends on non-existent task '{dep}'")
+        
+        # Check for cycles using DFS
+        if self._has_cycle(tasks):
+            errors.append("Dependency graph contains cycles")
+        
+        return len(errors) == 0, errors
+    
+    def _has_cycle(self, tasks: List[CompiledTask]) -> bool:
+        """Check if dependency graph has cycles."""
+        # Build adjacency list
+        adj = {t.task_id: list(t.dependencies) for t in tasks}
+        
+        visited = set()
+        rec_stack = set()
+        
+        def dfs(node):
+            visited.add(node)
+            rec_stack.add(node)
+            
+            for neighbor in adj.get(node, []):
+                if neighbor not in visited:
+                    if dfs(neighbor):
+                        return True
+                elif neighbor in rec_stack:
+                    return True
+            
+            rec_stack.remove(node)
+            return False
+        
+        for task in tasks:
+            if task.task_id not in visited:
+                if dfs(task.task_id):
+                    return True
+        return False
+    
+    def _inject_verifications(self, tasks: List[CompiledTask], result: CompileResult):
+        """Inject missing verifications where needed."""
+        
+        for task in tasks:
+            if task.verification_type == "none":
+                # Check if this is a side-effecting task that needs verification
+                if task.tool_name in self._tool_config:
+                    config = self._tool_config[task.tool_name]
+                    
+                    if config.get('dangerous', False):
+                        # Dangerous tools should have explicit verification
+                        if not task.compile_errors:
+                            result.auto_fixups.append(f"{task.task_id}: dangerous tool without explicit verification")
+            
+            # Inject default verification based on tool
+            if task.verification_type == "none" and task.tool_name:
+                if task.tool_name in ["write_file", "delete_file"]:
+                    task.verification_type = "file_exists"
+                    result.auto_fixups.append(f"{task.task_id}: auto-injected file_exists verification")
+                elif task.tool_name == "execute_command":
+                    task.verification_type = "function_result"
+                    result.auto_fixups.append(f"{task.task_id}: auto-injected function_result verification")
+    
+    def _apply_policies(self, tasks: List[CompiledTask], result: CompileResult):
+        """Apply policy constraints to tasks."""
+        
+        for task in tasks:
+            # Check dangerous tools with approval
+            if task.tool_name in self._tool_config:
+                config = self._tool_config[task.tool_name]
+                
+                if config.get('requires_approval', False):
+                    task.requires_approval = True
+                    if task.approval_policy == 'never':
+                        result.warnings.append(
+                            f"{task.task_id}: dangerous tool '{task.tool_name}' with approval_policy='never' "
+                            "may fail at runtime"
+                        )
+            
+            # Mark checkpoint boundaries for dangerous operations
+            if task.tool_name in ['execute_command', 'install_package']:
+                task.checkpoint_boundary = True
+    
+    def _build_executable_graph(self, goal: str, tasks: List[CompiledTask]) -> ExecutableGraph:
+        """Build executable graph from compiled tasks."""
+        
+        graph_id = f"graph_{uuid.uuid4().hex[:12]}"
+        
+        # Create nodes
+        nodes = []
+        for task in tasks:
+            node = GraphNode(
+                node_id=f"node_{task.task_id}",
+                task_id=task.task_id,
+                stage="execute",
+                retry_budget=task.retry_policy.get('max_retries', 3),
+                requires_approval=task.requires_approval,
+                dangerous=task.tool_name in self._tool_config and 
+                         self._tool_config[task.tool_name].get('dangerous', False),
+                checkpoint_boundary=task.checkpoint_boundary,
+                status="pending"
+            )
+            nodes.append(node)
+        
+        # Create edges
+        edges = []
+        task_id_to_node = {t.task_id: f"node_{t.task_id}" for t in tasks}
+        
+        for task in tasks:
+            for dep in task.dependencies:
+                if dep in task_id_to_node:
+                    edge = GraphEdge(
+                        from_node=task_id_to_node[dep],
+                        to_node=f"node_{task.task_id}",
+                        edge_type="dependency",
+                        condition="on_success"
+                    )
+                    edges.append(edge)
+        
+        # Build graph
+        graph = ExecutableGraph(
+            graph_id=graph_id,
+            goal=goal,
+            nodes=nodes,
+            edges=edges,
+            valid=True,
+            compile_warnings=[],
+            compile_errors=[]
+        )
+        
+        return graph
+    
+    async def compile_with_fallback(self, draft: PlanDraft) -> CompileResult:
+        """
+        Try to compile, if fails try to fix and recompile.
+        """
+        result = await self.compile(draft)
+        
+        if not result.success and result.auto_fixups:
+            # Try again with auto-fixups applied
+            self.logger.info("Retrying compilation with fixups...")
+            result = await self.compile(draft)
+        
+        return result
+
+
 # ==================== DATA CLASSES ====================
 
 @dataclass
@@ -4014,6 +4513,13 @@ class CentralKernel:
         self._active_transactions: Dict[str, SideEffectTransaction] = {}
         self._transaction_ledger: Dict[str, List[Dict]] = {}  # FIX: Dict, not List
         self._idempotency_cache: Dict[str, Any] = {}
+        
+        # FIX: Plan Compiler - The "compiler wall" between planner and executor
+        logger.info("📋 Initializing Plan Compiler...")
+        self.plan_compiler = PlanCompiler(self)
+        
+        # Compiled graph cache for execution
+        self._compiled_graphs: Dict[str, ExecutableGraph] = {}
         
         logger.info("✅ Central Kernel Ready!")
     
