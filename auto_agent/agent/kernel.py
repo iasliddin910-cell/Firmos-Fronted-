@@ -2344,6 +2344,211 @@ class TerminationManager:
         return decision
 
 
+# ==================== HUMAN HANDOVER / ESCALATION ====================
+
+class EscalationReason(str, Enum):
+    """Types of escalation reasons"""
+    APPROVAL_REQUIRED = "approval_required"
+    AMBIGUOUS_INTENT = "ambiguous_intent"
+    NO_PROGRESS = "no_progress"
+    POLICY_BLOCKED = "policy_blocked"
+    PARTIAL_SUCCESS_REVIEW = "partial_success_review"
+    CAPABILITY_UNAVAILABLE = "capability_unavailable"
+    BUDGET_EXHAUSTED_SALVAGEABLE = "budget_exhausted_salvageable"
+    HUMAN_EXECUTION_REQUIRED = "human_execution_required"
+    VERIFIER_UNCLEAR = "verifier_unclear"
+
+
+@dataclass
+class HandoffPacket:
+    """Complete handoff packet for human escalation"""
+    handoff_id: str
+    task_id: str
+    reason: EscalationReason
+    summary: str
+    current_state: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    options: List[Dict[str, Any]] = field(default_factory=list)
+    recommended_option: Optional[str] = None
+    risks: List[str] = field(default_factory=list)
+    required_human_action: Optional[str] = None
+    
+    def to_user_friendly(self) -> str:
+        """Convert to user-friendly message"""
+        msg = f"📋 **Task: {self.summary}**\n\n"
+        msg += f"**Reason:** {self.reason.value}\n\n"
+        msg += f"**Current State:** {self.current_state}\n\n"
+        
+        if self.options:
+            msg += "**Options:**\n"
+            for i, opt in enumerate(self.options, 1):
+                msg += f"{i}. {opt.get('label', 'Option')}\n"
+        
+        if self.risks:
+            msg += "\n**Risks:**\n"
+            for risk in self.risks:
+                msg += f"- {risk}\n"
+        
+        return msg
+
+
+@dataclass
+class HumanResponseCompileResult:
+    """Result of compiling human response"""
+    accepted: bool
+    selected_option: Optional[str] = None
+    added_constraints: Dict[str, Any] = field(default_factory=dict)
+    approval_granted: bool = False
+    manual_action_confirmed: bool = False
+    resume_allowed: bool = False
+    resume_from_status: Optional[str] = None
+
+
+@dataclass
+class ResumeDirective:
+    """Directive to resume after human handoff"""
+    task_id: str
+    resume_from_status: str
+    supersede_old_branch: bool = False
+    updated_constraints: Dict[str, Any] = field(default_factory=dict)
+
+
+class HumanResponseCompiler:
+    """
+    COMPILES human response into structured result
+    """
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.logger = logging.getLogger(__name__)
+    
+    async def compile(self, handoff: HandoffPacket, human_response: str) -> HumanResponseCompileResult:
+        """Compile human response"""
+        
+        response = human_response.lower().strip()
+        
+        # Check for approval
+        if "approve" in response or "allow" in response or "yes" in response:
+            return HumanResponseCompileResult(
+                accepted=True,
+                approval_granted=True,
+                resume_allowed=True,
+                resume_from_status="approved"
+            )
+        
+        # Check for rejection
+        if "reject" in response or "deny" in response or "no" in response:
+            return HumanResponseCompileResult(
+                accepted=False,
+                resume_allowed=False
+            )
+        
+        # Check for option selection
+        if response.isdigit() or any(response.startswith(str(i)) for i in range(1, 10)):
+            option_num = int(response.strip()[0]) - 1
+            if option_num < len(handoff.options):
+                return HumanResponseCompileResult(
+                    accepted=True,
+                    selected_option=handoff.options[option_num].get("value"),
+                    resume_allowed=True,
+                    resume_from_status="option_selected"
+                )
+        
+        # Default: resume with human input
+        return HumanResponseCompileResult(
+            accepted=True,
+            resume_allowed=True,
+            resume_from_status="human_input_received"
+        )
+
+
+class HandoffOrchestrator:
+    """
+    HANDOFF ORCHESTRATOR - Manages human escalation flow
+    """
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.compiler = HumanResponseCompiler(kernel)
+        self._active_handoffs: Dict[str, HandoffPacket] = {}
+        self._handoff_history: List[HandoffPacket] = []
+        self.logger = logging.getLogger(__name__)
+    
+    async def create_handoff(
+        self,
+        task_id: str,
+        reason: EscalationReason,
+        summary: str,
+        current_state: str,
+        options: List[Dict] = None,
+        recommended: str = None,
+        risks: List[str] = None,
+        evidence: Dict = None
+    ) -> HandoffPacket:
+        """Create handoff packet"""
+        
+        import uuid
+        handoff = HandoffPacket(
+            handoff_id=f"handoff_{uuid.uuid4().hex[:8]}",
+            task_id=task_id,
+            reason=reason,
+            summary=summary,
+            current_state=current_state,
+            options=options or [],
+            recommended_option=recommended,
+            risks=risks or [],
+            evidence=evidence or {}
+        )
+        
+        self._active_handoffs[handoff.handoff_id] = handoff
+        self._handoff_history.append(handoff)
+        
+        # Record to ledger
+        if hasattr(self.kernel, 'telemetry') and self.kernel.telemetry:
+            self.kernel.telemetry.record_event('handoff_created', {
+                'handoff_id': handoff.handoff_id,
+                'task_id': task_id,
+                'reason': reason.value
+            })
+        
+        return handoff
+    
+    async def compile_response(
+        self,
+        handoff_id: str,
+        human_response: str
+    ) -> HumanResponseCompileResult:
+        """Compile human response"""
+        
+        if handoff_id not in self._active_handoffs:
+            raise ValueError(f"Handoff {handoff_id} not found")
+        
+        handoff = self._active_handoffs[handoff_id]
+        result = await self.compiler.compile(handoff, human_response)
+        
+        # Record to ledger
+        if hasattr(self.kernel, 'telemetry') and self.kernel.telemetry:
+            self.kernel.telemetry.record_event('handoff_response', {
+                'handoff_id': handoff_id,
+                'accepted': result.accepted,
+                'resume_allowed': result.resume_allowed
+            })
+        
+        return result
+    
+    def get_handoff(self, handoff_id: str) -> Optional[HandoffPacket]:
+        """Get handoff by ID"""
+        return self._active_handoffs.get(handoff_id)
+    
+    def get_active_handoffs(self) -> List[HandoffPacket]:
+        """Get all active handoffs"""
+        return list(self._active_handoffs.values())
+    
+    def get_handoff_history(self) -> List[HandoffPacket]:
+        """Get handoff history"""
+        return self._handoff_history
+
+
 class ContextAssembler:
     """
     ASSEMBLES context from multiple sources deterministically.
@@ -5402,6 +5607,10 @@ class CentralKernel:
         # FIX: Termination Manager - Goal termination
         logger.info("🛑 Initializing Termination Manager...")
         self.termination_manager = TerminationManager(self)
+        
+        # FIX: Handoff Orchestrator - Human escalation
+        logger.info("👤 Initializing Handoff Orchestrator...")
+        self.handoff_orchestrator = HandoffOrchestrator(self)
         
         # FIX: Mode Selector - The capability negotiation boundary
         logger.info("🎯 Initializing Mode Selector...")
