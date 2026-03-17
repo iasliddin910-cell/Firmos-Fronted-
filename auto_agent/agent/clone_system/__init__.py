@@ -170,6 +170,16 @@ from .promotion_system import (
     create_promotion_decision_system
 )
 
+# Orchestration Layer
+from .orchestrator import (
+    CentralOrchestrator,
+    create_orchestrator,
+    SignalSource, SignalType, SignalStatus,
+    CandidateStatus,
+    Observation, UpgradeCandidate, SystemState,
+    IntakeLayer, ReasoningLayer, CandidateLifecycleManager
+)
+
 # Version
 __version__ = "1.0.0"
 __author__ = "OmniAgent X Team"
@@ -217,4 +227,11 @@ __all__ = [
     # Main System
     "PromotionDecisionSystem",
     "create_promotion_decision_system",
+    # Orchestration
+    "CentralOrchestrator",
+    "create_orchestrator",
+    "SignalSource", "SignalType", "SignalStatus",
+    "CandidateStatus",
+    "Observation", "UpgradeCandidate", "SystemState",
+    "IntakeLayer", "ReasoningLayer", "CandidateLifecycleManager",
 ]
