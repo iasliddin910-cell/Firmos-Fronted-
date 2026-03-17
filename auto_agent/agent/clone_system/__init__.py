@@ -151,6 +151,25 @@ from .risk_narrator import RiskNarrator, create_risk_narrator
 from .approval_console import HumanApprovalConsole, create_human_approval_console
 from .reporting_system import ReportingApprovalSystem, create_reporting_approval_system
 
+# Promotion / Fork / Decision System
+from .decision_engine import (
+    DecisionEngine, create_decision_engine,
+    DestinationType, BranchStatus, MergePolicy, DecisionResult,
+    DecisionScore, PromotionResult, BranchInfo, ForkSpec
+)
+from .promotion_executor import (
+    DestinationPolicy, PromotionExecutor,
+    create_destination_policy, create_promotion_executor
+)
+from .fork_manager import (
+    ForkManager, RollbackAnchorManager,
+    create_fork_manager, create_rollback_anchor_manager
+)
+from .promotion_system import (
+    PromotionDecisionSystem,
+    create_promotion_decision_system
+)
+
 # Version
 __version__ = "1.0.0"
 __author__ = "OmniAgent X Team"
@@ -171,17 +190,31 @@ __all__ = [
     "EvidenceItem",
     "UpgradePassport",
     "UpgradeDossier",
-    # Modules
-    "ReportAggregator",
-    "create_report_aggregator",
-    "DeltaAnalyzer",
-    "create_delta_analyzer",
-    "BenchmarkComparisonEngine",
-    "create_benchmark_comparison_engine",
-    "RiskNarrator",
-    "create_risk_narrator",
-    "HumanApprovalConsole",
-    "create_human_approval_console",
+    # Reporting modules
     "ReportingApprovalSystem",
     "create_reporting_approval_system",
+    # Decision Engine
+    "DecisionEngine",
+    "create_decision_engine",
+    "DestinationType",
+    "BranchStatus",
+    "MergePolicy",
+    "DecisionResult",
+    "DecisionScore",
+    "PromotionResult",
+    "BranchInfo",
+    "ForkSpec",
+    # Promotion
+    "DestinationPolicy",
+    "PromotionExecutor",
+    "create_destination_policy",
+    "create_promotion_executor",
+    # Fork Manager
+    "ForkManager",
+    "RollbackAnchorManager",
+    "create_fork_manager",
+    "create_rollback_anchor_manager",
+    # Main System
+    "PromotionDecisionSystem",
+    "create_promotion_decision_system",
 ]
