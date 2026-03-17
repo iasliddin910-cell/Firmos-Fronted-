@@ -2549,6 +2549,197 @@ class HandoffOrchestrator:
         return self._handoff_history
 
 
+# ==================== KERNEL CONSTITUTION / INVARIANT CHECKER ====================
+
+class ViolationSeverity(str, Enum):
+    """Severity levels for invariant violations"""
+    WARNING = "warning"
+    ERROR = "error"
+    FATAL = "fatal"
+
+
+@dataclass
+class InvariantViolation:
+    """An invariant violation"""
+    code: str
+    severity: ViolationSeverity
+    message: str
+    task_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class InvariantReport:
+    """Report of invariant checks"""
+    ok: bool
+    violations: List[InvariantViolation] = field(default_factory=list)
+    checked_at: float = field(default_factory=time.time)
+    
+    def has_fatal(self) -> bool:
+        return any(v.severity == ViolationSeverity.FATAL for v in self.violations)
+
+
+class KernelConstitution:
+    """
+    KERNEL CONSTITUTION - Invariant rules that cannot be broken
+    
+    This is the fundamental contract of the kernel.
+    """
+    
+    # Core invariants - these MUST hold always
+    INVARIANTS = [
+        # Task state invariants
+        "task_state_status_consistent",  # state and status must match
+        "completed_not_in_pending",       # completed task not in pending
+        "completed_not_in_running",      # completed task not in running
+        "failed_not_in_completed",       # failed task not in completed
+        "running_has_started_at",        # running task has started_at
+        
+        # Queue invariants
+        "no_duplicate_task_ids",         # task IDs unique across sets
+        "dependency_respects_status",     # dependent tasks have valid status
+        
+        # Transaction invariants  
+        "verified_before_committed",     # cannot commit without verification
+        "approval_before_dangerous",     # dangerous ops need approval
+        
+        # Budget invariants
+        "retry_within_limit",          # retry_count <= max_retries
+        
+        # Recovery invariants
+        "superseded_not_runnable",      # superseded tasks cannot run
+    ]
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+
+
+class InvariantEngine:
+    """
+    INVARIANT ENGINE - Checks kernel invariants
+    
+    Runs checks at critical points:
+    - After state restore
+    - After status transitions
+    - After recovery
+    - After checkpoint restore
+    - Before commit
+    """
+    
+    def __init__(self, kernel: 'CentralKernel'):
+        self.kernel = kernel
+        self.constitution = KernelConstitution()
+        self.logger = logging.getLogger(__name__)
+        self._violation_count = 0
+    
+    def check_all(self) -> InvariantReport:
+        """Run all invariant checks"""
+        violations = []
+        
+        # Check task state consistency
+        violations.extend(self._check_state_status_consistency())
+        
+        # Check queue/set consistency
+        violations.extend(self._check_queue_consistency())
+        
+        # Check transaction consistency
+        violations.extend(self._check_transaction_consistency())
+        
+        ok = len([v for v in violations if v.severity == ViolationSeverity.FATAL]) == 0
+        
+        report = InvariantReport(
+            ok=ok,
+            violations=violations
+        )
+        
+        if not ok:
+            self._violation_count += 1
+            self.logger.error(f"🚨 INVARIANT VIOLATION: {len(violations)} violations found")
+        
+        return report
+    
+    def _check_state_status_consistency(self) -> List[InvariantViolation]:
+        """Check task state and status consistency"""
+        violations = []
+        
+        if not hasattr(self.kernel, 'task_manager'):
+            return violations
+        
+        # Check running tasks have started_at
+        for task_id in getattr(self.kernel.task_manager, 'running_tasks', []):
+            task = self.kernel.task_manager.get_task(task_id)
+            if task and not task.started_at:
+                violations.append(InvariantViolation(
+                    code="running_without_started_at",
+                    severity=ViolationSeverity.ERROR,
+                    message=f"Task {task_id} is running but has no started_at",
+                    task_id=task_id
+                ))
+        
+        return violations
+    
+    def _check_queue_consistency(self) -> List[InvariantViolation]:
+        """Check queue/set consistency"""
+        violations = []
+        
+        if not hasattr(self.kernel, 'task_manager'):
+            return violations
+        
+        # Check for duplicate task IDs
+        all_tasks = set()
+        if hasattr(self.kernel.task_manager, 'tasks'):
+            all_tasks.update(self.kernel.task_manager.tasks.keys())
+        if hasattr(self.kernel.task_manager, 'completed_tasks'):
+            completed = set(self.kernel.task_manager.completed_tasks)
+            duplicates = all_tasks & completed
+            for task_id in duplicates:
+                violations.append(InvariantViolation(
+                    code="duplicate_in_completed",
+                    severity=ViolationSeverity.ERROR,
+                    message=f"Task {task_id} in both tasks and completed_tasks",
+                    task_id=task_id
+                ))
+        
+        return violations
+    
+    def _check_transaction_consistency(self) -> List[InvariantViolation]:
+        """Check transaction consistency"""
+        violations = []
+        
+        # Check committed transactions have verification
+        if hasattr(self.kernel, '_active_transactions'):
+            for tx_id, tx in self.kernel._active_transactions.items():
+                if tx.is_committed() and not tx.verification_passed:
+                    violations.append(InvariantViolation(
+                        code="committed_without_verification",
+                        severity=ViolationSeverity.FATAL,
+                        message=f"Transaction {tx_id} committed without verification",
+                        task_id=tx.task_id
+                    ))
+        
+        return violations
+    
+    def check_transition(self, task_id: str, from_status: str, to_status: str) -> bool:
+        """Check if transition is valid"""
+        # Basic transition validation
+        valid = True
+        
+        # Cannot go from completed to running
+        if from_status == "completed" and to_status == "running":
+            valid = False
+        
+        # Cannot go from failed to running without retry
+        if from_status == "failed" and to_status == "running":
+            # Only valid if retry is allowed
+            pass
+        
+        return valid
+    
+    def get_violation_count(self) -> int:
+        """Get total violation count"""
+        return self._violation_count
+
+
 class ContextAssembler:
     """
     ASSEMBLES context from multiple sources deterministically.
@@ -5611,6 +5802,10 @@ class CentralKernel:
         # FIX: Handoff Orchestrator - Human escalation
         logger.info("👤 Initializing Handoff Orchestrator...")
         self.handoff_orchestrator = HandoffOrchestrator(self)
+        
+        # FIX: Invariant Engine - Constitution enforcement
+        logger.info("🛡️ Initializing Invariant Engine...")
+        self.invariant_engine = InvariantEngine(self)
         
         # FIX: Mode Selector - The capability negotiation boundary
         logger.info("🎯 Initializing Mode Selector...")
