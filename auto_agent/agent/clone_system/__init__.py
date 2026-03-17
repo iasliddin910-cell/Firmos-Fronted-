@@ -126,67 +126,62 @@ from .self_clone_system import (
     create_self_clone_system,
 )
 
+# Reporting & Approval System
+from .reporting_types import (
+    ApprovalLevel,
+    ApprovalAction,
+    DecisionRecommendation,
+    TrustLevel,
+    ReportLevel,
+    CodeDelta,
+    CapabilityDelta,
+    ToolDelta,
+    BehaviorDelta,
+    MetricsImpact,
+    RiskItem,
+    EvidenceItem,
+    UpgradePassport,
+    UpgradeDossier,
+)
+
+from .report_aggregator import ReportAggregator, create_report_aggregator
+from .delta_analyzer import DeltaAnalyzer, create_delta_analyzer
+from .benchmark_comparison import BenchmarkComparisonEngine, create_benchmark_comparison_engine
+from .risk_narrator import RiskNarrator, create_risk_narrator
+from .approval_console import HumanApprovalConsole, create_human_approval_console
+from .reporting_system import ReportingApprovalSystem, create_reporting_approval_system
+
 # Version
 __version__ = "1.0.0"
 __author__ = "OmniAgent X Team"
 
 __all__ = [
-    # Core types
-    "CloneType",
-    "CloneStatus",
-    "RiskClass", 
-    "ChangeType",
-    "ValidationResult",
-    "CloneMetadata",
-    "ChangeBudget",
-    "ImprovementPlan",
-    "PatchSet",
-    "ValidationReport",
-    "CloneArtifact",
-    "ToolSpec",
-    "CloneLineage",
-    # Factory
-    "CloneFactory",
-    "SourceCloneManager",
-    "create_clone_factory",
-    "create_source_clone_manager",
-    # Runtime
-    "RuntimeIsolator",
-    "RuntimeLimits",
-    "CloneRuntime",
-    "SecretScopeManager",
-    "create_runtime_isolator",
-    "create_secret_scope_manager",
-    # Knowledge
-    "RepositoryMapper",
-    "SelfModelGraph",
-    "CloneKnowledgeManager",
-    "create_knowledge_manager",
-    # Planner
-    "ImprovementPlanner",
-    "PatchGenerator",
-    "create_improvement_planner",
-    "create_patch_generator",
-    # Patch
-    "PatchExecutor",
-    "ToolOnboarding",
-    "BenchmarkAdder",
-    "create_patch_executor",
-    "create_tool_onboarding",
-    "create_benchmark_adder",
-    # Validation
-    "LocalValidator",
-    "ValidationGate",
-    "create_local_validator",
-    "create_validation_gate",
-    # Artifacts
-    "ArtifactStore",
-    "LineageRegistry",
-    "ReportGenerator",
-    "create_artifact_store",
-    "create_lineage_registry",
-    "create_report_generator",
-    # Main system
-    "SelfCloneSystem",
-    "create_self_clone_system",
+    # Reporting types
+    "ApprovalLevel",
+    "ApprovalAction",
+    "DecisionRecommendation",
+    "TrustLevel",
+    "ReportLevel",
+    "CodeDelta",
+    "CapabilityDelta",
+    "ToolDelta",
+    "BehaviorDelta",
+    "MetricsImpact",
+    "RiskItem",
+    "EvidenceItem",
+    "UpgradePassport",
+    "UpgradeDossier",
+    # Modules
+    "ReportAggregator",
+    "create_report_aggregator",
+    "DeltaAnalyzer",
+    "create_delta_analyzer",
+    "BenchmarkComparisonEngine",
+    "create_benchmark_comparison_engine",
+    "RiskNarrator",
+    "create_risk_narrator",
+    "HumanApprovalConsole",
+    "create_human_approval_console",
+    "ReportingApprovalSystem",
+    "create_reporting_approval_system",
 ]
