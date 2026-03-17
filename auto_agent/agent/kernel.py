@@ -65,6 +65,27 @@ import re
 # Import new Multi-Agent Coordinator
 from agent.multi_agent_coordinator import MultiAgentCoordinator as NewMultiAgentCoordinator
 
+# Import Replay and Simulation Subsystem (FIX: Deterministic replay / simulation mode)
+try:
+    from agent.replay import (
+        DeterministicClock,
+        DeterministicIdSource,
+        ReplayEngine,
+        ReplayConfig,
+        ReplayMode,
+        SimulationMode,
+        ExecutionMode,
+        ScenarioRunner,
+        DivergenceAnalyzer,
+        DivergenceReport,
+        EventTaxonomy,
+        ReplayEvent
+    )
+    REPLAY_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Replay subsystem not available: {e}")
+    REPLAY_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -5037,7 +5058,7 @@ class TaskManager:
         
         logger.info(f"Journal replay restored {len(self.tasks)} tasks")
     
-    def _journal_entry(self, entry_type: str, task: Task = None, task_id: str = None, fsync: bool = False):
+    def _journal_entry(self, entry_type: str, task: Task = None, task_id: str = None, fsync: bool = False, queue_position: int = None):
         """
         Write journal entry for replay with atomic writes and checksums.
         
@@ -5810,6 +5831,23 @@ class CentralKernel:
         # FIX: Mode Selector - The capability negotiation boundary
         logger.info("🎯 Initializing Mode Selector...")
         self.mode_selector = ModeSelector(self)
+        
+        # FIX: Deterministic Replay / Simulation Subsystem
+        # Core replay components for world+ grade autonomy
+        if REPLAY_AVAILABLE:
+            logger.info("🔄 Initializing Deterministic Replay Subsystem...")
+            self.deterministic_clock = DeterministicClock(deterministic=True)
+            self.deterministic_id_source = DeterministicIdSource(seed=42)
+            self.replay_engine = ReplayEngine(clock=self.deterministic_clock, id_source=self.deterministic_id_source)
+            self.simulation_mode = SimulationMode(clock=self.deterministic_clock, id_source=self.deterministic_id_source)
+            self.scenario_runner = ScenarioRunner()
+            self.divergence_analyzer = DivergenceAnalyzer()
+            self.event_taxonomy = EventTaxonomy()
+            self._replay_enabled = True
+            logger.info("✅ Replay Subsystem Ready!")
+        else:
+            self._replay_enabled = False
+            logger.warning("⚠️ Replay Subsystem NOT Available")
         
         # Compiled graph cache for execution
         self._compiled_graphs: Dict[str, ExecutableGraph] = {}
