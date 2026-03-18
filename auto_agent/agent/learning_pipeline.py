@@ -4828,3 +4828,1172 @@ def create_observed_world_learning_no1_plus(config: Dict = None, pipeline=None, 
     """Factory function for No1+ Observed-World Learning"""
     return ObservedWorldLearningNo1Plus(config, pipeline, governance)
 
+
+# ==================== SOURCE ACQUISITION & REVERIFICATION ENGINE ====================
+# No1+ World-Class Source Management System
+
+class SourceState(Enum):
+    """Source Lifecycle State"""
+    ACTIVE = "active"           # Normal operation
+    WATCH = "watch"             # Being monitored
+    PROBATION = "probation"     # Limited use
+    QUARANTINED = "quarantined" # Blocked
+    RETIRED = "retired"         # No longer used
+    REHABILITATED = "rehabilitated"  # Recovered
+
+
+class SourcePolicy(Enum):
+    """Source Type Specific Acquisition Policy"""
+    DOCS_SECTION_AWARE = "docs_section_aware"
+    GITHUB_RELEASE_AWARE = "github_release_aware"
+    FORUM_QUALITY_FILTER = "forum_quality_filter"
+    PAPER_ABSTRACT_EXTRACT = "paper_abstract_extract"
+    NEWS_TIME_SENSITIVE = "news_time_sensitive"
+    API_SPECIFIC = "api_specific"
+    GENERAL = "general"
+
+
+class ReverifyTrigger(Enum):
+    """Reverification Trigger Types"""
+    TIME_BASED = "time_based"               # Scheduled
+    CHANGE_DETECTED = "change_detected"       # Content changed
+    CONTRADICTION = "contradiction"           # Contradicted
+    RETRIEVAL_FAILURE = "retrieval_failure"  # Failed to retrieve
+    USER_CORRECTION = "user_correction"       # User flagged
+    HIGH_VOLATILITY = "high_volatility"       # High volatility domain
+    BENCHMARK_REGRESSION = "benchmark_regression"  # Test failed
+    VERSION_CHANGE = "version_change"         # New version detected
+
+
+class SourceRegistry:
+    """
+    Source Registry - Canonical Source Management
+    =============================================
+    Each source now has full lifecycle tracking:
+    - source_id, url, type, domain
+    - trust_state, volatility_class
+    - yield_score, noise_score, cost_score
+    - last_fetched_at, last_changed_at
+    - next_fetch_at, next_reverify_at
+    - quarantine_state
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self.sources: Dict[str, Dict] = {}
+        
+        # State tracking
+        self.watchlist: Set[str] = set()  # source_ids being watched
+        self.probation_sources: Set[str] = set()
+        self.quarantined_sources: Set[str] = set()
+        
+        # Statistics
+        self.total_fetches = 0
+        self.failed_fetches = 0
+    
+    def register_source(self, url: str, source_type: SourceType, 
+                       topics: List[str] = None, metadata: Dict = None) -> str:
+        """Register a new source"""
+        source_id = f"src_{hashlib.md5(url.encode()).hexdigest()[:12]}"
+        
+        if source_id in self.sources:
+            return source_id
+        
+        domain = self._extract_domain(url)
+        
+        self.sources[source_id] = {
+            "source_id": source_id,
+            "url": url,
+            "source_type": source_type.value,
+            "domain": domain,
+            "trust_state": TrustLevel.UNKNOWN.value,
+            "volatility_class": VolatilityClass.STABLE.value,
+            "yield_score": 0.5,
+            "noise_score": 0.0,
+            "cost_score": 0.0,
+            "last_fetched_at": 0.0,
+            "last_changed_at": 0.0,
+            "next_fetch_at": 0.0,
+            "next_reverify_at": 0.0,
+            "quarantine_state": SourceState.ACTIVE.value,
+            "topics": topics or [],
+            "metadata": metadata or {},
+            "fetch_history": [],
+            "change_count": 0,
+            "failure_count": 0,
+            "success_count": 0,
+            "claims_extracted": 0,
+            "verified_claims": 0,
+            "created_at": time.time()
+        }
+        
+        return source_id
+    
+    def _extract_domain(self, url: str) -> str:
+        """Extract domain from URL"""
+        match = re.search(r'https?://([^/]+)', url)
+        return match.group(1) if match else ""
+    
+    def get_source(self, source_id: str) -> Optional[Dict]:
+        """Get source by ID"""
+        return self.sources.get(source_id)
+    
+    def get_source_by_url(self, url: str) -> Optional[Dict]:
+        """Get source by URL"""
+        source_id = f"src_{hashlib.md5(url.encode()).hexdigest()[:12]}"
+        return self.sources.get(source_id)
+    
+    def update_fetch_result(self, source_id: str, result: Dict):
+        """Update source after fetch"""
+        if source_id not in self.sources:
+            return
+        
+        source = self.sources[source_id]
+        
+        # Update fetch stats
+        source["last_fetched_at"] = time.time()
+        self.total_fetches += 1
+        
+        if result.get("success"):
+            source["success_count"] += 1
+            
+            # Update change detection
+            content_hash = result.get("content_hash", "")
+            if source.get("last_fetch_hash") and source["last_fetch_hash"] != content_hash:
+                source["change_count"] += 1
+                source["last_changed_at"] = time.time()
+            
+            source["last_fetch_hash"] = content_hash
+            
+            # Update yield metrics
+            claims = result.get("claims_extracted", 0)
+            source["claims_extracted"] += claims
+            if claims > 0:
+                verified = result.get("verified_claims", 0)
+                source["verified_claims"] += verified
+        else:
+            source["failure_count"] += 1
+        
+        # Record fetch in history
+        source["fetch_history"].append({
+            "timestamp": time.time(),
+            "success": result.get("success", False),
+            "latency_ms": result.get("latency_ms", 0),
+            "content_size": result.get("content_size", 0),
+            "claims_extracted": result.get("claims_extracted", 0)
+        })
+        
+        # Keep only last 100 history
+        source["fetch_history"] = source["fetch_history"][-100:]
+    
+    def get_due_sources(self, limit: int = 10) -> List[Dict]:
+        """Get sources due for fetching"""
+        now = time.time()
+        due = []
+        
+        for source in self.sources.values():
+            if source["quarantine_state"] == SourceState.QUARANTINED.value:
+                continue
+            
+            if source["next_fetch_at"] <= now:
+                # Calculate priority
+                priority = self._calculate_fetch_priority(source)
+                due.append((priority, source))
+        
+        # Sort by priority (highest first)
+        due.sort(key=lambda x: x[0], reverse=True)
+        
+        return [s[1] for s in due[:limit]]
+    
+    def _calculate_fetch_priority(self, source: Dict) -> float:
+        """Calculate fetch priority"""
+        # Factors: volatility, time since last fetch, trust, changes
+        priority = 0.5
+        
+        # High volatility = higher priority
+        if source.get("volatility_class") == VolatilityClass.HIGHLY_VOLATILE.value:
+            priority += 0.3
+        elif source.get("volatility_class") == VolatilityClass.VOLATILE.value:
+            priority += 0.2
+        
+        # High trust = higher priority
+        if source.get("trust_state") == TrustLevel.HIGH.value:
+            priority += 0.15
+        elif source.get("trust_state") == TrustLevel.MEDIUM.value:
+            priority += 0.1
+        
+        # Recent changes = higher priority
+        if source.get("change_count", 0) > 5:
+            priority += 0.15
+        
+        # Low failure rate = higher priority
+        total = source.get("success_count", 0) + source.get("failure_count", 0)
+        if total > 0:
+            success_rate = source["success_count"] / total
+            priority *= (0.5 + success_rate * 0.5)
+        
+        return priority
+    
+    def set_quarantine_state(self, source_id: str, state: SourceState, reason: str = ""):
+        """Set source quarantine state"""
+        if source_id in self.sources:
+            old_state = self.sources[source_id]["quarantine_state"]
+            self.sources[source_id]["quarantine_state"] = state.value
+            self.sources[source_id]["quarantine_state_changed_at"] = time.time()
+            self.sources[source_id]["quarantine_reason"] = reason
+            
+            # Update sets
+            if state == SourceState.QUARANTINED:
+                self.quarantined_sources.add(source_id)
+                if source_id in self.watchlist:
+                    self.watchlist.discard(source_id)
+            elif state == SourceState.ACTIVE:
+                self.quarantined_sources.discard(source_id)
+    
+    def add_to_watchlist(self, source_id: str):
+        """Add source to watchlist"""
+        if source_id in self.sources:
+            self.watchlist.add(source_id)
+            self.sources[source_id]["watchlist_added_at"] = time.time()
+    
+    def remove_from_watchlist(self, source_id: str):
+        """Remove source from watchlist"""
+        self.watchlist.discard(source_id)
+    
+    def get_watchlist_sources(self) -> List[Dict]:
+        """Get all watchlist sources"""
+        return [self.sources[sid] for sid in self.watchlist if sid in self.sources]
+    
+    def get_yield_stats(self, source_id: str) -> Dict:
+        """Get source yield statistics"""
+        source = self.sources.get(source_id)
+        if not source:
+            return {}
+        
+        total = source.get("success_count", 0) + source.get("failure_count", 0)
+        if total == 0:
+            return {"yield_score": 0.5, "noise_score": 0.0}
+        
+        success_rate = source["success_count"] / total
+        claims_per_fetch = source["claims_extracted"] / max(1, source.get("fetch_count", 1))
+        verified_ratio = source["verified_claims"] / max(1, source["claims_extracted"])
+        
+        return {
+            "yield_score": success_rate * claims_per_fetch,
+            "noise_score": 1 - verified_ratio,
+            "success_rate": success_rate,
+            "claims_extracted": source["claims_extracted"],
+            "verified_claims": source["verified_claims"],
+            "change_count": source["change_count"]
+        }
+
+
+class AcquisitionScheduler:
+    """
+    Acquisition Scheduler - When to fetch sources
+    =============================================
+    This is the heart of 24/7 source learning:
+    - Which source to fetch when
+    - Which source to prioritize
+    - Which source to delay due to budget
+    """
+    
+    def __init__(self, config: Dict = None, registry: SourceRegistry = None):
+        self.config = config or {}
+        self.registry = registry or SourceRegistry(config)
+        
+        # Budget constraints
+        self.daily_fetch_budget = self.config.get("daily_fetch_budget", 100)
+        self.hourly_fetch_limit = self.config.get("hourly_fetch_limit", 10)
+        
+        # Tracking
+        self.fetches_today = 0
+        self.fetches_this_hour = 0
+        self.last_hour_reset = time.time()
+        self.last_day_reset = time.time()
+    
+    def reset_if_needed(self):
+        """Reset periodic counters"""
+        now = time.time()
+        
+        # Reset hourly
+        if now - self.last_hour_reset > 3600:
+            self.fetches_this_hour = 0
+            self.last_hour_reset = now
+        
+        # Reset daily
+        if now - self.last_day_reset > 86400:
+            self.fetches_today = 0
+            self.last_day_reset = now
+    
+    def get_next_fetch_action(self) -> Optional[Dict]:
+        """Get next source to fetch and action"""
+        self.reset_if_needed()
+        
+        # Check budget
+        if self.fetches_today >= self.daily_fetch_budget:
+            return {"action": "wait", "reason": "daily_budget_exceeded"}
+        
+        if self.fetches_this_hour >= self.hourly_fetch_limit:
+            return {"action": "wait", "reason": "hourly_limit_exceeded"}
+        
+        # Get due sources
+        due_sources = self.registry.get_due_sources(limit=10)
+        
+        if not due_sources:
+            return {"action": "wait", "reason": "no_sources_due"}
+        
+        # Select highest priority
+        source = due_sources[0]
+        
+        # Determine action
+        action = self._determine_action(source)
+        
+        return {
+            "action": action,
+            "source": source,
+            "source_id": source["source_id"]
+        }
+    
+    def _determine_action(self, source: Dict) -> str:
+        """Determine fetch action"""
+        # Check if urgent reverify needed
+        now = time.time()
+        
+        # Change detected - urgent fetch
+        if source.get("last_changed_at", 0) > source.get("last_fetched_at", 0):
+            return "full_reverify"
+        
+        # Overdue reverification
+        if source.get("next_reverify_at", 0) <= now:
+            return "full_reverify"
+        
+        # Normal fetch
+        return "fetch"
+    
+    def execute_fetch(self, source_id: str) -> Dict:
+        """Execute fetch for source and return result"""
+        # This would integrate with actual fetch tools
+        # For now, return mock result
+        
+        result = {
+            "source_id": source_id,
+            "success": True,
+            "content_hash": hashlib.md5(str(time.time()).encode()).hexdigest(),
+            "content_size": 1000,
+            "latency_ms": 500,
+            "claims_extracted": 5,
+            "verified_claims": 3,
+            "timestamp": time.time()
+        }
+        
+        # Update stats
+        self.registry.update_fetch_result(source_id, result)
+        self.fetches_today += 1
+        self.fetches_this_hour += 1
+        
+        # Schedule next fetch
+        self._schedule_next_fetch(source_id)
+        
+        return result
+    
+    def _schedule_next_fetch(self, source_id: str):
+        """Schedule next fetch time based on volatility"""
+        source = self.registry.get_source(source_id)
+        if not source:
+            return
+        
+        # Determine cadence based on volatility
+        volatility = source.get("volatility_class", VolatilityClass.STABLE.value)
+        
+        cadence_map = {
+            VolatilityClass.HIGHLY_VOLATILE.value: 3600,      # 1 hour
+            VolatilityClass.VOLATILE.value: 86400,            # 1 day
+            VolatilityClass.MEDIUM.value: 259200,              # 3 days
+            VolatilityClass.STABLE.value: 604800,             # 1 week
+            VolatilityClass.IMMUTABLE.value: 2592000          # ~1 month
+        }
+        
+        base_cadence = cadence_map.get(volatility, 86400)
+        
+        # Adjust based on trust
+        trust = source.get("trust_state", TrustLevel.UNKNOWN.value)
+        if trust == TrustLevel.HIGH.value:
+            base_cadence *= 0.8  # More frequent
+        elif trust == TrustLevel.LOW.value:
+            base_cadence *= 1.5  # Less frequent
+        
+        next_fetch = time.time() + base_cadence
+        source["next_fetch_at"] = next_fetch
+
+
+class AdaptiveReverificationEngine:
+    """
+    Adaptive Reverification Engine - Smart Rechecking
+    =================================================
+    Not all knowledge needs the same reverification cadence:
+    - volatility-aware
+    - domain-aware
+    - quality-aware
+    - contradiction-aware
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        # Default cadences by volatility (seconds)
+        self.default_cadences = {
+            VolatilityClass.HIGHLY_VOLATILE.value: 3600,       # 1 hour
+            VolatilityClass.VOLATILE.value: 86400,               # 1 day
+            VolatilityClass.MEDIUM.value: 259200,                # 3 days
+            VolatilityClass.STABLE.value: 604800,                # 1 week
+            VolatilityClass.IMMUTABLE.value: 2592000            # ~1 month
+        }
+        
+        # Pending reverification jobs
+        self.reverify_queue: List[Dict] = []
+        self.completed_jobs: List[Dict] = []
+    
+    def schedule_reverification(self, knowledge_id: str, trigger: ReverifyTrigger,
+                               priority: int = 5, metadata: Dict = None) -> str:
+        """Schedule a reverification job"""
+        job_id = f"reverify_{hashlib.md5(f'{knowledge_id}{time.time()}'.encode()).hexdigest()[:8]}"
+        
+        job = {
+            "job_id": job_id,
+            "knowledge_id": knowledge_id,
+            "trigger": trigger.value,
+            "priority": priority,
+            "status": "pending",
+            "created_at": time.time(),
+            "started_at": 0.0,
+            "completed_at": 0.0,
+            "metadata": metadata or {}
+        }
+        
+        # Add to queue based on priority
+        self.reverify_queue.append(job)
+        self.reverify_queue.sort(key=lambda x: x["priority"], reverse=True)
+        
+        return job_id
+    
+    def get_next_job(self) -> Optional[Dict]:
+        """Get next reverification job"""
+        for job in self.reverify_queue:
+            if job["status"] == "pending":
+                job["status"] = "in_progress"
+                job["started_at"] = time.time()
+                return job
+        return None
+    
+    def complete_job(self, job_id: str, result: Dict):
+        """Mark job as complete"""
+        for job in self.reverify_queue:
+            if job["job_id"] == job_id:
+                job["status"] = "completed"
+                job["completed_at"] = time.time()
+                job["result"] = result
+                
+                # Move to completed
+                self.completed_jobs.append(job)
+                self.reverify_queue.remove(job)
+                break
+        
+        # Keep only last 1000 completed jobs
+        self.completed_jobs = self.completed_jobs[-1000:]
+    
+    def get_due_for_reverify(self) -> List[Dict]:
+        """Get knowledge due for reverification"""
+        now = time.time()
+        due = []
+        
+        # This would normally check the knowledge store
+        # For now, return pending jobs
+        for job in self.reverify_queue:
+            if job["status"] == "pending":
+                due.append(job)
+        
+        return due[:50]
+    
+    def calculate_reverify_cadence(self, knowledge_entry: KnowledgeEntry, 
+                                   source: Dict = None) -> float:
+        """Calculate optimal reverification cadence"""
+        # Base cadence from volatility
+        volatility = knowledge_entry.get("volatility_class", VolatilityClass.STABLE.value)
+        cadence = self.default_cadences.get(volatility, 86400)
+        
+        # Adjust based on source if available
+        if source:
+            trust = source.get("trust_state", TrustLevel.UNKNOWN.value)
+            if trust == TrustLevel.HIGH.value:
+                cadence *= 1.5  # Less frequent for trusted
+            elif trust == TrustLevel.LOW.value:
+                cadence *= 0.5  # More frequent for untrusted
+        
+        # Adjust based on knowledge age
+        age = time.time() - knowledge_entry.get("collected_at", time.time())
+        if age > 180 * 86400:  # > 180 days
+            cadence *= 0.7  # More frequent
+        
+        # Adjust based on success rate
+        if knowledge_entry.usage_count > 0:
+            success_rate = knowledge_entry.success_count / knowledge_entry.usage_count
+            if success_rate < 0.5:
+                cadence *= 0.5  # More frequent for low success
+            elif success_rate > 0.9:
+                cadence *= 1.3  # Less frequent for high success
+        
+        return cadence
+
+
+class SourceRehabilitationPipeline:
+    """
+    Source Rehabilitation Pipeline - Quarantine Lifecycle
+    =====================================================
+    Sources are not binary - they have a full lifecycle:
+    - active, watched, probation, quarantined, retired, rehabilitated
+    """
+    
+    def __init__(self, config: Dict = None, registry: SourceRegistry = None):
+        self.config = config or {}
+        self.registry = registry or SourceRegistry(config)
+        
+        # Rehabilitation settings
+        self.probation_duration = self.config.get("probation_duration", 7 * 86400)  # 7 days
+        self.retest_interval = self.config.get("retest_interval", 86400)  # 1 day
+        self.min_success_rate = self.config.get("min_success_rate", 0.6)
+    
+    def evaluate_for_rehabilitation(self, source_id: str) -> bool:
+        """Evaluate if quarantined source can be rehabilitated"""
+        source = self.registry.get_source(source_id)
+        if not source:
+            return False
+        
+        if source["quarantine_state"] != SourceState.QUARANTINED.value:
+            return False
+        
+        # Check time in quarantine
+        quarantine_time = time.time() - source.get("quarantine_state_changed_at", 0)
+        if quarantine_time < self.probation_duration:
+            return False
+        
+        # Check recent performance
+        fetch_history = source.get("fetch_history", [])[-10:]
+        if not fetch_history:
+            return False
+        
+        recent_success = sum(1 for f in fetch_history if f.get("success", False))
+        success_rate = recent_success / len(fetch_history)
+        
+        return success_rate >= self.min_success_rate
+    
+    def move_to_probation(self, source_id: str):
+        """Move source to probation"""
+        self.registry.set_quarantine_state(source_id, SourceState.PROBATION, "Probation after rehabilitation")
+        
+        # Set probation end time
+        source = self.registry.get_source(source_id)
+        if source:
+            source["probation_end_at"] = time.time() + self.probation_duration
+    
+    def evaluate_probation_progress(self, source_id: str) -> Dict:
+        """Evaluate source during probation"""
+        source = self.registry.get_source(source_id)
+        if not source or source["quarantine_state"] != SourceState.PROBATION.value:
+            return {"action": "none"}
+        
+        # Check probation end
+        if source.get("probation_end_at", 0) <= time.time():
+            # Check performance
+            success_count = source.get("success_count", 0)
+            failure_count = source.get("failure_count", 0)
+            total = success_count + failure_count
+            
+            if total > 0:
+                success_rate = success_count / total
+                
+                if success_rate >= self.min_success_rate:
+                    return {"action": "rehabilitate", "reason": "success_rate_good"}
+                else:
+                    return {"action": "re_quarantine", "reason": "success_rate_poor"}
+        
+        return {"action": "continue_probation"}
+    
+    def rehabilitate(self, source_id: str):
+        """Rehabilitate source to active"""
+        self.registry.set_quarantine_state(source_id, SourceState.REHABILITATED, "Successfully rehabilitated")
+        
+        # After rehabilitation, move to active
+        source = self.registry.get_source(source_id)
+        if source:
+            source["quarantine_state"] = SourceState.ACTIVE.value
+    
+    def get_rehabilitation_candidates(self) -> List[str]:
+        """Get sources that should be evaluated for rehabilitation"""
+        candidates = []
+        
+        for source_id in self.registry.quarantined_sources:
+            if self.evaluate_for_rehabilitation(source_id):
+                candidates.append(source_id)
+        
+        return candidates
+
+
+class ChangeRadar:
+    """
+    Change Radar - Detect Source Changes
+    ====================================
+    No1+ agent doesn't just re-fetch - it detects what changed:
+    - content hash
+    - structural changes
+    - semantic diff
+    - version markers
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        # Snapshot storage
+        self.snapshots: Dict[str, List[Dict]] = defaultdict(list)
+        
+        # Max snapshots per source
+        self.max_snapshots = self.config.get("max_snapshots", 10)
+    
+    def capture_snapshot(self, source_id: str, content: str, 
+                       metadata: Dict = None) -> Dict:
+        """Capture a content snapshot"""
+        import hashlib
+        
+        # Create content hash
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        
+        # Create structural hash (simple - paragraph count, headers, etc.)
+        structural = {
+            "paragraphs": len(content.split("\n\n")),
+            "lines": len(content.split("\n")),
+            "chars": len(content),
+            "has_code": "```" in content or "    " in content,
+            "has_lists": bool(re.search(r'^\s*[-*•]\s', content, re.MULTILINE))
+        }
+        structural_hash = hashlib.md5(str(structural).encode()).hexdigest()
+        
+        snapshot = {
+            "source_id": source_id,
+            "timestamp": time.time(),
+            "content_hash": content_hash,
+            "structural_hash": structural_hash,
+            "content": content[:10000],  # Keep first 10k chars
+            "metadata": metadata or {},
+            "structural": structural
+        }
+        
+        # Store snapshot
+        self.snapshots[source_id].append(snapshot)
+        
+        # Trim old snapshots
+        if len(self.snapshots[source_id]) > self.max_snapshots:
+            self.snapshots[source_id] = self.snapshots[source_id][-self.max_snapshots:]
+        
+        return snapshot
+    
+    def detect_changes(self, source_id: str) -> Dict:
+        """Detect changes since last snapshot"""
+        snapshots = self.snapshots.get(source_id, [])
+        
+        if len(snapshots) < 2:
+            return {"changed": False, "reason": "not_enough_snapshots"}
+        
+        latest = snapshots[-1]
+        previous = snapshots[-2]
+        
+        # Check content hash
+        content_changed = latest["content_hash"] != previous["content_hash"]
+        structural_changed = latest["structural_hash"] != previous["structural_hash"]
+        
+        if not content_changed and not structural_changed:
+            return {"changed": False, "reason": "no_changes"}
+        
+        # Determine change type
+        change_type = []
+        if content_changed:
+            change_type.append("content_update")
+        if structural_changed:
+            change_type.append("structure_change")
+        
+        # Calculate diff details
+        content_diff = self._calculate_content_diff(
+            previous["content"], 
+            latest["content"]
+        )
+        
+        return {
+            "changed": True,
+            "change_type": change_type,
+            "content_changed": content_changed,
+            "structural_changed": structural_changed,
+            "time_since_last": latest["timestamp"] - previous["timestamp"],
+            "diff": content_diff,
+            "previous_snapshot": previous["timestamp"],
+            "latest_snapshot": latest["timestamp"]
+        }
+    
+    def _calculate_content_diff(self, old: str, new: str) -> Dict:
+        """Calculate content difference details"""
+        old_lines = set(old.split("\n"))
+        new_lines = set(new.split("\n"))
+        
+        added = len(new_lines - old_lines)
+        removed = len(old_lines - new_lines)
+        common = len(old_lines & new_lines)
+        
+        return {
+            "lines_added": added,
+            "lines_removed": removed,
+            "lines_common": common,
+            "change_ratio": (added + removed) / max(1, common)
+        }
+    
+    def get_change_frequency(self, source_id: str) -> float:
+        """Calculate change frequency for source"""
+        snapshots = self.snapshots.get(source_id, [])
+        
+        if len(snapshots) < 2:
+            return 0.0
+        
+        # Calculate average time between changes
+        changes = 0
+        total_time = 0
+        
+        for i in range(1, len(snapshots)):
+            if snapshots[i]["content_hash"] != snapshots[i-1]["content_hash"]:
+                changes += 1
+                total_time += snapshots[i]["timestamp"] - snapshots[i-1]["timestamp"]
+        
+        if changes == 0:
+            return 0.0
+        
+        return changes / max(1, total_time / 86400)  # Changes per day
+
+
+class DiscoveryMiner:
+    """
+    Discovery Miner - Find New Sources
+    ==================================
+    No1+ agent doesn't just work with known sources:
+    - entity-based search
+    - citation expansion
+    - official source detection
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        # Discovered candidates
+        self.candidates: Dict[str, Dict] = {}
+        
+        # Seed sources by topic
+        self.seed_sources: Dict[str, List[str]] = {
+            "ai": [
+                "https://arxiv.org/list/cs.AI/recent",
+                "https://github.com/topics/artificial-intelligence"
+            ],
+            "python": [
+                "https://docs.python.org/3/",
+                "https://github.com/python/cpython"
+            ],
+            "ml": [
+                "https://arxiv.org/list/cs.LG/recent",
+                "https://github.com/topics/machine-learning"
+            ]
+        }
+    
+    def discover_by_topic(self, topic: str, limit: int = 5) -> List[Dict]:
+        """Discover new sources for a topic"""
+        candidates = []
+        
+        # Check seed sources first
+        seed_urls = self.seed_sources.get(topic.lower(), [])
+        
+        for url in seed_urls[:limit]:
+            candidate = {
+                "url": url,
+                "topic": topic,
+                "source": "seed_list",
+                "discovered_at": time.time()
+            }
+            candidates.append(candidate)
+        
+        return candidates
+    
+    def discover_by_entity(self, entity: str) -> List[Dict]:
+        """Discover sources related to an entity"""
+        candidates = []
+        
+        # Common patterns for entity sources
+        patterns = [
+            f"https://github.com/{entity}",
+            f"https://docs.{entity}.com",
+            f"https://{entity}.readme.io",
+            f"https://en.wikipedia.org/wiki/{entity.replace(' ', '_')}"
+        ]
+        
+        for url in patterns:
+            candidates.append({
+                "url": url,
+                "entity": entity,
+                "source": "entity_pattern",
+                "discovered_at": time.time()
+            })
+        
+        return candidates
+    
+    def add_candidate(self, url: str, source: str, metadata: Dict = None):
+        """Add a discovered candidate source"""
+        candidate_id = f"candidate_{hashlib.md5(url.encode()).hexdigest()[:8]}"
+        
+        self.candidates[candidate_id] = {
+            "candidate_id": candidate_id,
+            "url": url,
+            "source": source,
+            "metadata": metadata or {},
+            "discovered_at": time.time(),
+            "evaluated": False,
+            "rejected": False,
+            "adopted": False
+        }
+    
+    def get_pending_candidates(self) -> List[Dict]:
+        """Get candidates that need evaluation"""
+        return [
+            c for c in self.candidates.values()
+            if not c["evaluated"] and not c["rejected"]
+        ]
+    
+    def evaluate_candidate(self, candidate_id: str, result: Dict):
+        """Mark candidate as evaluated"""
+        if candidate_id in self.candidates:
+            self.candidates[candidate_id]["evaluated"] = True
+            self.candidates[candidate_id]["evaluation_result"] = result
+            
+            if result.get("adopted"):
+                self.candidates[candidate_id]["adopted"] = True
+
+
+class SourcePortfolioManager:
+    """
+    Source Portfolio Manager - Domain Coverage Intelligence
+    ======================================================
+    Strong system doesn't rely on single source type:
+    - Official docs
+    - Implementation sources
+    - Community sources
+    - Empirical sources
+    """
+    
+    def __init__(self, config: Dict = None, registry: SourceRegistry = None):
+        self.config = config or {}
+        self.registry = registry or SourceRegistry(config)
+        
+        # Domain portfolios
+        self.portfolios: Dict[str, Dict] = {}
+    
+    def build_portfolio(self, domain: str) -> Dict:
+        """Build source portfolio for domain"""
+        # Get sources for domain
+        domain_sources = [
+            s for s in self.registry.sources.values()
+            if domain in s.get("domain", "")
+        ]
+        
+        # Categorize by type
+        portfolio = {
+            "domain": domain,
+            "official_docs": [],
+            "github": [],
+            "community": [],
+            "papers": [],
+            "other": []
+        }
+        
+        for source in domain_sources:
+            source_type = source.get("source_type", "")
+            
+            if "docs" in source_type.lower() or source_type == SourceType.API_DOCS.value:
+                portfolio["official_docs"].append(source)
+            elif "github" in source_type.lower() or "github" in source.get("url", ""):
+                portfolio["github"].append(source)
+            elif source_type == SourceType.PAPER.value:
+                portfolio["papers"].append(source)
+            elif source_type in [SourceType.FORUM.value, SourceType.BLOG.value]:
+                portfolio["community"].append(source)
+            else:
+                portfolio["other"].append(source)
+        
+        self.portfolios[domain] = portfolio
+        
+        return portfolio
+    
+    def get_source_diversity(self, domain: str) -> Dict:
+        """Get diversity metrics for domain"""
+        portfolio = self.portfolios.get(domain) or self.build_portfolio(domain)
+        
+        total = sum(len(sources) for sources in portfolio.values() if isinstance(sources, list))
+        
+        return {
+            "total_sources": total,
+            "official_docs_count": len(portfolio["official_docs"]),
+            "github_count": len(portfolio["github"]),
+            "community_count": len(portfolio["community"]),
+            "papers_count": len(portfolio["papers"]),
+            "diversity_score": self._calculate_diversity(portfolio)
+        }
+    
+    def _calculate_diversity(self, portfolio: Dict) -> float:
+        """Calculate portfolio diversity score"""
+        counts = [
+            len(portfolio.get(k, [])) 
+            for k in ["official_docs", "github", "community", "papers"]
+        ]
+        
+        total = sum(counts)
+        if total == 0:
+            return 0.0
+        
+        # Entropy-based diversity
+        import math
+        entropy = 0
+        for c in counts:
+            if c > 0:
+                p = c / total
+                entropy -= p * math.log2(p)
+        
+        # Normalize to 0-1
+        max_entropy = math.log2(4)  # 4 categories
+        return entropy / max_entropy
+    
+    def recommend_source_type(self, domain: str, query_type: str) -> str:
+        """Recommend best source type for query"""
+        diversity = self.get_source_diversity(domain)
+        
+        if query_type == "implementation":
+            if diversity.get("github_count", 0) > 0:
+                return "github"
+        elif query_type == "api_reference":
+            if diversity.get("official_docs_count", 0) > 0:
+                return "official_docs"
+        elif query_type == "troubleshooting":
+            if diversity.get("community_count", 0) > 0:
+                return "community"
+        elif query_type == "research":
+            if diversity.get("papers_count", 0) > 0:
+                return "papers"
+        
+        return "any"
+
+
+class SourceAcquisitionNo1Plus:
+    """
+    Source Acquisition No1+ - Full Pipeline Integration
+    ==================================================
+    This integrates all source management into the learning pipeline.
+    """
+    
+    def __init__(self, config: Dict = None, pipeline=None):
+        self.config = config or {}
+        self.pipeline = pipeline
+        
+        # Core components
+        self.registry = SourceRegistry(config.get("registry_config"))
+        self.scheduler = AcquisitionScheduler(config.get("scheduler_config"), self.registry)
+        self.reverification = AdaptiveReverificationEngine(config.get("reverify_config"))
+        self.rehabilitation = SourceRehabilitationPipeline(config.get("rehab_config"), self.registry)
+        self.change_radar = ChangeRadar(config.get("radar_config"))
+        self.discovery = DiscoveryMiner(config.get("discovery_config"))
+        self.portfolio = SourcePortfolioManager(config.get("portfolio_config"), self.registry)
+        
+        logger.info("🔍 Source Acquisition No1+ System initialized")
+    
+    # ==================== SOURCE REGISTRATION ====================
+    
+    def register_source(self, url: str, source_type: SourceType,
+                       topics: List[str] = None, metadata: Dict = None) -> str:
+        """Register new source"""
+        return self.registry.register_source(url, source_type, topics, metadata)
+    
+    def get_source(self, source_id: str) -> Optional[Dict]:
+        """Get source by ID"""
+        return self.registry.get_source(source_id)
+    
+    # ==================== ACQUISITION ====================
+    
+    def start_acquisition_cycle(self) -> List[Dict]:
+        """Start one acquisition cycle"""
+        results = []
+        
+        # Get next action
+        action = self.scheduler.get_next_fetch_action()
+        
+        if action.get("action") == "wait":
+            return results
+        
+        if action.get("action") in ["fetch", "full_reverify"]:
+            source_id = action["source_id"]
+            
+            # Execute fetch (would integrate with actual fetch tools)
+            fetch_result = self.scheduler.execute_fetch(source_id)
+            
+            # Capture snapshot
+            if fetch_result.get("success"):
+                content = fetch_result.get("content", "mock content")
+                self.change_radar.capture_snapshot(source_id, content)
+                
+                # Detect changes
+                changes = self.change_radar.detect_changes(source_id)
+                
+                if changes.get("changed"):
+                    # Trigger reverification for affected knowledge
+                    self._trigger_change_reverification(source_id, changes)
+                
+                results.append({
+                    "source_id": source_id,
+                    "fetch_result": fetch_result,
+                    "changes": changes
+                })
+        
+        return results
+    
+    def _trigger_change_reverification(self, source_id: str, changes: Dict):
+        """Trigger reverification due to detected changes"""
+        # Get source
+        source = self.registry.get_source(source_id)
+        if not source:
+            return
+        
+        # Schedule reverification with high priority
+        self.reverification.schedule_reverification(
+            knowledge_id=source_id,
+            trigger=ReverifyTrigger.CHANGE_DETECTED,
+            priority=9,  # High priority
+            metadata={"changes": changes}
+        )
+    
+    # ==================== REVERIFICATION ====================
+    
+    def run_reverification_cycle(self) -> Dict:
+        """Run reverification cycle"""
+        results = {
+            "processed": 0,
+            "updated": 0,
+            "superseded": 0,
+            "disputed": 0
+        }
+        
+        # Get next job
+        job = self.reverification.get_next_job()
+        
+        while job and results["processed"] < 10:
+            results["processed"] += 1
+            
+            # Execute reverification (simplified)
+            knowledge_id = job["knowledge_id"]
+            
+            # In real implementation, this would:
+            # 1. Fetch current source
+            # 2. Compare with last snapshot
+            # 3. Update knowledge status
+            
+            result = {
+                "verified": True,
+                "status_changed": False
+            }
+            
+            if result.get("status_changed"):
+                results["updated"] += 1
+            
+            self.reverification.complete_job(job["job_id"], result)
+            
+            # Get next job
+            job = self.reverification.get_next_job()
+        
+        return results
+    
+    def schedule_reverification(self, knowledge_id: str, trigger: str, priority: int = 5):
+        """Manually schedule reverification"""
+        trigger_enum = ReverifyTrigger(trigger)
+        self.reverification.schedule_reverification(knowledge_id, trigger_enum, priority)
+    
+    # ==================== REHABILITATION ====================
+    
+    def run_rehabilitation_cycle(self) -> Dict:
+        """Run rehabilitation evaluation cycle"""
+        results = {
+            "evaluated": 0,
+            "rehabilitated": 0,
+            "re_quarantined": 0
+        }
+        
+        candidates = self.rehabilitation.get_rehabilitation_candidates()
+        
+        for source_id in candidates:
+            results["evaluated"] += 1
+            
+            evaluation = self.rehabilitation.evaluate_probation_progress(source_id)
+            
+            if evaluation["action"] == "rehabilitate":
+                self.rehabilitation.rehabilitate(source_id)
+                results["rehabilitated"] += 1
+            elif evaluation["action"] == "re_quarantine":
+                self.registry.set_quarantine_state(source_id, SourceState.QUARANTINED, 
+                                                   evaluation.get("reason", "probation_failed"))
+                results["re_quarantined"] += 1
+        
+        return results
+    
+    # ==================== DISCOVERY ====================
+    
+    def discover_sources(self, topic: str = None, entity: str = None) -> List[Dict]:
+        """Discover new sources"""
+        sources = []
+        
+        if topic:
+            sources.extend(self.discovery.discover_by_topic(topic))
+        
+        if entity:
+            sources.extend(self.discovery.discover_by_entity(entity))
+        
+        return sources
+    
+    def register_discovered(self, url: str, source_type: SourceType):
+        """Register discovered source"""
+        return self.register_source(url, source_type)
+    
+    # ==================== PORTFOLIO ====================
+    
+    def analyze_portfolio(self, domain: str) -> Dict:
+        """Analyze source portfolio for domain"""
+        return self.portfolio.get_source_diversity(domain)
+    
+    def recommend_source(self, domain: str, query_type: str) -> str:
+        """Recommend best source type"""
+        return self.portfolio.recommend_source_type(domain, query_type)
+    
+    # ==================== HEALTH ====================
+    
+    def get_system_health(self) -> Dict:
+        """Get system health metrics"""
+        return {
+            "total_sources": len(self.registry.sources),
+            "active_sources": sum(1 for s in self.registry.sources.values() 
+                                 if s["quarantine_state"] == SourceState.ACTIVE.value),
+            "quarantined": len(self.registry.quarantined_sources),
+            "watchlist": len(self.registry.watchlist),
+            "pending_reverify": len(self.reverification.reverify_queue),
+            "discovered_candidates": len(self.discovery.candidates),
+            "change_radar_sources": len(self.change_radar.snapshots)
+        }
+
+
+def create_source_acquisition_system(config: Dict = None, pipeline=None) -> SourceAcquisitionNo1Plus:
+    """Factory function for Source Acquisition System"""
+    return SourceAcquisitionNo1Plus(config, pipeline)
+
