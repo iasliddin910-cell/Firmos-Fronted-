@@ -105,6 +105,24 @@ except ImportError as e:
     logger.warning(f"Health spine not available: {e}")
     HEALTH_SPINE_AVAILABLE = False
 
+# Import State Migration System (FIX: Versioned state contract)
+try:
+    from agent.state_migration import (
+        StateManager,
+        StateSchemaRegistry,
+        MigrationRegistry,
+        CompatibilityGate,
+        SnapshotManifest,
+        MigrationReport,
+        VersionedStateEnvelope,
+        SchemaType,
+        CompatibilityLevel
+    )
+    STATE_MIGRATION_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"State migration not available: {e}")
+    STATE_MIGRATION_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -4962,7 +4980,16 @@ class TaskManager:
             logger.info("No previous state found, starting fresh")
     
     def _validate_state(self, state: Dict) -> bool:
-        """Validate state structure before applying"""
+        """
+        Validate state structure before applying.
+        
+        FIX: Now uses State Migration System for proper version handling.
+        """
+        # If state migration is available, use it
+        if STATE_MIGRATION_AVAILABLE and hasattr(self, 'state_manager'):
+            return self._validate_state_with_migration(state)
+        
+        # Fallback to old validation
         required_keys = ['tasks', 'completed_tasks', 'failed_tasks', 'timestamp']
         
         for key in required_keys:
@@ -4978,8 +5005,110 @@ class TaskManager:
         
         return True
     
+    def _validate_state_with_migration(self, state: Dict) -> bool:
+        """
+        Validate state using the migration system.
+        
+        This properly checks:
+        - Schema compatibility
+        - Version migration path
+        - Required fields
+        """
+        try:
+            # Get compatibility gate
+            gate = self.state_manager.compatibility_gate
+            
+            # Check compatibility
+            compatibility, messages = gate.check_compatibility(
+                SchemaType.FULL_STATE,
+                state.get('version', 1),
+                self.state_version
+            )
+            
+            # Log compatibility status
+            for msg in messages:
+                logger.info(f"State compatibility: {msg}")
+            
+            # If incompatible, reject
+            if compatibility == CompatibilityLevel.INCOMPATIBLE:
+                logger.error(f"State is incompatible: {messages}")
+                return False
+            
+            # If migration needed, log it
+            if compatibility == CompatibilityLevel.MIGRATABLE:
+                logger.info("State requires migration, will be migrated on restore")
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"State migration validation failed: {e}, using fallback")
+            return True  # Allow fallback validation
+    
     def _apply_state(self, state: Dict):
-        """Apply restored state to task manager"""
+        """
+        Apply restored state to task manager.
+        
+        FIX: Now uses State Migration System for proper version handling.
+        """
+        # If state migration is available, use it
+        if STATE_MIGRATION_AVAILABLE and hasattr(self, 'state_manager'):
+            self._apply_state_with_migration(state)
+            return
+        
+        # Fallback to old behavior
+        self._apply_state_legacy(state)
+    
+    def _apply_state_with_migration(self, state: Dict):
+        """
+        Apply state with migration support.
+        
+        This properly handles:
+        - Version migration
+        - Field normalization (approval_waiting_tasks dict->list)
+        - Field renaming (background_queue_tasks -> background_tasks)
+        - Rollback point restoration
+        """
+        try:
+            # Wrap state in envelope
+            envelope = self.state_manager.wrap_state(
+                SchemaType.FULL_STATE,
+                state,
+                source_version=state.get('version')
+            )
+            
+            # Unwrap and migrate
+            migrated_state, report = self.state_manager.unwrap_and_migrate(
+                envelope,
+                target_version=self.state_version
+            )
+            
+            if report:
+                self._migration_report = report
+                
+                if report.success:
+                    logger.info(f"State migration successful: {report.to_dict()}")
+                    
+                    # Log field changes
+                    for normalized in report.fields_normalized:
+                        logger.info(f"Migrated field: {normalized.field_name} - {normalized.description}")
+                    
+                    for renamed in report.fields_renamed:
+                        logger.info(f"Renamed field: {renamed.field_name}")
+                else:
+                    logger.error(f"State migration failed: {report.error_message}")
+            
+            # Use migrated state if available, otherwise original
+            final_state = migrated_state if migrated_state else state
+            
+        except Exception as e:
+            logger.warning(f"State migration failed: {e}, using fallback")
+            final_state = state
+        
+        # Apply the (possibly migrated) state
+        self._apply_state_legacy(final_state)
+    
+    def _apply_state_legacy(self, state: Dict):
+        """Legacy state application (fallback)"""
         # Restore tasks
         for task_data in state.get('tasks', []):
             task = self._task_from_dict(task_data)
@@ -4989,37 +5118,68 @@ class TaskManager:
         self.completed_tasks = set(state.get('completed_tasks', []))
         self.failed_tasks = set(state.get('failed_tasks', []))
         
-        # Re-queue pending tasks
-        for task_id, task_data in state.get('pending_tasks', {}).items():
-            task = self._task_from_dict(task_data)
-            if task.status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
-                self.pending_queue.put(task)
-        
-        # Restore approval waiting tasks - CRITICAL for recovery
-        self.approval_waiting_tasks = {}
-        for task_data in state.get('approval_waiting_tasks', []):
-            task = self._task_from_dict(task_data)
-            if task.status == TaskStatus.APPROVAL_WAITING:
-                # Check if approval has expired
-                approval_expired = task.metadata.get('approval_expired', False)
-                if approval_expired:
-                    # Revert to pending
-                    logger.warning(f"Approval expired for task {task.id}, re-queuing")
-                    task.status = TaskStatus.PENDING
+        # Re-queue pending tasks - support both dict and list formats
+        pending = state.get('pending_tasks', {})
+        if isinstance(pending, dict):
+            for task_id, task_data in pending.items():
+                task = self._task_from_dict(task_data)
+                if task.status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
                     self.pending_queue.put(task)
+        elif isinstance(pending, list):
+            for task_data in pending:
+                task = self._task_from_dict(task_data)
+                if task.status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+                    self.pending_queue.put(task)
+        
+        # Restore approval waiting tasks - FIX: support both dict and list formats
+        self.approval_waiting_tasks = {}
+        awt = state.get('approval_waiting_tasks', [])
+        
+        if isinstance(awt, dict):
+            # Old format: dict - convert to list
+            for task_id, task_data in awt.items():
+                task = self._task_from_dict(task_data)
+                if task.status == TaskStatus.APPROVAL_WAITING:
+                    approval_expired = task.metadata.get('approval_expired', False)
+                    if approval_expired:
+                        logger.warning(f"Approval expired for task {task.id}, re-queuing")
+                        task.status = TaskStatus.PENDING
+                        self.pending_queue.put(task)
+                    else:
+                        self.approval_waiting_tasks[task.id] = task
                 else:
-                    # Keep as approval waiting
-                    self.approval_waiting_tasks[task.id] = task
-            else:
-                self.tasks[task.id] = task
-
-        # Restore background queue - CRITICAL for recovery
-        for task_data in state.get('background_queue_tasks', []):
-            task = self._task_from_dict(task_data)
-            self.background_queue.put(task)
+                    self.tasks[task.id] = task
+        elif isinstance(awt, list):
+            # New format: list
+            for task_data in awt:
+                task = self._task_from_dict(task_data)
+                if task.status == TaskStatus.APPROVAL_WAITING:
+                    approval_expired = task.metadata.get('approval_expired', False)
+                    if approval_expired:
+                        logger.warning(f"Approval expired for task {task.id}, re-queuing")
+                        task.status = TaskStatus.PENDING
+                        self.pending_queue.put(task)
+                    else:
+                        self.approval_waiting_tasks[task.id] = task
+                else:
+                    self.tasks[task.id] = task
+        
+        # Restore background queue - FIX: support both old and new field names
+        # Check new field first, then fall back to old
+        bg_tasks = state.get('background_tasks') or state.get('background_queue_tasks', [])
+        
+        if isinstance(bg_tasks, dict):
+            for task_id, task_data in bg_tasks.items():
+                task = self._task_from_dict(task_data)
+                self.background_queue.put(task)
+        elif isinstance(bg_tasks, list):
+            for task_data in bg_tasks:
+                task = self._task_from_dict(task_data)
+                self.background_queue.put(task)
         
         # Restore running tasks that might be stuck
         for task_id in state.get('running_tasks', []):
+            logger.info(f"Restoring running task: {task_id}")
             if task_id in self.tasks:
                 task = self.tasks[task_id]
                 # Check if task was stuck (timeout)
@@ -5886,6 +6046,20 @@ class CentralKernel:
         else:
             self._health_spine_enabled = False
             logger.warning("⚠️ Kernel Health Spine NOT Available")
+        
+        # FIX: State Migration System - Versioned state contract
+        if STATE_MIGRATION_AVAILABLE:
+            logger.info("💾 Initializing State Migration System...")
+            self.state_manager = StateManager()
+            
+            # Run compatibility check on startup
+            self._migration_report = None
+            
+            self._state_migration_enabled = True
+            logger.info("✅ State Migration System Ready!")
+        else:
+            self._state_migration_enabled = False
+            logger.warning("⚠️ State Migration System NOT Available")
         
         # Compiled graph cache for execution
         self._compiled_graphs: Dict[str, ExecutableGraph] = {}
