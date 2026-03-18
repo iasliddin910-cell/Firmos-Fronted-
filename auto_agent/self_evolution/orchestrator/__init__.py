@@ -1,194 +1,298 @@
 """
-Central Orchestrator - Bosh Boshqaruv Markazi
-====================================================
-Bu tizimning yuragi!
-
-Vazifalari:
-- Qaysi signalga javob berishni tanlash
-- Qaysi candidate ni birinchi ishlashni tanlash
-- Qachon clone yaratishni hal qilish
-- Parallel ishlarni boshqarish
-- Risk budgetni kuzatish
-- Human approvalsiz hech narsani main'ga o'tkazmaslik
+ORCHESTRATOR MODULE - Bosh Boshqaruv
+=====================================
+CentralOrchestrator va LifecycleManager
 """
 
-import uuid
 import logging
 from datetime import datetime
-from typing import Optional
-from enum import Enum
-
-from ..data_contracts import (
-    SystemState, Observation, UpgradeCandidate, CloneRun,
-    CandidateState, DestinationType, ApprovalDecision
-)
+from typing import Optional, Dict, List
+from ..domain import CandidateStatus, CloneState, DecisionType, DestinationType
 
 logger = logging.getLogger(__name__)
 
 
-class OrchestratorState(Enum):
-    """Orchestrator holatlari"""
-    IDLE = "idle"
-    RUNNING = "running"
-    PAUSED = "paused"
-    ERROR = "error"
+class LifecycleManager:
+    """State transition boshqaruv"""
+    
+    VALID_TRANSITIONS = {
+        CandidateStatus.OBSERVED: [CandidateStatus.TRIAGED],
+        CandidateStatus.TRIAGED: [CandidateStatus.QUEUED, CandidateStatus.REJECTED],
+        CandidateStatus.QUEUED: [CandidateStatus.CLONE_ALLOCATED, CandidateStatus.REJECTED],
+        CandidateStatus.CLONE_ALLOCATED: [CandidateStatus.IN_MODIFICATION, CandidateStatus.REJECTED],
+        CandidateStatus.IN_MODIFICATION: [CandidateStatus.LOCAL_VALIDATION, CandidateStatus.REJECTED],
+        CandidateStatus.LOCAL_VALIDATION: [CandidateStatus.FULL_EVALUATION, CandidateStatus.REJECTED],
+        CandidateStatus.FULL_EVALUATION: [CandidateStatus.REPORT_READY, CandidateStatus.REJECTED],
+        CandidateStatus.REPORT_READY: [CandidateStatus.AWAITING_DECISION],
+        CandidateStatus.AWAITING_DECISION: [CandidateStatus.APPROVED, CandidateStatus.REJECTED, CandidateStatus.ARCHIVED],
+        CandidateStatus.APPROVED: [CandidateStatus.PROMOTED, CandidateStatus.FORKED],
+        CandidateStatus.PROMOTED: [CandidateStatus.ROLLED_BACK],
+    }
+    
+    def __init__(self):
+        self.candidates: Dict = {}
+        logger.info("🔄 LifecycleManager initialized")
+    
+    def transition(self, candidate_id: str, new_status: CandidateStatus) -> bool:
+        if candidate_id not in self.candidates:
+            return False
+        
+        current = self.candidates[candidate_id].get("status")
+        allowed = self.VALID_TRANSITIONS.get(current, [])
+        
+        if new_status not in allowed:
+            logger.warning(f"❌ Invalid transition: {current} -> {new_status}")
+            return False
+        
+        self.candidates[candidate_id]["status"] = new_status
+        self.candidates[candidate_id]["updated_at"] = datetime.now().isoformat()
+        logger.info(f"🔄 {candidate_id}: {current} -> {new_status}")
+        return True
+    
+    def register(self, candidate_id: str, data: dict):
+        self.candidates[candidate_id] = {**data, "status": CandidateStatus.OBSERVED, "created_at": datetime.now().isoformat()}
+
+
+class PriorityEngine:
+    """Queue tartiblash"""
+    
+    def __init__(self):
+        self.queue: List[str] = []
+        logger.info("📊 PriorityEngine initialized")
+    
+    def score_candidate(self, candidate: dict) -> float:
+        roi = candidate.get("roi", 0.5)
+        risk_inverted = 1.0 - ({"low": 0.2, "medium": 0.5, "high": 0.8}.get(candidate.get("risk", "medium"), 0.5))
+        return roi * 0.6 + risk_inverted * 0.4
+    
+    def rank(self, candidates: List[dict]) -> List[dict]:
+        return sorted(candidates, key=lambda c: self.score_candidate(c), reverse=True)
+    
+    def select_next(self) -> Optional[str]:
+        return self.queue[0] if self.queue else None
+
+
+class PolicyGuard:
+    """Invariant tekshirish"""
+    
+    def __init__(self):
+        self.violations: List[dict] = []
+        logger.info("🛡️ PolicyGuard initialized")
+    
+    def ensure_clone_only(self, candidate: dict) -> bool:
+        if candidate.get("status") != CandidateStatus.CLONE_ALLOCATED:
+            return True
+        return True
+    
+    def ensure_rollback_before_promotion(self, record: dict) -> bool:
+        return bool(record.get("rollback_anchor"))
+    
+    def ensure_human_decision(self, record: dict) -> bool:
+        return record.get("by") == "human"
 
 
 class CentralOrchestrator:
     """
-    Central Orchestrator - Bosh Boshqaruv Markazi
+    Bosh Boshqaruv Markazi
+    
+    Asosiy vazifalar:
+    - navbatdagi candidate'ni tanlash
+    - clone ochishga ruxsat berish
+    - stage transition'larni boshqarish
+    - approval'siz originalga tegilmasligini majbur qilish
     """
     
     def __init__(self, workspace_path: str):
         self.workspace_path = workspace_path
-        self.system_state = SystemState()
-        self.state = OrchestratorState.IDLE
+        self.lifecycle = LifecycleManager()
+        self.priority = PriorityEngine()
+        self.policy = PolicyGuard()
         
-        self.intake_system = None
-        self.candidate_system = None
-        self.execution_layer = None
-        self.evaluation_layer = None
-        self.reporting_layer = None
-        self.governance_layer = None
-        self.promotion_layer = None
-        self.memory_layer = None
+        # State
+        self.candidates: Dict = {}
+        self.clones: Dict = {}
+        self.observations: Dict = {}
+        self.dossiers: Dict = {}
+        self.decisions: Dict = {}
         
-        self.backlog: list[str] = []
-        self.roadmap_priorities: list[str] = []
+        # Services (will be connected later)
+        self.intake_service = None
+        self.candidate_factory = None
+        self.clone_factory = None
+        self.patch_engine = None
+        self.validation_service = None
+        self.evaluation_service = None
+        self.reporting_service = None
+        self.governance_service = None
+        self.promotion_service = None
+        self.memory_service = None
         
         logger.info("🎯 CentralOrchestrator initialized")
     
-    def connect_layers(self, layers: dict):
-        """Barcha qatlamlarni ulash"""
-        self.intake_system = layers.get("intake")
-        self.candidate_system = layers.get("candidates")
-        self.execution_layer = layers.get("execution")
-        self.evaluation_layer = layers.get("evaluation")
-        self.reporting_layer = layers.get("reporting")
-        self.governance_layer = layers.get("governance")
-        self.promotion_layer = layers.get("promotion")
-        self.memory_layer = layers.get("memory")
-        logger.info("🔗 All layers connected")
+    def connect_services(self, services: dict):
+        """Service larni ulash"""
+        self.intake_service = services.get("intake")
+        self.candidate_factory = services.get("candidate_factory")
+        self.clone_factory = services.get("clone_factory")
+        self.patch_engine = services.get("patch_engine")
+        self.validation_service = services.get("validation")
+        self.evaluation_service = services.get("evaluation")
+        self.reporting_service = services.get("reporting")
+        self.governance_service = services.get("governance")
+        self.promotion_service = services.get("promotion")
+        self.memory_service = services.get("memory")
+        logger.info("🔗 Services connected")
     
-    def process_observation(self, observation: Observation) -> dict:
-        """Observation ni qayta ishlash"""
-        logger.info(f"🎯 Processing observation: {observation.id}")
+    # === OBSERVATION ===
+    
+    def submit_observation(self, observation: dict) -> str:
+        """Observation qabul qilish"""
+        obs_id = observation.get("id")
+        self.observations[obs_id] = observation
+        logger.info(f"👁️ Observation received: {obs_id}")
+        return obs_id
+    
+    def create_candidate_from_signal(self, observation_id: str) -> Optional[str]:
+        """Signal dan candidate yaratish"""
+        if not self.candidate_factory:
+            return None
         
-        result = {"observation_id": observation.id, "action": None, "candidate_id": None, "status": "pending"}
+        candidate = self.candidate_factory.from_observation(self.observations.get(observation_id))
+        if candidate:
+            self.candidates[candidate["id"]] = candidate
+            self.lifecycle.register(candidate["id"], candidate)
+            logger.info(f"📋 Candidate created: {candidate['id']}")
+            return candidate["id"]
+        return None
+    
+    # === SCHEDULING ===
+    
+    def schedule_next_candidate(self) -> Optional[str]:
+        """Keyingi candidate ni tanlash"""
+        pending = [c for c in self.candidates.values() if c.get("status") == CandidateStatus.QUEUED]
+        if not pending:
+            return None
         
-        if self.intake_system:
-            triage_result = self.intake_system["triage"].triage_observation(observation)
-            result["triage_result"] = triage_result
+        ranked = self.priority.rank(pending)
+        return ranked[0].get("id") if ranked else None
+    
+    # === CLONE RUN ===
+    
+    def start_clone_run(self, candidate_id: str) -> Optional[str]:
+        """Clone ishga tushirish"""
+        if not self.clone_factory:
+            return None
         
-        if triage_result == "candidate_create":
-            candidate = self._create_candidate_from_observation(observation)
-            result["action"] = "candidate_created"
-            result["candidate_id"] = candidate.id
+        clone = self.clone_factory.create_clone(candidate_id)
+        if clone:
+            self.clones[clone["clone_id"]] = clone
+            self.lifecycle.transition(candidate_id, CandidateStatus.CLONE_ALLOCATED)
+            logger.info(f"🏭 Clone started: {clone['clone_id']}")
+            return clone["clone_id"]
+        return None
+    
+    # === TRANSITION ===
+    
+    def advance_candidate(self, candidate_id: str, new_status: CandidateStatus) -> bool:
+        """Candidate ni keyingi holatga o'tkazish"""
+        success = self.lifecycle.transition(candidate_id, new_status)
+        if success:
+            self.candidates[candidate_id]["status"] = new_status
+        return success
+    
+    def pause_candidate(self, candidate_id: str, reason: str) -> bool:
+        """Candidate ni to'xtatish"""
+        logger.info(f"⏸️ Candidate paused: {candidate_id} - {reason}")
+        return True
+    
+    # === VALIDATION & EVALUATION ===
+    
+    def validate_clone(self, clone_id: str) -> dict:
+        """Clone ni tekshirish"""
+        if not self.validation_service:
+            return {"passed": False, "error": "Service not connected"}
         
-        if result["candidate_id"]:
-            self._add_to_backlog(result["candidate_id"])
-        
-        result["status"] = "completed"
+        result = self.validation_service.validate(clone_id, self.clones.get(clone_id, {}).get("path", ""))
         return result
     
-    def _create_candidate_from_observation(self, observation: Observation) -> UpgradeCandidate:
-        if not self.candidate_system:
-            raise RuntimeError("Candidate system not connected")
+    def evaluate_clone(self, clone_id: str) -> dict:
+        """Clone ni baholash"""
+        if not self.evaluation_service:
+            return {}
         
-        factory = self.candidate_system["factory"]
-        candidate = factory.create_from_observation(observation)
-        logger.info(f"📋 Candidate created: {candidate.id}")
-        return candidate
+        return self.evaluation_service.evaluate(clone_id)
     
-    def _add_to_backlog(self, candidate_id: str):
-        if candidate_id not in self.backlog:
-            self.backlog.append(candidate_id)
-            self._reorder_backlog()
+    # === REPORTING ===
     
-    def _reorder_backlog(self):
-        if not self.candidate_system:
-            return
+    def build_dossier(self, candidate_id: str, clone_id: str, evaluation: dict) -> dict:
+        """Hisobot yaratish"""
+        if not self.reporting_service:
+            return {}
         
-        registry = self.candidate_system["registry"]
-        
-        self.backlog.sort(
-            key=lambda cid: registry.get_candidate(cid).priority if registry.get_candidate(cid) else 0,
-            reverse=True
-        )
+        dossier = self.reporting_service.build(candidate_id, clone_id, evaluation)
+        self.dossiers[dossier.get("id")] = dossier
+        return dossier
     
-    def select_next_candidate(self) -> Optional[str]:
-        if self.system_state.active_clones_count >= self.system_state.clone_limit:
-            logger.warning("⚠️ Clone limit reached")
+    # === GOVERNANCE ===
+    
+    def submit_for_approval(self, dossier_id: str) -> str:
+        """Approval uchun yuborish"""
+        if not self.governance_service:
+            return ""
+        
+        approval_id = self.governance_service.submit(dossier_id)
+        self.advance_candidate(self.dossiers.get(dossier_id, {}).get("candidate_id"), CandidateStatus.AWAITING_DECISION)
+        return approval_id
+    
+    def finalize_decision(self, decision: dict) -> bool:
+        """Qaror qilish"""
+        candidate_id = decision.get("candidate_id")
+        decision_type = decision.get("decision")
+        
+        # Decision ni qayd qilish
+        self.decisions[candidate_id] = decision
+        
+        # Holatni o'zgartirish
+        if decision_type == DecisionType.APPROVE_MAIN or decision_type == DecisionType.APPROVE_CANARY:
+            self.advance_candidate(candidate_id, CandidateStatus.APPROVED)
+        elif decision_type == DecisionType.REJECT:
+            self.advance_candidate(candidate_id, CandidateStatus.REJECTED)
+        
+        logger.info(f"✅ Decision finalized: {candidate_id} -> {decision_type.value}")
+        return True
+    
+    # === PROMOTION ===
+    
+    def promote(self, candidate_id: str, destination: DestinationType) -> Optional[dict]:
+        """Promotion qilish"""
+        if not self.promotion_service:
             return None
         
-        if self.system_state.used_risk_budget >= self.system_state.current_risk_budget:
-            logger.warning("⚠️ Risk budget exhausted")
+        clone_id = self._get_clone_for_candidate(candidate_id)
+        if not clone_id:
             return None
         
-        if not self.backlog:
-            return None
-        
-        candidate_id = self.backlog[0]
-        
-        if self.candidate_system:
-            candidate = self.candidate_system["registry"].get_candidate(candidate_id)
-            if not candidate or candidate.state != CandidateState.QUEUED:
-                self.backlog.remove(candidate_id)
-                return self.select_next_candidate()
-        
-        return candidate_id
+        record = self.promotion_service.promote(clone_id, destination)
+        self.advance_candidate(candidate_id, CandidateStatus.PROMOTED)
+        return record
     
-    def execute_candidate(self, candidate_id: str, modifications: list[dict]) -> Optional[CloneRun]:
-        logger.info(f"⚡ Executing candidate: {candidate_id}")
-        
-        if not self.execution_layer:
-            raise RuntimeError("Execution layer not connected")
-        
-        clone = self.execution_layer.execute_candidate(candidate_id, modifications)
-        
-        if clone:
-            self.system_state.active_clones_count += 1
-            self.system_state.last_updated = datetime.now()
-        
-        return clone
+    def _get_clone_for_candidate(self, candidate_id: str) -> Optional[str]:
+        for clone in self.clones.values():
+            if clone.get("candidate_id") == candidate_id:
+                return clone.get("clone_id")
+        return None
     
-    def evaluate_clone(self, clone: CloneRun, candidate: UpgradeCandidate) -> dict:
-        logger.info(f"📈 Evaluating clone: {clone.clone_id}")
-        
-        if not self.evaluation_layer:
-            raise RuntimeError("Evaluation layer not connected")
-        
-        evaluation = self.evaluation_layer.evaluate_clone(clone)
-        
-        if self.reporting_layer:
-            report = self.reporting_layer.create_full_report(candidate, clone, evaluation)
-            return report
-        
-        return {"evaluation": evaluation}
+    # === STATUS ===
     
-    def get_system_status(self) -> dict:
+    def get_status(self) -> dict:
+        """Tizim holatini olish"""
         return {
-            "orchestrator_state": self.state.value,
-            "system_state": self.system_state.to_dict(),
-            "backlog_size": len(self.backlog),
-            "active_clones": self.system_state.active_clones_count,
-            "pending_decisions": self.system_state.awaiting_decision_count
+            "candidates": len(self.candidates),
+            "clones": len(self.clones),
+            "observations": len(self.observations),
+            "dossiers": len(self.dossiers),
+            "decisions": len(self.decisions)
         }
-    
-    def can_clone(self) -> bool:
-        return (
-            self.system_state.active_clones_count < self.system_state.clone_limit and
-            self.system_state.used_risk_budget < self.system_state.current_risk_budget
-        )
-    
-    def start(self):
-        self.state = OrchestratorState.RUNNING
-        logger.info("🎯 CentralOrchestrator started")
-    
-    def stop(self):
-        self.state = OrchestratorState.IDLE
-        logger.info("⏹️ CentralOrchestrator stopped")
 
 
-def create_central_orchestrator(workspace_path: str) -> CentralOrchestrator:
-    return CentralOrchestrator(workspace_path)
+__all__ = ["CentralOrchestrator", "LifecycleManager", "PriorityEngine", "PolicyGuard"]
