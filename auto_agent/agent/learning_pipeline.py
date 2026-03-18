@@ -119,22 +119,408 @@ class VerificationMethod(Enum):
     BENCHMARK_VALIDATED = "benchmark_validated"
 
 
-class VolatilityClass(Enum):
-    """Volatility Class - Domain-specific time decay rates"""
-    # Very slow decay - almost never changes
-    IMMUTABLE = "immutable"           # Mathematical facts, constants
-    # Slow decay - changes rarely
-    STABLE = "stable"                 # Programming concepts, CS fundamentals
-    # Medium decay - changes occasionally
-    MEDIUM = "medium"                # General knowledge, facts
-    # Fast decay - changes frequently  
-    VOLATILE = "volatile"             # Software releases, APIs
-    # Very fast decay - changes constantly
-    HIGHLY_VOLATILE = "highly_volatile"  # Prices, market data, news
-    # User-specific decay
-    USER_PREFERENCE = "user_preference"   # User preferences
-    # Procedure-specific decay
-    PROCEDURE = "procedure"               # Procedures/workflows
+class FailureType(Enum):
+    """Failure Taxonomy - Detailed failure classification"""
+    KNOWLEDGE_ERROR = "knowledge_error"           # Knowledge content was wrong
+    STALE_KNOWLEDGE = "stale_knowledge"           # Knowledge outdated
+    CONTRADICTION = "contradiction"                # Contradiction detected
+    SCOPE_MISMATCH = "scope_mismatch"              # Wrong scope/domain
+    RETRIEVAL_MISS = "retrieval_miss"             # Wrong knowledge selected
+    RANKING_ERROR = "ranking_error"                # Ranking features failed
+    PROCEDURE_DRIFT = "procedure_drift"            # Procedure changed
+    TOOL_FAILURE = "tool_failure"                 # Tool didn't work
+    ENVIRONMENT_FAILURE = "environment_failure"   # Environment issue
+    EXTERNAL_DEPENDENCY = "external_dependency"    # External service failed
+    USER_AMBIGUITY = "user_ambiguity"              # User intent unclear
+    PLANNER_ERROR = "planner_error"               # Planning failed
+    VERIFICATION_ERROR = "verification_error"      # Verification wrong
+    UNKNOWN = "unknown"                           # Unknown failure
+
+
+class AttributionEdgeType(Enum):
+    """Types of causal relationships in attribution graph"""
+    USED_FOR = "used_for"                    # Entity was used for task
+    INFLUENCED = "influenced"                # Entity influenced outcome
+    CAUSED = "caused"                        # Entity caused outcome
+    CONTRADICTED = "contradicted"            # Entity contradicted another
+    VERIFIED_BY = "verified_by"             # Entity verified by another
+    FAILED_DUE_TO = "failed_due_to"          # Failure caused by entity
+    SUPPORTED = "supported"                  # Entity supported another
+    SELECTED_OVER = "selected_over"          # Entity was selected over another
+
+
+@dataclass
+class LearningEpisode:
+    """
+    Learning Episode - Complete task execution record
+    =================================================
+    This is the core of the closed-loop system.
+    Every real task execution becomes an episode with full trace.
+    """
+    episode_id: str
+    task_id: str
+    task_description: str
+    goal: str
+    context: Dict[str, Any] = field(default_factory=dict)
+    
+    # Execution trace
+    retrieved_items: List[Dict[str, Any]] = field(default_factory=list)
+    selected_items: List[str] = field(default_factory=list)  # knowledge IDs
+    
+    # Procedure trace
+    procedures_used: List[str] = field(default_factory=list)  # procedure IDs
+    procedure_steps: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Tool trace
+    tools_used: List[str] = field(default_factory=list)  # tool names
+    tool_results: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Verification trace
+    verification_results: List[Dict[str, Any]] = field(default_factory=list)
+    verification_artifacts: List[str] = field(default_factory=list)
+    
+    # Outcome
+    outcome: Dict[str, Any] = field(default_factory=dict)
+    final_verdict: str = "pending"  # success, failure, partial, unknown
+    
+    # Feedback traces
+    user_feedback: Dict[str, Any] = field(default_factory=dict)
+    production_feedback: Dict[str, Any] = field(default_factory=dict)
+    
+    # Attribution
+    credits: Dict[str, float] = field(default_factory=dict)  # entity_id -> credit
+    blames: Dict[str, float] = field(default_factory=dict)   # entity_id -> blame
+    
+    # Failure analysis
+    failure_type: str = "unknown"
+    root_cause: str = ""
+    
+    # Temporal
+    start_time: float = field(default_factory=time.time)
+    end_time: float = 0.0
+    latency_ms: float = 0.0
+    
+    # Quality metrics
+    quality_score: float = 0.0
+    user_satisfaction: float = 0.0
+    
+    # Causal graph
+    causal_graph: Dict[str, Any] = field(default_factory=dict)
+    
+    # Status
+    processed: bool = False
+    delayed_feedback_bound: bool = False
+    
+    def mark_complete(self, final_verdict: str, outcome: Dict[str, Any]):
+        """Mark episode as complete"""
+        self.end_time = time.time()
+        self.latency_ms = (self.end_time - self.start_time) * 1000
+        self.final_verdict = final_verdict
+        self.outcome = outcome
+        
+        if "quality_score" in outcome:
+            self.quality_score = outcome["quality_score"]
+        if "user_satisfaction" in outcome:
+            self.user_satisfaction = outcome["user_satisfaction"]
+    
+    def add_retrieval_trace(self, retrieved: Dict[str, Any]):
+        """Add retrieval trace"""
+        self.retrieved_items.append(retrieved)
+    
+    def add_selection(self, knowledge_id: str, reason: str = ""):
+        """Record knowledge selection"""
+        if knowledge_id not in self.selected_items:
+            self.selected_items.append(knowledge_id)
+    
+    def add_procedure(self, procedure_id: str, steps: List[Dict] = None):
+        """Add procedure to trace"""
+        if procedure_id not in self.procedures_used:
+            self.procedures_used.append(procedure_id)
+        if steps:
+            self.procedure_steps.extend(steps)
+    
+    def add_tool_call(self, tool_name: str, result: Dict):
+        """Add tool call to trace"""
+        self.tools_used.append(tool_name)
+        self.tool_results.append({
+            "tool": tool_name,
+            "result": result,
+            "timestamp": time.time()
+        })
+    
+    def add_verification(self, verification: Dict):
+        """Add verification result"""
+        self.verification_results.append(verification)
+    
+    def to_dict(self) -> Dict:
+        """Serialize episode"""
+        return {
+            "episode_id": self.episode_id,
+            "task_id": self.task_id,
+            "task_description": self.task_description,
+            "goal": self.goal,
+            "context": self.context,
+            "retrieved_items": self.retrieved_items,
+            "selected_items": self.selected_items,
+            "procedures_used": self.procedures_used,
+            "procedure_steps": self.procedure_steps,
+            "tools_used": self.tools_used,
+            "tool_results": self.tool_results,
+            "verification_results": self.verification_results,
+            "verification_artifacts": self.verification_artifacts,
+            "outcome": self.outcome,
+            "final_verdict": self.final_verdict,
+            "user_feedback": self.user_feedback,
+            "production_feedback": self.production_feedback,
+            "credits": self.credits,
+            "blames": self.blames,
+            "failure_type": self.failure_type,
+            "root_cause": self.root_cause,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "latency_ms": self.latency_ms,
+            "quality_score": self.quality_score,
+            "user_satisfaction": self.user_satisfaction,
+            "causal_graph": self.causal_graph,
+            "processed": self.processed,
+            "delayed_feedback_bound": self.delayed_feedback_bound
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'LearningEpisode':
+        """Deserialize episode"""
+        return cls(
+            episode_id=data.get("episode_id", ""),
+            task_id=data.get("task_id", ""),
+            task_description=data.get("task_description", ""),
+            goal=data.get("goal", ""),
+            context=data.get("context", {}),
+            retrieved_items=data.get("retrieved_items", []),
+            selected_items=data.get("selected_items", []),
+            procedures_used=data.get("procedures_used", []),
+            procedure_steps=data.get("procedure_steps", []),
+            tools_used=data.get("tools_used", []),
+            tool_results=data.get("tool_results", []),
+            verification_results=data.get("verification_results", []),
+            verification_artifacts=data.get("verification_artifacts", []),
+            outcome=data.get("outcome", {}),
+            final_verdict=data.get("final_verdict", "pending"),
+            user_feedback=data.get("user_feedback", {}),
+            production_feedback=data.get("production_feedback", {}),
+            credits=data.get("credits", {}),
+            blames=data.get("blames", {}),
+            failure_type=data.get("failure_type", "unknown"),
+            root_cause=data.get("root_cause", ""),
+            start_time=data.get("start_time", time.time()),
+            end_time=data.get("end_time", 0.0),
+            latency_ms=data.get("latency_ms", 0.0),
+            quality_score=data.get("quality_score", 0.0),
+            user_satisfaction=data.get("user_satisfaction", 0.0),
+            causal_graph=data.get("causal_graph", {}),
+            processed=data.get("processed", False),
+            delayed_feedback_bound=data.get("delayed_feedback_bound", False)
+        )
+
+
+@dataclass
+class AttributionEdge:
+    """Attribution Edge - Causal relationship between entities"""
+    edge_id: str
+    source_entity_type: str  # knowledge, procedure, tool, source, planner
+    source_entity_id: str
+    target_entity_type: str
+    target_entity_id: str
+    edge_type: str  # used_for, influenced, caused, etc.
+    weight: float = 1.0
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    
+    def to_dict(self) -> Dict:
+        return {
+            "edge_id": self.edge_id,
+            "source_entity_type": self.source_entity_type,
+            "source_entity_id": self.source_entity_id,
+            "target_entity_type": self.target_entity_type,
+            "target_entity_id": self.target_entity_id,
+            "edge_type": self.edge_type,
+            "weight": self.weight,
+            "evidence": self.evidence,
+            "timestamp": self.timestamp
+        }
+
+
+@dataclass
+class AntiPattern:
+    """Anti-Pattern - Failure pattern memory"""
+    pattern_id: str
+    pattern_type: str  # bad_source_domain, bad_procedure_env, bad_retrieval_query
+    description: str
+    
+    # Pattern specifics
+    source_domain: str = ""          # source + domain pair
+    procedure_environment: str = ""  # procedure + environment
+    retrieval_query_pattern: str = ""  # query pattern that fails
+    
+    # Occurrence
+    occurrence_count: int = 0
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    
+    # Evidence
+    episode_ids: List[str] = field(default_factory=list)
+    failure_types: List[str] = field(default_factory=list)
+    
+    # Severity
+    severity: str = "medium"  # low, medium, high, critical
+    
+    # Prevention guidance
+    guidance: str = ""
+    
+    def record_occurrence(self, episode_id: str, failure_type: str):
+        """Record new occurrence"""
+        self.occurrence_count += 1
+        self.last_seen = time.time()
+        if episode_id not in self.episode_ids:
+            self.episode_ids.append(episode_id)
+        if failure_type not in self.failure_types:
+            self.failure_types.append(failure_type)
+    
+    def to_dict(self) -> Dict:
+        return {
+            "pattern_id": self.pattern_id,
+            "pattern_type": self.pattern_type,
+            "description": self.description,
+            "source_domain": self.source_domain,
+            "procedure_environment": self.procedure_environment,
+            "retrieval_query_pattern": self.retrieval_query_pattern,
+            "occurrence_count": self.occurrence_count,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "episode_ids": self.episode_ids,
+            "failure_types": self.failure_types,
+            "severity": self.severity,
+            "guidance": self.guidance
+        }
+
+
+@dataclass 
+class ProcedureCandidate:
+    """Procedure Candidate - Extracted from successful episodes"""
+    procedure_id: str
+    name: str
+    description: str
+    
+    # Extracted from episodes
+    step_sequence: List[Dict[str, Any]] = field(default_factory=list)
+    prerequisites: List[str] = field(default_factory=list)
+    success_conditions: List[str] = field(default_factory=list)
+    best_evidence: List[str] = field(default_factory=list)  # knowledge IDs
+    
+    # Metrics
+    success_count: int = 0
+    total_attempts: int = 0
+    success_rate: float = 0.0
+    avg_latency_ms: float = 0.0
+    
+    # Source episodes
+    source_episodes: List[str] = field(default_factory=list)
+    
+    # Confidence
+    confidence: float = 0.5
+    
+    # Timestamps
+    first_extracted: float = field(default_factory=time.time)
+    last_updated: float = field(default_factory=time.time)
+    
+    # Status
+    status: str = "candidate"  # candidate, validated, active, deprecated
+    
+    def update_from_episode(self, episode: LearningEpisode):
+        """Update procedure from successful episode"""
+        self.total_attempts += 1
+        if episode.final_verdict == "success":
+            self.success_count += 1
+        
+        self.success_rate = self.success_count / max(1, self.total_attempts)
+        
+        # Update latency
+        self.avg_latency_ms = (
+            (self.avg_latency_ms * (self.total_attempts - 1) + episode.latency_ms) 
+            / self.total_attempts
+        )
+        
+        # Add to source episodes
+        if episode.episode_id not in self.source_episodes:
+            self.source_episodes.append(episode.episode_id)
+        
+        self.last_updated = time.time()
+    
+    def to_dict(self) -> Dict:
+        return {
+            "procedure_id": self.procedure_id,
+            "name": self.name,
+            "description": self.description,
+            "step_sequence": self.step_sequence,
+            "prerequisites": self.prerequisites,
+            "success_conditions": self.success_conditions,
+            "best_evidence": self.best_evidence,
+            "success_count": self.success_count,
+            "total_attempts": self.total_attempts,
+            "success_rate": self.success_rate,
+            "avg_latency_ms": self.avg_latency_ms,
+            "source_episodes": self.source_episodes,
+            "confidence": self.confidence,
+            "first_extracted": self.first_extracted,
+            "last_updated": self.last_updated,
+            "status": self.status
+        }
+
+
+@dataclass
+class DelayedFeedback:
+    """Delayed Feedback - Feedback that arrives after the fact"""
+    feedback_id: str
+    original_episode_id: str
+    
+    # Feedback content
+    feedback_type: str  # user_correction, bug_report, regression, etc.
+    content: Dict[str, Any]
+    
+    # Binding info
+    correlation_id: str = ""  # Links related feedback
+    causation_id: str = ""    # Links cause-effect
+    
+    # When feedback arrived
+    arrival_time: float = field(default_factory=time.time)
+    
+    # Original task time
+    original_task_time: float = 0.0
+    
+    # Status
+    bound: bool = False
+    processed: bool = False
+    
+    def bind_to_episode(self, episode_id: str, retroactive: bool = True):
+        """Bind delayed feedback to episode"""
+        self.original_episode_id = episode_id
+        self.bound = True
+        
+        if retroactive:
+            logger.info(f"🔗 Retroactively bound feedback {self.feedback_id} to episode {episode_id}")
+    
+    def to_dict(self) -> Dict:
+        return {
+            "feedback_id": self.feedback_id,
+            "original_episode_id": self.original_episode_id,
+            "feedback_type": self.feedback_type,
+            "content": self.content,
+            "correlation_id": self.correlation_id,
+            "causation_id": self.causation_id,
+            "arrival_time": self.arrival_time,
+            "original_task_time": self.original_task_time,
+            "bound": self.bound,
+            "processed": self.processed
+        }
 
 
 class TemporalStatus(Enum):
@@ -148,6 +534,714 @@ class TemporalStatus(Enum):
     QUARANTINED = "quarantined"             # Flagged for review
     RETIRED = "retired"                     # No longer applicable
     ARCHIVED = "archived"                    # Preserved for historical reference
+
+
+class OutcomeVerdict(Enum):
+    """Outcome Verdict - Structured task outcome classification"""
+    SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+class UpdatePolicy(Enum):
+    """Learning Update Policy - How to update based on outcome"""
+    CONFIDENCE_UPDATE = "confidence_update"
+    SOURCE_TRUST_UPDATE = "source_trust_update"
+    PROCEDURE_REINFORCEMENT = "procedure_reinforcement"
+    PROCEDURE_DEMOTION = "procedure_demotion"
+    RETRIEVAL_RERANK = "retrieval_rerank"
+    ANTI_PATTERN_CREATE = "anti_pattern_create"
+    RE_VERIFICATION_TRIGGER = "re_verification_trigger"
+    QUARANTINE_TRIGGER = "quarantine_trigger"
+    PROCEDURE_EXTRACTION = "procedure_extraction"
+    NO_UPDATE = "no_update"
+
+
+# ==================== CAUSAL LEARNING GRAPH ====================
+
+class CausalLearningGraph:
+    """
+    Causal Learning Graph - Full causal relationship tracking
+    ==========================================================
+    This is the heart of the No1+ closed loop system.
+    Instead of just "task worked / didn't work", we track:
+    - What retrieval candidate was selected
+    - What knowledge influenced the decision
+    - What procedure was used
+    - What tool executed
+    - What verification said
+    - What final outcome occurred
+    
+    Then we distribute blame/credit based on this graph.
+    """
+    
+    def __init__(self, episode_id: str):
+        self.episode_id = episode_id
+        self.nodes: Dict[str, Dict] = {}  # entity_id -> entity_info
+        self.edges: List[Dict] = []
+        self.attributions: Dict[str, float] = {}  # entity_id -> attribution_score
+    
+    def add_node(self, entity_type: str, entity_id: str, info: Dict = None):
+        """Add a node to the causal graph"""
+        node_key = f"{entity_type}:{entity_id}"
+        self.nodes[node_key] = {
+            "type": entity_type,
+            "id": entity_id,
+            "info": info or {},
+            "added_at": time.time()
+        }
+    
+    def add_edge(self, source_type: str, source_id: str, 
+                 target_type: str, target_id: str, edge_type: str, weight: float = 1.0):
+        """Add an edge representing causal relationship"""
+        edge = {
+            "source": f"{source_type}:{source_id}",
+            "target": f"{target_type}:{target_id}",
+            "edge_type": edge_type,
+            "weight": weight,
+            "timestamp": time.time()
+        }
+        self.edges.append(edge)
+    
+    def compute_attributions(self, outcome: str) -> Dict[str, float]:
+        """
+        Compute blame/credit attributions based on graph and outcome.
+        
+        This is the key differentiator from simple agents:
+        - Simple agent: "task worked / didn't work"
+        - No1+ agent: "why did it work / why did it fail"
+        """
+        attributions = defaultdict(lambda: 0.0)
+        
+        if outcome == "success":
+            # Distribute credit along all edges
+            for edge in self.edges:
+                source = edge["source"]
+                weight = edge["weight"]
+                
+                # Credit flows from outcome back to sources
+                if edge["edge_type"] in ["used_for", "influenced", "supported"]:
+                    attributions[source] += weight * 0.3
+                elif edge["edge_type"] == "caused":
+                    attributions[source] += weight * 0.5
+        
+        elif outcome == "failure":
+            # Distribute blame along edges
+            for edge in self.edges:
+                source = edge["source"]
+                weight = edge["weight"]
+                
+                # Blame flows from outcome back to causes
+                if edge["edge_type"] == "failed_due_to":
+                    attributions[source] += weight * 0.8
+                elif edge["edge_type"] == "used_for":
+                    attributions[source] += weight * 0.3
+        
+        self.attributions = dict(attributions)
+        return self.attributions
+    
+    def get_entity_attribution(self, entity_type: str, entity_id: str) -> float:
+        """Get attribution score for specific entity"""
+        key = f"{entity_type}:{entity_id}"
+        return self.attributions.get(key, 0.0)
+    
+    def to_dict(self) -> Dict:
+        return {
+            "episode_id": self.episode_id,
+            "nodes": self.nodes,
+            "edges": self.edges,
+            "attributions": self.attributions
+        }
+
+
+class CreditAssignmentEngine:
+    """
+    Credit Assignment Engine - Distributes blame/credit to entities
+    =================================================================
+    This is what separates No1+ from simple agents.
+    
+    In a task, multiple entities participate:
+    - Multiple knowledge entries
+    - One or more procedures
+    - Multiple tools
+    - Sources
+    
+    If task succeeds/fails, we need to know:
+    - Which knowledge helped/hurt
+    - Which procedure was effective/ineffective
+    - Which tool worked/didn't work
+    - Which source led us astray
+    
+    This engine computes this attribution.
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        # Attribution weights
+        self.knowledge_weight = self.config.get("knowledge_weight", 0.4)
+        self.procedure_weight = self.config.get("procedure_weight", 0.3)
+        self.tool_weight = self.config.get("tool_weight", 0.2)
+        self.source_weight = self.config.get("source_weight", 0.1)
+        
+        # Minimum confidence for attribution
+        self.min_attribution_threshold = self.config.get("min_attribution_threshold", 0.05)
+    
+    def assign_credit(self, episode: LearningEpisode) -> Dict[str, float]:
+        """Assign credit to entities for successful outcome."""
+        credits = defaultdict(lambda: 0.0)
+        
+        if episode.final_verdict != "success":
+            return dict(credits)
+        
+        # Credit knowledge entries
+        for knowledge_id in episode.selected_items:
+            credits[f"knowledge:{knowledge_id}"] += self.knowledge_weight / max(1, len(episode.selected_items))
+        
+        # Credit procedures
+        for proc_id in episode.procedures_used:
+            credits[f"procedure:{proc_id}"] += self.procedure_weight / max(1, len(episode.procedures_used))
+        
+        # Credit tools
+        for tool_name in episode.tools_used:
+            tool_success = any(
+                r.get("success", False) 
+                for r in episode.tool_results 
+                if r.get("tool") == tool_name
+            )
+            if tool_success:
+                credits[f"tool:{tool_name}"] += self.tool_weight / max(1, len(set(episode.tools_used)))
+        
+        # Normalize credits
+        total = sum(credits.values())
+        if total > 0:
+            credits = {k: v / total for k, v in credits.items()}
+        
+        return dict(credits)
+    
+    def assign_blame(self, episode: LearningEpisode, failure_type: str) -> Dict[str, float]:
+        """Assign blame to entities for failed outcome."""
+        blames = defaultdict(lambda: 0.0)
+        
+        if episode.final_verdict == "success":
+            return dict(blames)
+        
+        # Map failure type to entity weights
+        failure_blame_map = {
+            "knowledge_error": {"knowledge": 0.7, "procedure": 0.2, "tool": 0.1},
+            "stale_knowledge": {"knowledge": 0.6, "source": 0.3, "procedure": 0.1},
+            "retrieval_miss": {"knowledge": 0.3, "retrieval": 0.5, "procedure": 0.2},
+            "ranking_error": {"retrieval": 0.7, "knowledge": 0.3},
+            "procedure_drift": {"procedure": 0.8, "tool": 0.2},
+            "tool_failure": {"tool": 0.9, "procedure": 0.1},
+            "environment_failure": {"environment": 0.8, "tool": 0.2},
+            "planner_error": {"planner": 0.9},
+            "verification_error": {"verification": 0.9},
+            "unknown": {"knowledge": 0.4, "procedure": 0.3, "tool": 0.2, "other": 0.1}
+        }
+        
+        weights = failure_blame_map.get(failure_type, failure_blame_map["unknown"])
+        
+        if "knowledge" in weights:
+            for knowledge_id in episode.selected_items:
+                blames[f"knowledge:{knowledge_id}"] += weights.get("knowledge", 0) / max(1, len(episode.selected_items))
+        
+        if "procedure" in weights:
+            for proc_id in episode.procedures_used:
+                blames[f"procedure:{proc_id}"] += weights.get("procedure", 0) / max(1, len(episode.procedures_used))
+        
+        if "tool" in weights:
+            for tool_name in episode.tools_used:
+                blames[f"tool:{tool_name}"] += weights.get("tool", 0) / max(1, len(set(episode.tools_used)))
+        
+        # Normalize
+        total = sum(blames.values())
+        if total > 0:
+            blames = {k: v / total for k, v in blames.items()}
+        
+        return dict(blames)
+    
+    def compute_mixed_attribution(self, episode: LearningEpisode) -> Tuple[Dict, Dict]:
+        """Compute both credit and blame based on outcome."""
+        if episode.final_verdict == "success":
+            return self.assign_credit(episode), {}
+        elif episode.final_verdict == "failure":
+            return {}, self.assign_blame(episode, episode.failure_type)
+        else:
+            credits = self.assign_credit(episode)
+            credits = {k: v * 0.5 for k, v in credits.items()}
+            return credits, {}
+
+
+class FailureClassifier:
+    """
+    Failure Classifier - Identifies root cause of failures
+    ======================================================
+    Instead of just "confidence -= 0.1", we now:
+    1. Identify the failure type
+    2. Find the root cause
+    3. Apply targeted fix
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        
+        self.indicators = {
+            "knowledge_error": ["incorrect", "wrong", "error in", "not correct", "invalid", "factual error"],
+            "stale_knowledge": ["outdated", "old version", "deprecated", "no longer", "changed"],
+            "retrieval_miss": ["wrong knowledge", "wrong information", "irrelevant", "not what i needed"],
+            "procedure_drift": ["procedure changed", "steps different", "workflow changed"],
+            "tool_failure": ["tool error", "command failed", "tool didn't work", "execution failed"],
+            "environment_failure": ["environment", "permission denied", "not found", "dependency missing"],
+            "planner_error": ["wrong plan", "incorrect approach", "wrong strategy"],
+            "user_ambiguity": ["unclear", "ambiguous", "not specific", "confusing"]
+        }
+    
+    def classify_failure(self, episode: LearningEpisode, feedback: Dict = None) -> str:
+        """Classify the failure type based on episode and feedback."""
+        failure_type = episode.failure_type
+        
+        if feedback:
+            feedback_text = str(feedback.get("message", "")).lower()
+            feedback_type = feedback.get("type", "")
+            
+            for ftype, indicators in self.indicators.items():
+                if any(ind in feedback_text for ind in indicators):
+                    failure_type = ftype
+                    break
+            
+            if feedback_type:
+                failure_type = self._map_feedback_type(feedback_type)
+        
+        if failure_type == "unknown":
+            failure_type = self._analyze_episode(episode)
+        
+        return failure_type
+    
+    def _map_feedback_type(self, feedback_type: str) -> str:
+        mapping = {
+            "user_correction_wrong": "knowledge_error",
+            "user_correction_outdated": "stale_knowledge",
+            "user_correction_contradiction": "contradiction",
+            "production_bug": "tool_failure",
+            "production_error": "environment_failure",
+            "benchmark_regression": "procedure_drift",
+            "retrieval_bad": "retrieval_miss"
+        }
+        return mapping.get(feedback_type, "unknown")
+    
+    def _analyze_episode(self, episode: LearningEpisode) -> str:
+        """Analyze episode to determine failure type"""
+        for tool_result in episode.tool_results:
+            if not tool_result.get("success", True):
+                if "permission" in str(tool_result).lower():
+                    return "environment_failure"
+                return "tool_failure"
+        
+        for verification in episode.verification_results:
+            if verification.get("passed", True) == False:
+                reason = verification.get("reason", "").lower()
+                if "outdated" in reason or "stale" in reason:
+                    return "stale_knowledge"
+                if "incorrect" in reason or "wrong" in reason:
+                    return "knowledge_error"
+                return "verification_error"
+        
+        if episode.selected_items and episode.final_verdict == "failure":
+            if len(episode.retrieved_items) > len(episode.selected_items) * 3:
+                return "retrieval_miss"
+            return "knowledge_error"
+        
+        return "unknown"
+    
+    def get_update_policy(self, failure_type: str) -> List:
+        """Get appropriate update policies based on failure type."""
+        policies = {
+            "knowledge_error": [UpdatePolicy.CONFIDENCE_UPDATE, UpdatePolicy.RE_VERIFICATION_TRIGGER],
+            "stale_knowledge": [UpdatePolicy.CONFIDENCE_UPDATE, UpdatePolicy.ANTI_PATTERN_CREATE],
+            "retrieval_miss": [UpdatePolicy.RETRIEVAL_RERANK],
+            "ranking_error": [UpdatePolicy.RETRIEVAL_RERANK],
+            "procedure_drift": [UpdatePolicy.PROCEDURE_DEMOTION, UpdatePolicy.ANTI_PATTERN_CREATE],
+            "tool_failure": [UpdatePolicy.ANTI_PATTERN_CREATE],
+            "environment_failure": [UpdatePolicy.NO_UPDATE],
+            "planner_error": [UpdatePolicy.NO_UPDATE],
+            "verification_error": [UpdatePolicy.RE_VERIFICATION_TRIGGER],
+            "unknown": [UpdatePolicy.CONFIDENCE_UPDATE]
+        }
+        
+        return policies.get(failure_type, [UpdatePolicy.NO_UPDATE])
+
+
+class ProcedureMiner:
+    """
+    Procedure Miner - Extracts reusable procedures from successful episodes
+    =========================================================================
+    When the system successfully completes a task, we analyze what worked
+    and create reusable procedure candidates.
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self.min_episodes = self.config.get("min_episodes", 3)
+        self.min_success_rate = self.config.get("min_success_rate", 0.7)
+        self.procedure_candidates: Dict[str, ProcedureCandidate] = {}
+    
+    def extract_procedure(self, episode: LearningEpisode) -> Optional[ProcedureCandidate]:
+        """Extract procedure candidate from successful episode."""
+        if episode.final_verdict != "success":
+            return None
+        
+        proc_id = f"auto_proc_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
+        
+        steps = []
+        for step in episode.procedure_steps:
+            steps.append({
+                "description": step.get("description", ""),
+                "knowledge_used": step.get("knowledge_used", []),
+                "tools_used": step.get("tools_used", [])
+            })
+        
+        best_evidence = []
+        for verification in episode.verification_results:
+            if verification.get("passed", False):
+                best_evidence.extend(verification.get("knowledge_used", []))
+        
+        best_evidence = list(set(best_evidence))
+        prerequisites = list(episode.context.keys())[:5]
+        
+        candidate = ProcedureCandidate(
+            procedure_id=proc_id,
+            name=f"Auto-generated procedure from episode {episode.episode_id[:8]}",
+            description=f"Extracted from successful task: {episode.goal[:100]}",
+            step_sequence=steps,
+            prerequisites=prerequisites,
+            success_conditions=[episode.goal],
+            best_evidence=best_evidence
+        )
+        
+        candidate.update_from_episode(episode)
+        
+        return candidate
+    
+    def update_procedure(self, procedure_id: str, episode: LearningEpisode):
+        """Update existing procedure with new episode"""
+        if procedure_id in self.procedure_candidates:
+            self.procedure_candidates[procedure_id].update_from_episode(episode)
+    
+    def find_similar_episodes(self, episodes: List[LearningEpisode], 
+                              target_episode: LearningEpisode) -> List[LearningEpisode]:
+        """Find episodes similar to target for procedure extraction"""
+        similar = []
+        target_context_keys = set(target_episode.context.keys())
+        
+        for episode in episodes:
+            if episode.episode_id == target_episode.episode_id:
+                continue
+            if episode.final_verdict != "success":
+                continue
+            
+            episode_keys = set(episode.context.keys())
+            overlap = len(target_context_keys & episode_keys)
+            
+            if overlap >= len(target_context_keys) * 0.5:
+                similar.append(episode)
+        
+        return similar[:5]
+    
+    def merge_to_procedure(self, procedure_id: str, episodes: List[LearningEpisode]):
+        """Merge multiple episodes into one procedure"""
+        if not episodes:
+            return
+        
+        if procedure_id not in self.procedure_candidates:
+            candidate = self.extract_procedure(episodes[0])
+            if candidate:
+                self.procedure_candidates[procedure_id] = candidate
+                episodes = episodes[1:]
+        
+        for episode in episodes:
+            self.update_procedure(procedure_id, episode)
+
+
+class AntiPatternMemory:
+    """
+    Anti-Pattern Memory - Stores failure patterns to avoid
+    ======================================================
+    Key difference from simple agents:
+    - We don't just lower confidence
+    - We remember SPECIFIC failure patterns
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self.min_occurrences = self.config.get("min_occurrences", 2)
+        self.patterns: Dict[str, AntiPattern] = {}
+    
+    def record_failure_pattern(self, episode: LearningEpisode, failure_type: str):
+        """Record a failure pattern from episode"""
+        pattern_type, pattern_key = self._identify_pattern(episode, failure_type)
+        
+        if not pattern_type:
+            return
+        
+        if pattern_key in self.patterns:
+            self.patterns[pattern_key].record_occurrence(episode.episode_id, failure_type)
+        else:
+            pattern = AntiPattern(
+                pattern_id=f"anti_{hashlib.md5(pattern_key.encode()).hexdigest()[:8]}",
+                pattern_type=pattern_type,
+                description=self._generate_description(pattern_type, episode),
+                source_domain=episode.context.get("source", "") + "|" + episode.context.get("domain", ""),
+                procedure_environment=f"{'|'.join(episode.procedures_used)}|{episode.context.get('environment', '')}"
+            )
+            pattern.record_occurrence(episode.episode_id, failure_type)
+            self.patterns[pattern_key] = pattern
+            logger.info(f"🛑 New anti-pattern recorded: {pattern_type}")
+    
+    def _identify_pattern(self, episode: LearningEpisode, failure_type: str) -> Tuple[str, str]:
+        """Identify what type of pattern this failure represents"""
+        source = episode.context.get("source", "")
+        domain = episode.context.get("domain", "")
+        if source and domain:
+            return ("bad_source_domain", f"source:{source}|domain:{domain}")
+        
+        if episode.procedures_used and episode.context.get("environment"):
+            proc = episode.procedures_used[0]
+            env = episode.context.get("environment")
+            return ("bad_procedure_env", f"procedure:{proc}|environment:{env}")
+        
+        if failure_type in ["retrieval_miss", "ranking_error"]:
+            query = episode.context.get("query", "")
+            if query:
+                query_pattern = " ".join(query.split()[:2])
+                return ("bad_retrieval_query", f"query_pattern:{query_pattern}")
+        
+        if failure_type == "contradiction":
+            return ("common_contradiction", f"contradiction:{episode.goal[:30]}")
+        
+        return (None, None)
+    
+    def _generate_description(self, pattern_type: str, episode: LearningEpisode) -> str:
+        descriptions = {
+            "bad_source_domain": f"Unreliable source in domain: {episode.context.get('source', 'unknown')}",
+            "bad_procedure_env": f"Procedure fails in environment: {episode.context.get('environment', 'unknown')}",
+            "bad_retrieval_query": f"Retrieval query pattern causes issues: {episode.context.get('query', '')[:50]}",
+            "common_contradiction": f"Contradiction in goal: {episode.goal[:50]}"
+        }
+        return descriptions.get(pattern_type, "Unknown failure pattern")
+    
+    def get_patterns_for_context(self, context: Dict) -> List[AntiPattern]:
+        """Get relevant anti-patterns for current context"""
+        relevant = []
+        
+        for pattern in self.patterns.values():
+            if pattern.occurrence_count < self.min_occurrences:
+                continue
+            
+            if pattern.pattern_type == "bad_source_domain":
+                source = context.get("source", "")
+                domain = context.get("domain", "")
+                if source in pattern.source_domain and domain in pattern.source_domain:
+                    relevant.append(pattern)
+            
+            elif pattern.pattern_type == "bad_procedure_env":
+                procedure = context.get("procedure", "")
+                environment = context.get("environment", "")
+                if procedure in pattern.procedure_environment and environment in pattern.procedure_environment:
+                    relevant.append(pattern)
+        
+        return relevant
+    
+    def should_avoid(self, context: Dict) -> bool:
+        """Check if current context has known anti-patterns"""
+        patterns = self.get_patterns_for_context(context)
+        
+        for pattern in patterns:
+            if pattern.severity in ["high", "critical"]:
+                logger.warning(f"⚠️ Anti-pattern detected: {pattern.description}")
+                return True
+        
+        return False
+
+
+class DelayedOutcomeBinder:
+    """
+    Delayed Outcome Binder - Binds late feedback to original episodes
+    =================================================================
+    Real-world feedback often arrives late.
+    This binder connects delayed feedback to the original episode.
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self.pending_feedback: Dict[str, DelayedFeedback] = {}
+        self.episode_lookup: Dict[str, str] = {}
+        self.max_delay_seconds = self.config.get("max_delay_seconds", 7 * 24 * 3600)
+    
+    def register_episode(self, episode: LearningEpisode, correlation_id: str = None):
+        """Register episode for future delayed feedback binding"""
+        if correlation_id:
+            self.episode_lookup[correlation_id] = episode.episode_id
+    
+    def receive_delayed_feedback(self, feedback: Dict) -> Optional[str]:
+        """Receive delayed feedback and try to bind to episode."""
+        feedback_id = feedback.get("feedback_id", f"delayed_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}")
+        
+        delayed = DelayedFeedback(
+            feedback_id=feedback_id,
+            original_episode_id="",
+            feedback_type=feedback.get("type", "delayed"),
+            content=feedback.get("content", feedback),
+            correlation_id=feedback.get("correlation_id", ""),
+            causation_id=feedback.get("causation_id", ""),
+            original_task_time=feedback.get("task_time", time.time() - 86400)
+        )
+        
+        episode_id = self._find_episode(delayed)
+        
+        if episode_id:
+            delayed.bind_to_episode(episode_id)
+            logger.info(f"✅ Bound delayed feedback {feedback_id} to episode {episode_id}")
+            return episode_id
+        
+        self.pending_feedback[feedback_id] = delayed
+        logger.info(f"⏳ Stored delayed feedback {feedback_id} for future binding")
+        
+        return None
+    
+    def _find_episode(self, delayed: DelayedFeedback) -> Optional[str]:
+        """Find episode for delayed feedback"""
+        if delayed.correlation_id and delayed.correlation_id in self.episode_lookup:
+            return self.episode_lookup[delayed.correlation_id]
+        
+        if delayed.causation_id and delayed.causation_id in self.episode_lookup:
+            return self.episode_lookup[delayed.causation_id]
+        
+        time_since_task = time.time() - delayed.original_task_time
+        if time_since_task > self.max_delay_seconds:
+            logger.warning(f"⏰ Delayed feedback too old, discarding: {delayed.feedback_id}")
+            return None
+        
+        return None
+    
+    def process_pending(self, episode_store: Dict[str, LearningEpisode]) -> List[DelayedFeedback]:
+        """Process all pending feedback against current episode store"""
+        processed = []
+        
+        for feedback_id, delayed in list(self.pending_feedback.items()):
+            episode_id = self._find_episode(delayed)
+            
+            if episode_id and episode_id in episode_store:
+                delayed.bind_to_episode(episode_id)
+                processed.append(delayed)
+                del self.pending_feedback[feedback_id]
+                
+                if delayed.correlation_id:
+                    self.episode_lookup[delayed.correlation_id] = episode_id
+        
+        return processed
+
+
+class OutcomeJudge:
+    """
+    Outcome Judge - Evaluates task outcomes with rich signals
+    =========================================================
+    Instead of binary success/failure, we now have:
+    - Quality score, Speed score, Robustness score
+    - User satisfaction, Regression risk
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self.quality_threshold = self.config.get("quality_threshold", 0.7)
+        self.speed_threshold_ms = self.config.get("speed_threshold_ms", 5000)
+        self.satisfaction_threshold = self.config.get("satisfaction_threshold", 0.6)
+    
+    def judge(self, episode: LearningEpisode) -> Dict[str, Any]:
+        """Judge the episode outcome."""
+        verdict = {
+            "verdict": self._determine_verdict(episode),
+            "quality_score": self._judge_quality(episode),
+            "speed_score": self._judge_speed(episode),
+            "robustness_score": self._judge_robustness(episode),
+            "user_satisfaction": episode.user_satisfaction,
+            "regression_risk": self._judge_regression_risk(episode)
+        }
+        
+        return verdict
+    
+    def _determine_verdict(self, episode: LearningEpisode) -> str:
+        """Determine overall verdict"""
+        if episode.outcome.get("success"):
+            quality = self._judge_quality(episode)
+            if quality < self.quality_threshold:
+                return "partial_success"
+            return "success"
+        
+        if episode.outcome.get("error"):
+            return "error"
+        if episode.outcome.get("timeout"):
+            return "timeout"
+        if episode.outcome.get("cancelled"):
+            return "cancelled"
+        
+        return "unknown"
+    
+    def _judge_quality(self, episode: LearningEpisode) -> float:
+        """Judge quality of work"""
+        quality = episode.quality_score
+        
+        if episode.verification_results:
+            passed = sum(1 for v in episode.verification_results if v.get("passed", False))
+            total = len(episode.verification_results)
+            verification_score = passed / max(1, total)
+            quality = (quality * 0.6 + verification_score * 0.4)
+        
+        return min(1.0, max(0.0, quality))
+    
+    def _judge_speed(self, episode: LearningEpisode) -> float:
+        """Judge speed of execution"""
+        latency = episode.latency_ms
+        
+        if latency < self.speed_threshold_ms:
+            return 1.0
+        
+        return 0.5 ** (latency / self.speed_threshold_ms)
+    
+    def _judge_robustness(self, episode: LearningEpisode) -> float:
+        """Judge robustness"""
+        if episode.tool_results:
+            successful = sum(1 for t in episode.tool_results if t.get("success", False))
+            total = len(episode.tool_results)
+            tool_success_rate = successful / max(1, total)
+        else:
+            tool_success_rate = 1.0
+        
+        retries = episode.outcome.get("retries", 0)
+        retry_penalty = min(0.3, retries * 0.1)
+        
+        return max(0.0, tool_success_rate - retry_penalty)
+    
+    def _judge_regression_risk(self, episode: LearningEpisode) -> str:
+        """Judge risk of regression"""
+        risk_factors = 0
+        
+        if len(episode.selected_items) > 5:
+            risk_factors += 1
+        if len(episode.tools_used) > 3:
+            risk_factors += 1
+        if episode.quality_score < 0.5:
+            risk_factors += 1
+        
+        if risk_factors >= 2:
+            return "high"
+        elif risk_factors == 1:
+            return "medium"
+        return "low"
 
 
 class TimeScopeType(Enum):
@@ -3108,4 +4202,629 @@ class ObservedWorldLearning:
 def create_observed_world_learning(config: Dict = None) -> ObservedWorldLearning:
     """Factory function for ObservedWorldLearning"""
     return ObservedWorldLearning(config)
+
+
+# ==================== NO1+ OBSERVED-WORLD CLOSED LOOP ====================
+# Enhanced ObservedWorldLearning with full closed-loop integration
+
+class ObservedWorldLearningNo1Plus:
+    """
+    No1+ Observed-World Closed Loop Learning System
+    ================================================
+    
+    This is the full implementation of the closed-loop learning system
+    that addresses all the issues mentioned:
+    
+    1. Episode Ledger - Every task becomes an episode with full trace
+    2. Credit Assignment Engine - Distributes blame/credit properly
+    3. Root Cause Learner - Identifies failure types
+    4. Procedure Miner - Extracts procedures from success
+    5. Anti-Pattern Memory - Stores failure patterns
+    6. Delayed Outcome Binder - Handles late feedback
+    7. Causal Learning Graph - Tracks causal relationships
+    
+    This integrates with UnifiedLearning and KnowledgeGovernance
+    into a single canonical closed loop.
+    """
+    
+    def __init__(self, config: Dict = None, pipeline=None, governance=None):
+        self.config = config or {}
+        
+        # Reference to pipeline and governance (integration point)
+        self.pipeline = pipeline
+        self.governance = governance
+        
+        # NEW: Episode Ledger - Core of closed loop
+        self.episodes: Dict[str, LearningEpisode] = {}
+        
+        # NEW: Credit Assignment Engine
+        self.credit_engine = CreditAssignmentEngine(self.config.get("credit_config"))
+        
+        # NEW: Failure Classifier
+        self.failure_classifier = FailureClassifier(self.config.get("failure_config"))
+        
+        # NEW: Procedure Miner
+        self.procedure_miner = ProcedureMiner(self.config.get("procedure_config"))
+        
+        # NEW: Anti-Pattern Memory
+        self.anti_pattern_memory = AntiPatternMemory(self.config.get("antipattern_config"))
+        
+        # NEW: Delayed Outcome Binder
+        self.delayed_binder = DelayedOutcomeBinder(self.config.get("delayed_config"))
+        
+        # NEW: Outcome Judge
+        self.outcome_judge = OutcomeJudge(self.config.get("judge_config"))
+        
+        # Legacy compatibility
+        self.feedback_weights = {
+            "user_correction": 0.9,
+            "production_outcome": 0.8,
+            "benchmark_result": 0.7,
+            "self_observed": 0.6,
+            "default": 0.3
+        }
+        
+        self.trust_decay_half_life = 30 * 24 * 3600
+        self.min_trust_threshold = 0.2
+        self.quarantined_sources: Set[str] = set()
+        self.quarantine_threshold = 0.3
+        self.contradiction_log: List[Dict] = []
+        self.production_outcomes: Dict[str, Dict] = {}
+        
+        logger.info("🌍🌟 No1+ Observed-World Closed Loop System initialized")
+    
+    # ==================== EPISODE MANAGEMENT ====================
+    
+    def create_episode(self, task_id: str, task_description: str, 
+                       goal: str, context: Dict = None) -> LearningEpisode:
+        """Create a new learning episode for a task"""
+        episode_id = f"ep_{hashlib.md5(f'{task_id}{time.time()}'.encode()).hexdigest()[:12]}"
+        
+        episode = LearningEpisode(
+            episode_id=episode_id,
+            task_id=task_id,
+            task_description=task_description,
+            goal=goal,
+            context=context or {}
+        )
+        
+        # Register with delayed binder
+        self.delayed_binder.register_episode(episode, correlation_id=task_id)
+        
+        self.episodes[episode_id] = episode
+        logger.info(f"📝 Created episode: {episode_id}")
+        
+        return episode
+    
+    def get_episode(self, episode_id: str) -> Optional[LearningEpisode]:
+        """Get episode by ID"""
+        return self.episodes.get(episode_id)
+    
+    def complete_episode(self, episode_id: str, outcome: Dict) -> Dict:
+        """
+        Complete an episode with outcome.
+        
+        This is the key closed-loop operation:
+        1. Judge the outcome
+        2. Classify failure (if any)
+        3. Assign credit/blame
+        4. Update knowledge/procedure/source
+        5. Extract procedures if successful
+        6. Record anti-patterns if failed
+        """
+        episode = self.episodes.get(episode_id)
+        if not episode:
+            return {"error": "Episode not found"}
+        
+        # 1. Judge the outcome
+        verdict = self.outcome_judge.judge(episode)
+        final_verdict = verdict["verdict"]
+        
+        # 2. Mark episode complete
+        episode.mark_complete(final_verdict, outcome)
+        
+        # 3. Classify failure type (if failed)
+        if final_verdict == "failure":
+            failure_type = self.failure_classifier.classify_failure(episode, outcome.get("feedback"))
+            episode.failure_type = failure_type
+            episode.root_cause = self._determine_root_cause(failure_type, episode)
+        
+        # 4. Assign credit/blame
+        credits, blames = self.credit_engine.compute_mixed_attribution(episode)
+        episode.credits = credits
+        episode.blames = blames
+        
+        # 5. Build causal graph
+        causal_graph = CausalLearningGraph(episode_id)
+        self._build_causal_graph(episode, causal_graph)
+        causal_graph.compute_attributions(final_verdict)
+        episode.causal_graph = causal_graph.to_dict()
+        
+        # 6. Apply learning updates
+        if final_verdict == "success":
+            self._apply_success_learning(episode)
+        elif final_verdict == "failure":
+            self._apply_failure_learning(episode)
+        
+        # 7. Extract procedure if successful
+        if final_verdict == "success":
+            procedure = self.procedure_miner.extract_procedure(episode)
+            if procedure:
+                logger.info(f"✅ Extracted procedure: {procedure.procedure_id}")
+        
+        # 8. Record anti-pattern if failed
+        if final_verdict == "failure":
+            self.anti_pattern_memory.record_failure_pattern(episode, episode.failure_type)
+        
+        episode.processed = True
+        
+        logger.info(f"🏁 Episode {episode_id} completed: {final_verdict}")
+        
+        return {
+            "episode_id": episode_id,
+            "verdict": verdict,
+            "credits": credits,
+            "blames": blames,
+            "failure_type": episode.failure_type if final_verdict == "failure" else None
+        }
+    
+    def _determine_root_cause(self, failure_type: str, episode: LearningEpisode) -> str:
+        """Determine root cause description"""
+        root_causes = {
+            "knowledge_error": f"Knowledge content was incorrect: {', '.join(episode.selected_items[:2])}",
+            "stale_knowledge": "Knowledge is outdated and needs updating",
+            "retrieval_miss": "Wrong knowledge was retrieved for the task",
+            "ranking_error": "Retrieval ranking failed to surface correct knowledge",
+            "procedure_drift": "Procedure has drifted from optimal path",
+            "tool_failure": f"Tool execution failed: {episode.tools_used}",
+            "environment_failure": "Environment issue prevented success",
+            "planner_error": "Planning approach was incorrect",
+            "verification_error": "Verification gave false positive/negative",
+            "unknown": "Unknown failure cause"
+        }
+        return root_causes.get(failure_type, "Unknown")
+    
+    def _build_causal_graph(self, episode: LearningEpisode, graph: CausalLearningGraph):
+        """Build causal graph for episode"""
+        
+        # Add knowledge nodes
+        for knowledge_id in episode.selected_items:
+            graph.add_node("knowledge", knowledge_id)
+        
+        # Add procedure nodes
+        for proc_id in episode.procedures_used:
+            graph.add_node("procedure", proc_id)
+        
+        # Add tool nodes
+        for tool_name in episode.tools_used:
+            graph.add_node("tool", tool_name)
+        
+        # Add edges based on usage
+        for knowledge_id in episode.selected_items:
+            # Knowledge used for task
+            graph.add_edge("knowledge", knowledge_id, "task", episode.task_id, "used_for")
+            
+            # If task failed, knowledge might have caused failure
+            if episode.final_verdict == "failure":
+                graph.add_edge("knowledge", knowledge_id, "task", episode.task_id, "failed_due_to")
+        
+        # Procedure edges
+        for proc_id in episode.procedures_used:
+            graph.add_edge("procedure", proc_id, "task", episode.task_id, "used_for")
+            
+            if episode.final_verdict == "failure":
+                graph.add_edge("procedure", proc_id, "task", episode.task_id, "failed_due_to")
+        
+        # Tool edges
+        for tool_name in episode.tools_used:
+            graph.add_edge("tool", tool_name, "task", episode.task_id, "used_for")
+            
+            if episode.final_verdict == "failure":
+                graph.add_edge("tool", tool_name, "task", episode.task_id, "failed_due_to")
+    
+    def _apply_success_learning(self, episode: LearningEpisode):
+        """Apply learning from successful episode"""
+        
+        # Update knowledge confidence with credits
+        for entity_id, credit in episode.credits.items():
+            if entity_id.startswith("knowledge:"):
+                knowledge_id = entity_id.replace("knowledge:", "")
+                self._update_knowledge_confidence(knowledge_id, credit, increase=True)
+            
+            elif entity_id.startswith("procedure:"):
+                proc_id = entity_id.replace("procedure:", "")
+                self._update_procedure_score(proc_id, credit, increase=True)
+        
+        # Trigger procedure extraction for similar episodes
+        similar = self.procedure_miner.find_similar_episodes(
+            list(self.episodes.values()), episode
+        )
+        if len(similar) >= 2:
+            proc_id = f"merged_{episode.episode_id[:8]}"
+            self.procedure_miner.merge_to_procedure(proc_id, [episode] + similar)
+    
+    def _apply_failure_learning(self, episode: LearningEpisode):
+        """Apply learning from failed episode"""
+        
+        # Get update policies based on failure type
+        policies = self.failure_classifier.get_update_policy(episode.failure_type)
+        
+        # Apply blame to entities
+        for entity_id, blame in episode.blames.items():
+            if entity_id.startswith("knowledge:"):
+                knowledge_id = entity_id.replace("knowledge:", "")
+                self._update_knowledge_confidence(knowledge_id, blame, increase=False)
+            
+            elif entity_id.startswith("procedure:"):
+                proc_id = entity_id.replace("procedure:", "")
+                self._update_procedure_score(proc_id, blame, increase=False)
+        
+        # Apply policy-specific updates
+        for policy in policies:
+            if policy == UpdatePolicy.ANTI_PATTERN_CREATE:
+                # Already done in complete_episode
+                pass
+            elif policy == UpdatePolicy.RE_VERIFICATION_TRIGGER:
+                self._trigger_reverification(episode)
+            elif policy == UpdatePolicy.QUARANTINE_TRIGGER:
+                self._check_source_quarantine(episode)
+            elif policy == UpdatePolicy.RETRIEVAL_RERANK:
+                self._update_retrieval_ranking(episode)
+    
+    def _update_knowledge_confidence(self, knowledge_id: str, amount: float, increase: bool):
+        """Update knowledge confidence based on attribution"""
+        if not self.pipeline or knowledge_id not in self.pipeline.knowledge:
+            return
+        
+        entry = self.pipeline.knowledge[knowledge_id]
+        
+        # Calculate adjustment
+        if increase:
+            adjustment = amount * 0.1  # Max 10% increase per episode
+            entry.confidence = min(1.0, entry.confidence + adjustment)
+            entry.success_count += 1
+        else:
+            adjustment = amount * 0.15  # Max 15% decrease per episode
+            entry.confidence = max(0.0, entry.confidence - adjustment)
+        
+        entry.last_verified = time.time()
+        
+        logger.debug(f"{'↑' if increase else '↓'} Knowledge {knowledge_id[:8]}: {adjustment:+.3f}")
+    
+    def _update_procedure_score(self, procedure_id: str, score: float, increase: bool):
+        """Update procedure score based on attribution"""
+        # This would integrate with procedure storage
+        logger.debug(f"{'↑' if increase else '↓'} Procedure {procedure_id}: {score:+.3f}")
+    
+    def _trigger_reverification(self, episode: LearningEpisode):
+        """Trigger reverification for failed knowledge"""
+        for knowledge_id in episode.selected_items:
+            logger.info(f"🔄 Triggering reverification for knowledge: {knowledge_id}")
+    
+    def _check_source_quarantine(self, episode: LearningEpisode):
+        """Check if sources should be quarantined"""
+        # Integration with quarantine logic
+        pass
+    
+    def _update_retrieval_ranking(self, episode: LearningEpisode):
+        """Update retrieval ranking based on failure"""
+        # Integration with retrieval system
+        pass
+    
+    # ==================== ENHANCED USER CORRECTION ====================
+    
+    def process_user_correction(self, entry_id: str, correction: Dict) -> Dict:
+        """
+        Process user correction with full closed-loop integration.
+        
+        Now does:
+        1. Identifies affected claim
+        2. Stores correction as evidence
+        3. Marks old truth as disputed
+        4. Creates replacement entry if needed
+        5. Opens contradiction case
+        6. Applies retrieval demotion
+        """
+        correction_type = correction.get("type", "direct")
+        
+        # Find related episode if any
+        episode_id = correction.get("episode_id")
+        episode = self.episodes.get(episode_id) if episode_id else None
+        
+        # 1. Identify affected claim
+        affected_claim = self._identify_affected_claim(entry_id, correction)
+        
+        # 2. Store correction as evidence
+        correction_evidence = {
+            "type": EvidenceType.USER_CORRECTION.value,
+            "correction_content": correction.get("content", ""),
+            "correction_type": correction_type,
+            "timestamp": time.time(),
+            "episode_id": episode_id
+        }
+        
+        # 3. Mark old truth as disputed
+        if self.pipeline and entry_id in self.pipeline.knowledge:
+            entry = self.pipeline.knowledge[entry_id]
+            entry.status = ClaimStatus.DISPUTED.value
+            entry.claims = entry.claims or []
+            entry.claims.append({
+                "type": "disputed",
+                "reason": correction.get("reason", "user correction"),
+                "evidence": correction_evidence,
+                "timestamp": time.time()
+            })
+        
+        # 4. Create replacement entry if needed
+        new_entry_id = None
+        if correction.get("create_replacement"):
+            new_entry_id = self._create_replacement_entry(entry_id, correction)
+        
+        # 5. Open contradiction case
+        contradiction_case = self._open_contradiction_case(entry_id, correction)
+        
+        # 6. Apply confidence adjustment
+        weight = self.feedback_weights["user_correction"]
+        if correction_type == "direct":
+            weight *= 1.0
+        elif correction_type == "indirect":
+            weight *= 0.7
+        elif correction_type == "implicit":
+            weight *= 0.5
+        
+        # Apply to pipeline if available
+        if self.governance:
+            self.governance.record_feedback(entry_id, "correction", weight)
+        
+        return {
+            "entry_id": entry_id,
+            "correction_type": correction_type,
+            "affected_claim": affected_claim,
+            "weight": weight,
+            "replacement_entry_id": new_entry_id,
+            "contradiction_case": contradiction_case,
+            "applied": True
+        }
+    
+    def _identify_affected_claim(self, entry_id: str, correction: Dict) -> str:
+        """Identify which claim was corrected"""
+        # Analyze correction content to find claim
+        correction_text = correction.get("content", "").lower()
+        
+        if "not" in correction_text or "incorrect" in correction_text:
+            return "factual_inaccuracy"
+        elif "outdated" in correction_text or "old" in correction_text:
+            return "stale_information"
+        elif "contradict" in correction_text:
+            return "contradiction"
+        
+        return "general_correction"
+    
+    def _create_replacement_entry(self, entry_id: str, correction: Dict) -> str:
+        """Create replacement entry for corrected knowledge"""
+        if not self.pipeline:
+            return ""
+        
+        # Create new entry with corrected content
+        new_entry_id = self.pipeline.add_knowledge(
+            content=correction.get("corrected_content", ""),
+            source_url=correction.get("source_url", "user_correction"),
+            source_type=SourceType.DOCUMENTATION,
+            knowledge_type=KnowledgeType.FACT,
+            tags=["user_corrected"]
+        )
+        
+        return new_entry_id
+    
+    def _open_contradiction_case(self, entry_id: str, correction: Dict) -> Dict:
+        """Open contradiction case for tracking"""
+        case = {
+            "id": f"contradiction_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}",
+            "entry_id": entry_id,
+            "type": "user_correction",
+            "status": "open",
+            "timestamp": time.time(),
+            "description": correction.get("reason", "User correction")
+        }
+        
+        self.contradiction_log.append(case)
+        
+        return case
+    
+    # ==================== ENHANCED PRODUCTION OUTCOME ====================
+    
+    def record_production_outcome(self, task_id: str, outcome: Dict, 
+                                  episode_id: str = None):
+        """
+        Record production outcome with episode integration.
+        
+        Now:
+        1. Links to episode
+        2. Stores selected knowledge
+        3. Links procedure/tool traces
+        4. Stores judge verdict
+        """
+        # Store in legacy format for compatibility
+        self.production_outcomes[task_id] = {
+            "success": outcome.get("success", False),
+            "knowledge_used": outcome.get("knowledge_used", []),
+            "quality_score": outcome.get("quality_score", 0.5),
+            "latency_ms": outcome.get("latency_ms", 0),
+            "timestamp": time.time(),
+            "user_satisfaction": outcome.get("user_satisfaction"),
+            "episode_id": episode_id
+        }
+        
+        # If we have episode, update it with production feedback
+        if episode_id and episode_id in self.episodes:
+            episode = self.episodes[episode_id]
+            episode.production_feedback = outcome
+            
+            # Trigger closed-loop learning if episode is complete
+            if outcome.get("task_complete"):
+                self.complete_episode(episode_id, outcome)
+    
+    def get_production_feedback(self, entry_id: str) -> Dict:
+        """Get aggregated production feedback with learning integration"""
+        relevant = [
+            o for o in self.production_outcomes.values()
+            if entry_id in o.get("knowledge_used", [])
+        ]
+        
+        if not relevant:
+            return {"score": 0.5, "count": 0, "needs_update": False}
+        
+        avg_quality = sum(o["quality_score"] for o in relevant) / len(relevant)
+        success_rate = sum(1 for o in relevant if o["success"]) / len(relevant)
+        
+        score = avg_quality * success_rate
+        
+        # Determine if update needed
+        needs_update = score < 0.3 or score > 0.9
+        
+        return {
+            "score": score,
+            "count": len(relevant),
+            "avg_quality": avg_quality,
+            "success_rate": success_rate,
+            "needs_update": needs_update
+        }
+    
+    # ==================== DELAYED FEEDBACK ====================
+    
+    def receive_delayed_feedback(self, feedback: Dict) -> Optional[str]:
+        """Receive delayed feedback and bind to episode"""
+        
+        # Try to bind to existing episode
+        episode_id = self.delayed_binder.receive_delayed_feedback(feedback)
+        
+        if episode_id and episode_id in self.episodes:
+            episode = self.episodes[episode_id]
+            episode.production_feedback = feedback.get("content", {})
+            episode.delayed_feedback_bound = True
+            
+            # Re-run learning if episode was already complete
+            if episode.processed:
+                self.complete_episode(episode_id, episode.production_feedback)
+        
+        return episode_id
+    
+    def process_pending_delayed(self) -> List[Dict]:
+        """Process all pending delayed feedback"""
+        processed = self.delayed_binder.process_pending(self.episodes)
+        
+        results = []
+        for delayed in processed:
+            episode_id = delayed.original_episode_id
+            if episode_id in self.episodes:
+                episode = self.episodes[episode_id]
+                episode.delayed_feedback_bound = True
+                
+                # Re-run learning
+                result = self.complete_episode(episode_id, delayed.content)
+                results.append(result)
+        
+        return results
+    
+    # ==================== ANTI-PATTERN CHECK ====================
+    
+    def check_anti_patterns(self, context: Dict) -> List[AntiPattern]:
+        """Check current context for known anti-patterns"""
+        return self.anti_pattern_memory.get_patterns_for_context(context)
+    
+    def should_avoid_context(self, context: Dict) -> bool:
+        """Check if current context should be avoided due to anti-patterns"""
+        return self.anti_pattern_memory.should_avoid(context)
+    
+    # ==================== LEGACY COMPATIBILITY ====================
+    
+    def quarantine_source(self, source_url: str, reason: str):
+        """Quarantine a bad source"""
+        self.quarantined_sources.add(source_url)
+        logger.warning(f"🔒 Source quarantined: {source_url} - {reason}")
+    
+    def is_quarantined(self, source_url: str) -> bool:
+        """Check if source is quarantined"""
+        return source_url in self.quarantined_sources
+    
+    def apply_benchmark_demotion(self, entry_id: str, benchmark_result: Dict):
+        """Demote knowledge based on benchmark"""
+        score = benchmark_result.get("score", 1.0)
+        
+        if score < 0.5:
+            demotion_factor = 0.3
+        elif score < 0.7:
+            demotion_factor = 0.6
+        else:
+            demotion_factor = 1.0
+        
+        return {
+            "entry_id": entry_id,
+            "demotion_factor": demotion_factor,
+            "benchmark_score": score
+        }
+    
+    def process_observed_feedback(self, feedback: Dict) -> Dict:
+        """Process observed feedback - dispatcher for compatibility"""
+        feedback_type = feedback.get("type", "default")
+        
+        if feedback_type == "user_correction":
+            return self.process_user_correction(
+                feedback["entry_id"],
+                feedback.get("correction", {})
+            )
+        elif feedback_type == "production":
+            self.record_production_outcome(
+                feedback["task_id"],
+                feedback.get("outcome", {}),
+                feedback.get("episode_id")
+            )
+            return {"processed": True}
+        elif feedback_type == "benchmark":
+            return self.apply_benchmark_demotion(
+                feedback["entry_id"],
+                feedback.get("result", {})
+            )
+        elif feedback_type == "delayed":
+            episode_id = self.receive_delayed_feedback(feedback.get("feedback", {}))
+            return {"processed": True, "bound_episode": episode_id}
+        
+        return {"error": "Unknown feedback type"}
+    
+    def get_learning_health(self) -> Dict:
+        """Get overall learning system health"""
+        return {
+            "episodes": len(self.episodes),
+            "completed_episodes": sum(1 for e in self.episodes.values() if e.processed),
+            "procedures_extracted": len(self.procedure_miner.procedure_candidates),
+            "anti_patterns": len(self.anti_pattern_memory.patterns),
+            "pending_delayed": len(self.delayed_binder.pending_feedback),
+            "quarantined_sources": len(self.quarantined_sources),
+            "contradictions_resolved": len(self.contradiction_log),
+            "production_outcomes": len(self.production_outcomes)
+        }
+    
+    def get_episode_stats(self) -> Dict:
+        """Get episode statistics"""
+        total = len(self.episodes)
+        if total == 0:
+            return {"total": 0}
+        
+        success = sum(1 for e in self.episodes.values() if e.final_verdict == "success")
+        failure = sum(1 for e in self.episodes.values() if e.final_verdict == "failure")
+        partial = sum(1 for e in self.episodes.values() if e.final_verdict == "partial_success")
+        
+        return {
+            "total": total,
+            "success": success,
+            "failure": failure,
+            "partial": partial,
+            "success_rate": success / total if total > 0 else 0,
+            "avg_latency_ms": sum(e.latency_ms for e in self.episodes.values()) / total
+        }
+
+
+def create_observed_world_learning_no1_plus(config: Dict = None, pipeline=None, governance=None) -> ObservedWorldLearningNo1Plus:
+    """Factory function for No1+ Observed-World Learning"""
+    return ObservedWorldLearningNo1Plus(config, pipeline, governance)
 
