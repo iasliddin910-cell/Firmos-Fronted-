@@ -86,6 +86,25 @@ except ImportError as e:
     logger.warning(f"Replay subsystem not available: {e}")
     REPLAY_AVAILABLE = False
 
+# Import Kernel Health Spine (FIX: Health check as first-class kernel subsystem)
+try:
+    from agent.health_spine import (
+        KernelHealthSpine,
+        LivenessProbe,
+        ReadinessProbe,
+        SemanticProbe,
+        CapabilityGate,
+        CanaryRunner,
+        RepairAdvisor,
+        CapabilityPosture,
+        ProbeType,
+        HealthLevel
+    )
+    HEALTH_SPINE_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Health spine not available: {e}")
+    HEALTH_SPINE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -5849,6 +5868,25 @@ class CentralKernel:
             self._replay_enabled = False
             logger.warning("⚠️ Replay Subsystem NOT Available")
         
+        # FIX: Kernel Health Spine - First-class health subsystem
+        # This integrates health checking into the kernel's operational spine
+        if HEALTH_SPINE_AVAILABLE:
+            logger.info("💊 Initializing Kernel Health Spine...")
+            self.health_spine = KernelHealthSpine(self)
+            
+            # Run initial health check
+            initial_health = self.health_spine.check_health()
+            logger.info(f"💊 Initial health: {initial_health['overall_level']} (posture: {initial_health['posture']})")
+            
+            # Register health triggers
+            self._register_health_triggers()
+            
+            self._health_spine_enabled = True
+            logger.info("✅ Kernel Health Spine Ready!")
+        else:
+            self._health_spine_enabled = False
+            logger.warning("⚠️ Kernel Health Spine NOT Available")
+        
         # Compiled graph cache for execution
         self._compiled_graphs: Dict[str, ExecutableGraph] = {}
         
@@ -6395,15 +6433,127 @@ class CentralKernel:
             
             # Approval/Pause states
             TaskStatus.WAITING_APPROVAL.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
-            TaskStatus.PAUSED.value: {TaskStatus.READY.value, TaskStatus.ABORTED.value},
+            TaskStatus.PAUSED.value: {TaskStatus.READY.value, TaskStatus.CANCELLED.value},
             
-            # Terminal states
-            TaskStatus.ESCALATED.value: set(),
+            # Terminal failure states
             TaskStatus.ABORTED.value: set(),
-            TaskStatus.TIMEOUT.value: set(),
-            TaskStatus.CANCELLED.value: set(),
-            TaskStatus.SUPERSEDED.value: set(),
+            TaskStatus.ESCALATED.value: set(),
         }
+    
+    # =====================================================
+    # KERNEL HEALTH SPINE INTEGRATION (No1 Grade)
+    # =====================================================
+    
+    def _register_health_triggers(self):
+        """Register health event triggers for automatic responses."""
+        if not hasattr(self, 'health_spine'):
+            return
+        
+        # Register trigger for health failures
+        self.health_spine.register_trigger("health_failed", self._on_health_failed)
+        self.health_spine.register_trigger("health_critical", self._on_health_critical)
+        self.health_spine.register_trigger("health_degraded", self._on_health_degraded)
+        self.health_spine.register_trigger("health_healthy", self._on_health_healthy)
+        
+        logger.info("✅ Health triggers registered")
+    
+    def _on_health_failed(self, health_result: Dict):
+        """Handle health failure."""
+        logger.error(f"🚨 KERNEL HEALTH FAILURE: {health_result}")
+        
+        # Enable emergency posture
+        if hasattr(self, 'mode_selector'):
+            self.mode_selector.update_health("emergency", False)
+        
+        # Log to ledger
+        self._log_health_event("health_failed", health_result)
+    
+    def _on_health_critical(self, health_result: Dict):
+        """Handle critical health status."""
+        logger.warning(f"⚠️ KERNEL HEALTH CRITICAL: {health_result}")
+        
+        # Update mode selector
+        if hasattr(self, 'mode_selector'):
+            self.mode_selector.update_health("critical", False)
+        
+        # Log to ledger
+        self._log_health_event("health_critical", health_result)
+    
+    def _on_health_degraded(self, health_result: Dict):
+        """Handle degraded health status."""
+        logger.info(f"📉 KERNEL HEALTH DEGRADED: {health_result}")
+        
+        # Log to ledger
+        self._log_health_event("health_degraded", health_result)
+    
+    def _on_health_healthy(self, health_result: Dict):
+        """Handle healthy status."""
+        logger.debug(f"✅ KERNEL HEALTH HEALTHY: {health_result}")
+    
+    def _log_health_event(self, event_type: str, data: Dict):
+        """Log health event to task ledger."""
+        try:
+            event = TaskEvent(
+                task_id="__health__",
+                event_type=event_type,
+                timestamp=time.time(),
+                data=data
+            )
+            self._task_event_ledger.append(event)
+        except Exception as e:
+            logger.warning(f"Failed to log health event: {e}")
+    
+    def check_health(self) -> Dict:
+        """
+        Public API: Check kernel health.
+        
+        Returns comprehensive health status including:
+        - Liveness (system alive?)
+        - Readiness (ready for tasks?)
+        - Semantic (semantically correct?)
+        - Capability posture
+        - Canary status
+        """
+        if not hasattr(self, 'health_spine'):
+            return {
+                "status": "health_spine_not_available",
+                "message": "Health spine not initialized"
+            }
+        
+        return self.health_spine.check_health()
+    
+    def run_health_canaries(self) -> Dict:
+        """
+        Public API: Run canary tasks.
+        
+        Returns canary test results.
+        """
+        if not hasattr(self, 'health_spine'):
+            return {"error": "Health spine not available"}
+        
+        return self.health_spine.run_canaries()
+    
+    def is_ready_for_mission(self) -> Tuple[bool, str]:
+        """
+        Public API: Check if kernel is ready for real mission.
+        
+        Returns (is_ready, reason).
+        """
+        if not hasattr(self, 'health_spine'):
+            return False, "Health spine not available"
+        
+        return self.health_spine.is_ready_for_mission()
+    
+    def get_capability_status(self) -> Dict[str, bool]:
+        """
+        Public API: Get current capability gates status.
+        
+        Returns dict of capability -> allowed.
+        """
+        if not hasattr(self, 'health_spine'):
+            return {}
+        
+        return self.health_spine.get_capability_status()
     
     def transition_task(
         self, 
