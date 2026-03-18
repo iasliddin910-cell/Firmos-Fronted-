@@ -13,6 +13,20 @@ for all knowledge in the system. Each piece of knowledge now includes:
 - Corroboration engine
 - Negative evidence registry
 - Truth case file system
+
+TIME-AWARE TRUTH SYSTEM - World No1+ Implementation
+====================================================
+This module now also implements comprehensive temporal knowledge management:
+- Temporal truth model with validity windows
+- Current/Historical truth split
+- Supersession graph
+- Volatility model with domain-specific decay
+- Temporal query resolver
+- Truth clock for drift detection
+- Time-aware retrieval ranking
+- Version scope tracking
+- Recency-weighted preferences
+- Time-decayed procedural memory
 """
 
 import os
@@ -105,6 +119,56 @@ class VerificationMethod(Enum):
     BENCHMARK_VALIDATED = "benchmark_validated"
 
 
+class VolatilityClass(Enum):
+    """Volatility Class - Domain-specific time decay rates"""
+    # Very slow decay - almost never changes
+    IMMUTABLE = "immutable"           # Mathematical facts, constants
+    # Slow decay - changes rarely
+    STABLE = "stable"                 # Programming concepts, CS fundamentals
+    # Medium decay - changes occasionally
+    MEDIUM = "medium"                # General knowledge, facts
+    # Fast decay - changes frequently  
+    VOLATILE = "volatile"             # Software releases, APIs
+    # Very fast decay - changes constantly
+    HIGHLY_VOLATILE = "highly_volatile"  # Prices, market data, news
+    # User-specific decay
+    USER_PREFERENCE = "user_preference"   # User preferences
+    # Procedure-specific decay
+    PROCEDURE = "procedure"               # Procedures/workflows
+
+
+class TemporalStatus(Enum):
+    """Temporal Status - Lifecycle state with time awareness"""
+    CANDIDATE = "candidate"                 # Newly discovered, not verified
+    VERIFIED_CURRENT = "verified_current"   # Verified and currently valid
+    VERIFIED_HISTORICAL = "verified_historical"  # Was true, now superseded
+    STALE_NEEDS_CHECK = "stale_needs_check"  # Needs reverification
+    SUPERSEDED = "superseded"               # Replaced by newer knowledge
+    DISPUTED = "disputed"                   # Currently under dispute
+    QUARANTINED = "quarantined"             # Flagged for review
+    RETIRED = "retired"                     # No longer applicable
+    ARCHIVED = "archived"                    # Preserved for historical reference
+
+
+class TimeScopeType(Enum):
+    """Time scope type for knowledge validity"""
+    CURRENT = "current"              # True now
+    HISTORICAL = "historical"        # Was true in the past
+    FORECAST = "forecast"            # Expected to be true in future
+    DEPRECATED = "deprecated"        # No longer valid
+    TIMELESS = "timeless"            # Always true (math, etc.)
+    COMPARATIVE = "comparative"      # Version-specific comparison
+    VERSION_SCOPED = "version_scoped" # Only valid for specific version
+
+
+class ProvenanceStatus(Enum):
+    PRIMARY = "primary"           # Directly from source
+    DERIVED = "derived"           # Derived from other knowledge
+    SYNTHESIZED = "synthesized"  # Synthesized from multiple sources
+    CORRECTED = "corrected"       # User corrected
+    INFERRED = "inferred"         # Inferred by system
+
+
 class ResolutionRule(Enum):
     PREFER_HIGHER_CONFIDENCE = "prefer_higher_confidence"
     PREFER_MORE_EVIDENCE = "prefer_more_evidence"
@@ -117,12 +181,170 @@ class ResolutionRule(Enum):
     DEMOTE_BOTH = "demote_both"
 
 
-class ProvenanceStatus(Enum):
-    PRIMARY = "primary"           # Directly from source
-    DERIVED = "derived"           # Derived from other knowledge
-    SYNTHESIZED = "synthesized"  # Synthesized from multiple sources
-    CORRECTED = "corrected"       # User corrected
-    INFERRED = "inferred"         # Inferred by system
+@dataclass
+class VersionScope:
+    """
+    Version Scope - Version-specific knowledge tracking
+    ===================================================
+    Tracks which version(s) a piece of knowledge applies to.
+    Essential for accurate code/tech recommendations.
+    """
+    product_name: str                    # e.g., "Python", "React", "Next.js"
+    component: str = ""                  # e.g., "app router", "hooks"
+    version: str = ""                    # Specific version: "3.11", "18.2"
+    version_min: str = ""                # Minimum version: "3.11"
+    version_max: str = ""                # Maximum version: "3.13"
+    version_range: str = ""              # Range string: ">=3.11,<3.13"
+    environment_scope: str = ""           # e.g., "node", "browser", "server"
+    platform_scope: str = ""             # e.g., "linux", "windows", "macos"
+    edition: str = ""                    # e.g., "enterprise", "community"
+    
+    def is_version_compatible(self, target_version: str) -> bool:
+        """Check if target version is within scope"""
+        if self.version and self.version == target_version:
+            return True
+        if self.version_range:
+            # Simple version range check
+            return target_version in self.version_range
+        return True  # No version constraints
+    
+    def to_dict(self) -> Dict:
+        return {
+            "product_name": self.product_name,
+            "component": self.component,
+            "version": self.version,
+            "version_min": self.version_min,
+            "version_max": self.version_max,
+            "version_range": self.version_range,
+            "environment_scope": self.environment_scope,
+            "platform_scope": self.platform_scope,
+            "edition": self.edition
+        }
+
+
+@dataclass
+class TruthClock:
+    """
+    Truth Clock - Time-aware confidence tracking
+    =============================================
+    Tracks temporal aspects of knowledge beyond simple freshness.
+    This is a "clock" that ticks based on knowledge volatility.
+    """
+    # Base confidence from content
+    confidence: float = 0.5
+    
+    # Time confidence - how sure are we about time validity?
+    time_confidence: float = 1.0
+    
+    # Drift risk - how likely is this to change soon?
+    # 0.0 = no risk, 1.0 = high risk
+    drift_risk: float = 0.0
+    
+    # Expiry pressure - how close to becoming stale?
+    # 0.0 = fresh, 1.0 = about to expire
+    expiry_pressure: float = 0.0
+    
+    # Reverification debt - how overdue is verification?
+    reverify_debt_days: float = 0.0
+    
+    # Last update metrics
+    last_updated: float = 0.0
+    last_verified: float = 0.0
+    
+    # Volatility indicators
+    volatility_class: VolatilityClass = VolatilityClass.MEDIUM
+    
+    def calculate_truth_clock(self, current_time: float, 
+                              volatility_class: VolatilityClass,
+                              last_verified: float) -> 'TruthClock':
+        """Calculate the truth clock based on time and volatility"""
+        
+        # Time since last verification
+        days_since_verify = (current_time - last_verified) / (24 * 3600)
+        
+        # Get decay parameters for volatility class
+        decay_params = VOLATILITY_PARAMS.get(volatility_class, DEFAULT_VOLATILITY_PARAMS)
+        
+        # Calculate drift risk
+        self.drift_risk = min(1.0, days_since_verify / decay_params["max_stable_days"])
+        
+        # Calculate expiry pressure
+        self.expiry_pressure = min(1.0, days_since_verify / decay_params["reverify_interval_days"])
+        
+        # Calculate reverification debt
+        self.reverify_debt_days = max(0, days_since_verify - decay_params["reverify_interval_days"])
+        
+        # Time confidence decreases as expiry pressure increases
+        self.time_confidence = max(0.0, 1.0 - self.expiry_pressure * 0.5)
+        
+        # Update timestamps
+        self.last_verified = last_verified
+        self.last_updated = current_time
+        self.volatility_class = volatility_class
+        
+        return self
+    
+    def get_composite_score(self) -> float:
+        """Get overall truth score combining confidence and time"""
+        return self.confidence * (0.5 + self.time_confidence * 0.5)
+    
+    def is_reverify_needed(self) -> bool:
+        """Check if reverification is needed"""
+        return self.expiry_pressure > 0.8 or self.reverify_debt_days > 0
+    
+    def to_dict(self) -> Dict:
+        return {
+            "confidence": self.confidence,
+            "time_confidence": self.time_confidence,
+            "drift_risk": self.drift_risk,
+            "expiry_pressure": self.expiry_pressure,
+            "reverify_debt_days": self.reverify_debt_days,
+            "volatility_class": self.volatility_class.value,
+            "composite_score": self.get_composite_score(),
+            "reverify_needed": self.is_reverify_needed()
+        }
+
+
+# Volatility parameters for each class
+DEFAULT_VOLATILITY_PARAMS = {
+    VolatilityClass.IMMUTABLE: {
+        "reverify_interval_days": 365,
+        "max_stable_days": 730,
+        "decay_rate": 0.01
+    },
+    VolatilityClass.STABLE: {
+        "reverify_interval_days": 180,
+        "max_stable_days": 365,
+        "decay_rate": 0.05
+    },
+    VolatilityClass.MEDIUM: {
+        "reverify_interval_days": 90,
+        "max_stable_days": 180,
+        "decay_rate": 0.1
+    },
+    VolatilityClass.VOLATILE: {
+        "reverify_interval_days": 14,
+        "max_stable_days": 30,
+        "decay_rate": 0.3
+    },
+    VolatilityClass.HIGHLY_VOLATILE: {
+        "reverify_interval_days": 3,
+        "max_stable_days": 7,
+        "decay_rate": 0.5
+    },
+    VolatilityClass.USER_PREFERENCE: {
+        "reverify_interval_days": 30,
+        "max_stable_days": 90,
+        "decay_rate": 0.2
+    },
+    VolatilityClass.PROCEDURE: {
+        "reverify_interval_days": 30,
+        "max_stable_days": 60,
+        "decay_rate": 0.25
+    }
+}
+
+VOLATILITY_PARAMS = DEFAULT_VOLATILITY_PARAMS
 
 
 # ==================== NEW EVIDENCE & PROVENANCE MODELS ====================
@@ -276,12 +498,12 @@ class VerificationReceipt:
     Every verification action creates a receipt.
     This makes confidence explainable and auditable.
     """
-    receipt_id: str
-    target_type: str             # "claim", "evidence", "entry"
-    target_id: str               # ID of verified item
+    receipt_id: str = ""
+    target_type: str = ""
+    target_id: str = ""
     
     # Verification details
-    method: VerificationMethod
+    method: VerificationMethod = VerificationMethod.AUTOMATIC
     inputs: Dict = field(default_factory=dict)  # What was checked
     
     # Results
@@ -289,7 +511,7 @@ class VerificationReceipt:
     checks_failed: List[str] = field(default_factory=list)
     
     # Verdict
-    result: str                  # "verified", "failed", "partial", "rejected"
+    result: str = ""
     verdict: str = ""            # Human-readable verdict
     confidence_delta: float = 0.0  # How much confidence changed
     
@@ -405,8 +627,8 @@ class ConfidenceReceipt:
     Every confidence score comes with a receipt showing
     exactly how it was calculated.
     """
-    receipt_id: str
-    entry_id: str
+    receipt_id: str = ""
+    entry_id: str = ""
     
     # Components
     source_trust_score: float = 0.0
@@ -482,15 +704,16 @@ class KnowledgeEntry:
     Knowledge Entry - Enhanced with Evidence Chain
     ===============================================
     Now supports claims, evidence, verification, and lineage.
+    Also includes comprehensive temporal fields for time-aware truth management.
     """
-    entry_id: str
-    content: str
-    knowledge_type: KnowledgeType
-    source: str
-    source_url: str
-    collected_at: float
-    last_verified: float
-    confidence: float
+    entry_id: str = ""
+    content: str = ""
+    knowledge_type: KnowledgeType = KnowledgeType.FACT
+    source: str = ""
+    source_url: str = ""
+    collected_at: float = 0.0
+    last_verified: float = 0.0
+    confidence: float = 0.5
     embedding: List[float] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
     entities: List[str] = field(default_factory=list)
@@ -534,6 +757,44 @@ class KnowledgeEntry:
     
     # Metadata
     metadata: Dict = field(default_factory=dict)
+    
+    # ==================== TEMPORAL FIELDS (NEW - Time-Aware Truth System) ====================
+    # Observation and assertion times
+    observed_at: float = 0.0              # When this knowledge was first observed
+    asserted_at: float = 0.0              # When this knowledge was asserted to be true
+    verified_at: float = 0.0              # When this was last verified
+    
+    # Validity window - when this knowledge is valid
+    valid_from: float = 0.0              # Timestamp when this became valid
+    valid_until: float = 0.0              # Timestamp when this stops being valid (0 = indefinite)
+    
+    # Temporal status
+    temporal_status: TemporalStatus = TemporalStatus.CANDIDATE
+    time_scope_type: TimeScopeType = TimeScopeType.CURRENT
+    
+    # Supersession tracking
+    superseded_by: str = ""               # ID of entry that superseded this
+    supersedes: str = ""                  # ID of entry this supersedes
+    superseded_at: float = 0.0            # When this was superseded
+    retirement_at: float = 0.0            # When this was retired
+    
+    # Volatility and decay
+    volatility_class: VolatilityClass = VolatilityClass.MEDIUM
+    
+    # Version scope (for version-specific knowledge)
+    version_scope: Optional[VersionScope] = None
+    
+    # Truth clock data
+    time_confidence: float = 1.0          # Confidence in time validity
+    drift_risk: float = 0.0              # Risk of becoming outdated
+    expiry_pressure: float = 0.0         # Pressure to re-verify
+    
+    # Timeline tracking
+    timeline_events: List[Dict] = field(default_factory=list)  # Historical events
+    
+    # Historical flag
+    is_historical: bool = False           # Is this historical (superseded) knowledge?
+    is_current: bool = True               # Is this currently valid?
 
 
 @dataclass
@@ -543,11 +804,11 @@ class Contradiction:
     =======================================
     Now includes evidence bundles and resolution tracking.
     """
-    entry_a: str
-    entry_b: str
-    contradiction_type: str
-    severity: float
-    detected_at: float
+    entry_a: str = ""
+    entry_b: str = ""
+    contradiction_type: str = ""
+    severity: float = 0.0
+    detected_at: float = 0.0
     resolution: str = ""
     
     # === PROVENANCE FIELDS (NEW) ===
@@ -584,6 +845,18 @@ class ProceduralMemory:
     last_used: float
     usage_count: int
     verified_against: List[str] = field(default_factory=list)
+    
+    # ==================== TEMPORAL FIELDS (NEW - Time-Aware) ====================
+    # Time tracking for procedures
+    created_at: float = 0.0               # When procedure was first created
+    last_success_at: float = 0.0          # Last successful execution
+    last_failure_at: float = 0.0          # Last failed execution
+    environment_last_seen: str = ""       # Last environment where this worked
+    compatibility_window: str = ""        # Version compatibility window
+    drift_score: float = 0.0              # How much environment has drifted
+    is_deprecated: bool = False           # Is this procedure deprecated?
+    replaced_by: str = ""                 # ID of replacement procedure
+    decay_factor: float = 1.0             # Decay based on age and failures
 
 
 # ==================== EVIDENCE & PROVENANCE MANAGER ====================
