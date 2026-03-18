@@ -123,6 +123,26 @@ except ImportError as e:
     logger.warning(f"State migration not available: {e}")
     STATE_MIGRATION_AVAILABLE = False
 
+# Import Kernel API Surface (FIX: Canonical API surface contract)
+try:
+    from agent.kernel_api import (
+        KernelAPI,
+        KernelCommand,
+        KernelQuery,
+        KernelResponseEnvelope,
+        KernelEventStream,
+        AdapterBoundary,
+        AdapterConfig,
+        CommandKind,
+        QueryKind,
+        ResponseStatus,
+        EventType
+    )
+    KERNEL_API_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Kernel API not available: {e}")
+    KERNEL_API_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -6060,6 +6080,22 @@ class CentralKernel:
         else:
             self._state_migration_enabled = False
             logger.warning("⚠️ State Migration System NOT Available")
+        
+        # FIX: Kernel API Surface - Canonical API interface
+        if KERNEL_API_AVAILABLE:
+            logger.info("🌐 Initializing Kernel API Surface...")
+            self.kernel_api = KernelAPI(self)
+            
+            # Connect event stream to health spine if available
+            if hasattr(self, 'health_spine') and self.health_spine:
+                # Register health events with API event stream
+                pass
+            
+            self._kernel_api_enabled = True
+            logger.info("✅ Kernel API Surface Ready!")
+        else:
+            self._kernel_api_enabled = False
+            logger.warning("⚠️ Kernel API Surface NOT Available")
         
         # Compiled graph cache for execution
         self._compiled_graphs: Dict[str, ExecutableGraph] = {}
